@@ -5,26 +5,246 @@
 namespace DotrAssetModder;
 
 // === Step 6.4 — RH2 texture encoder ==================================================
-// Re-encodes an edited RGBA image back into an RH2 block by TEMPLATE + PATCH: the
-// original RH2 (same texture slot) is kept verbatim - header, the nSecs x 0x30 GS
-// register packet, every GIF tag and the inter-page 0x60 gaps - and only two payload
-// regions are overwritten: the CLUT (palette) bytes and the swizzled image page data.
-// This matches how the game itself treats the block (SzText_Load_Pipe copies the packet
-// and only patches per-section dest GS addresses at +0x24), so a same-dimension re-encode
-// stays valid without reconstructing any DMA/GIF plumbing.
+// Two code paths:
 //
-// PSMT8 path validated by a pixel-perfect round-trip on all 10 textures across
-// timeater.mrg + blue-eyes_white_dragon.mrg (256x256/256x128/128x256/128x64). PSMT4 is
-// the analytic inverse of Rh2Decoder.DecodePsmt4 but UNTESTED (no PSMT4 sample shipped).
+//   Encode(...)      TEMPLATE + PATCH. Keeps a donor RH2 (same slot) verbatim - header,
+//                    the nSecs x 0x30 GS register packet, every GIF tag and the inter-page
+//                    0x60 gaps - and overwrites only the CLUT and the swizzled image data.
+//                    Validated pixel-perfect on all 10 retail textures. Used whenever the
+//                    source already fits the donor's dimensions (the cheap, safe path).
 //
-// Output keeps the template's dimensions / PSM / CLUT format. A differently-sized source
-// image is resampled (nearest) to the template's decoded dimensions.
+//   BuildNative(...) FROM-SCRATCH RH2 at an arbitrary power-of-two size (Phase 1 of the
+//                    slot-rebuild plan). Emits a complete PSMT8 / PSMCT16 (5551) block:
+//                    0x60 header, nSecs x 0x30 register packet, CLUT setup + 256-entry
+//                    palette, then per section a 0x60 setup block + 0x2000 swizzled page.
+//                    The register/setup blocks are retail bytes captured VERBATIM with only
+//                    the layout-dependent fields substituted (ref pointers, dimensions,
+//                    section count, totalSize, TEX0 TW/TH/TBW) - substitution, not invention.
+//
+// How the on-disk container was verified (against blue-eyes_white_dragon.mrg):
+//   * The parametric layout below regenerates ALL 11 retail RH2 blocks BYTE-FOR-BYTE
+//     (256x128 -> nSecs 5, 128x64 -> nSecs 2).
+//   * TEX0 TW/TH/TBW substitution reproduces both retail TEX0 values exactly and extends
+//     to any POT size (TW=log2 w, TH=log2 h, TBW=w/64, TBP0=0 patched at runtime).
+//   * Section count at +0x58 = 1 (CLUT) + cols*rows, matching SzText_Load_Pipe in the ELF,
+//     which reads the count straight from +0x58 and advances one 8 KB GS page per section.
+//   * A native build at a retail texture's native dimensions decodes back with ZERO RGB
+//     and ZERO alpha-bit error (Phase 1 round-trip gate, items a + b).
+//
+// On-disk RH2 layout (PSMT8 + PSMCT16), all offsets from the RH2 base:
+//   +0x00  0x60 header. Three (offset,size) DMA-region pairs drive the engine's copy:
+//          (+0x10,+0x14)=register packet, (+0x18,+0x1c)=CLUT region, (+0x20,+0x24)=image
+//          region; +0x28=totalSize; +0x30 TEX0; +0x50/52 PSM/clutPSM; +0x54/56 w/h; +0x58 nSecs.
+//   +0x60  register packet: block0 = CLUT, blocks 1..N = image sections; each 0x30 bytes,
+//          template-constant except +0x04 (DMA ref ADDR -> its setup block) and the +0x27
+//          flag (0x02 CLUT / 0x00 image). +0x24 of each block is the GS dest, patched at
+//          runtime (0 on disk).
+//   then   CLUT setup block (0x60) + palette (256 x PSMCT16 = 512 B)
+//   then   per image section: setup block (0x60) + 0x2000 swizzled PSMT8 page data.
+//
+// PSMT4 native generation and PSMCT32-CLUT native generation are intentionally NOT emitted
+// here: no retail sample exercises their setup blocks, so they fall outside the verified
+// "capture + substitute" guarantee. BuildNative targets the retail-matching PSMT8/5551 form.
 // =====================================================================================
 
 public static class Rh2Encoder
 {
-    private const int Pad = 0x60;
+    private const int Pad = 0x60;       // inter-section / pre-palette gap, also the setup-block size
+    private const int Section = 0x2000; // one 128x64 PSMT8 page = one 8 KB GS page
+    private const int RegBlock = 0x30;  // one GS register block in the upload packet
+    private const int HdrSize = 0x60;
+    private const int ClutEntries = 256;
     private static readonly byte[] EndSig = { 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+    // ---- verbatim retail templates (captured from blue-eyes_white_dragon.mrg) ---------
+    // Layout-dependent fields are zeroed and substituted at build time (see BuildNative).
+
+    // 0x60 header with computed fields (totalSize, the 4 region pairs, TEX0, w/h, nSecs)
+    // zeroed. The remaining constant bytes (TEX1=6, +0x40=0x60, +0x48=0x14, PSM=0x13,
+    // clutPSM=0x02) are carried verbatim.
+    private static readonly byte[] HeaderSkeleton =
+    {
+        0x52, 0x48, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x13, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // CLUT register block (0x30): +0x04 ref pointer zeroed, +0x27 flag = 0x02
+    private static readonly byte[] ClutRegBlock =
+    {
+        0x02, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x02, 0x00, 0x00, 0x51,
+        0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // Image register block (0x30): +0x04 ref pointer zeroed, +0x27 flag = 0x00
+    private static readonly byte[] ImgRegBlock =
+    {
+        0x02, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x02, 0x00, 0x00, 0x51,
+        0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // CLUT upload setup block (0x60): GIF A+D, TRXREG 16x16 (256-entry CLUT). Constant.
+    private static readonly byte[] ClutSetupBlock =
+    {
+        0x25, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x00, 0x00, 0x51,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x20, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // Image-section upload setup block (0x60): GIF A+D, one 128x64 page. Constant for every
+    // section; the GS destination is supplied by the register block's +0x24, patched at runtime.
+    private static readonly byte[] SectionSetupBlock =
+    {
+        0x05, 0x02, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x02, 0x00, 0x51,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x53, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // Retail PSMT8 TEX0 used as the substitution base (256x128). TBP0/CBP are 0 on disk
+    // (the engine assigns and patches them per upload); we only substitute TW/TH/TBW/PSM.
+    private const ulong Tex0Template = 0x20100005e1310000UL;
+
+    // =================================================================================
+    // Phase 1 — true RH2 slot rebuilder
+    // =================================================================================
+
+    /// Build a complete native PSMT8 / PSMCT16 RH2 from <paramref name="rgba"/>
+    /// (<paramref name="srcW"/> x <paramref name="srcH"/>, 4 bytes/px) at a power-of-two
+    /// target. <paramref name="targetW"/> must be a POT multiple of 128 (>=128);
+    /// <paramref name="targetH"/> a POT multiple of 64 (>=64). Use <see cref="ChooseTarget"/>
+    /// to derive a valid target from a source size.
+    public static byte[] BuildNative(byte[] rgba, int srcW, int srcH, int targetW, int targetH)
+    {
+        ValidateTarget(targetW, targetH);
+
+        int cols = targetW / 128;
+        int rows = targetH / 64;
+        int nImg = cols * rows;
+        int nSecs = 1 + nImg;                       // 1 CLUT + cols*rows image sections
+
+        int palBytes = ClutEntries * 2;             // PSMCT16: 256 entries x 2 bytes
+        int regSize = nSecs * RegBlock;
+        int clutSetupOff = HdrSize + regSize;
+        int clutRegionSize = Pad + palBytes;        // setup block + palette
+        int sec0SetupOff = clutSetupOff + clutRegionSize;
+        int imageRegionSize = nImg * (Pad + Section);
+        int total = sec0SetupOff + imageRegionSize;
+
+        var o = new byte[total];
+        HeaderSkeleton.CopyTo(o, 0);
+
+        // header: substitute the layout-dependent fields (3 region pairs + total + TEX0 + dims)
+        W32(o, 0x08, (uint)total);
+        W32(o, 0x10, HdrSize);
+        W32(o, 0x14, (uint)regSize);
+        W32(o, 0x18, (uint)clutSetupOff);
+        W32(o, 0x1c, (uint)clutRegionSize);
+        W32(o, 0x20, (uint)sec0SetupOff);
+        W32(o, 0x24, (uint)(total - sec0SetupOff));
+        W32(o, 0x28, (uint)total);
+        W64(o, 0x30, Tex0For(targetW, targetH));
+        W16(o, 0x54, (ushort)targetW);
+        W16(o, 0x56, (ushort)targetH);
+        W16(o, 0x58, (ushort)nSecs);
+
+        // register packet: CLUT block then one image block per section, each pointing at its setup
+        int p = HdrSize;
+        WriteRegBlock(o, ref p, ClutRegBlock, clutSetupOff);
+        for (int s = 0; s < nImg; s++)
+            WriteRegBlock(o, ref p, ImgRegBlock, sec0SetupOff + s * (Pad + Section));
+
+        // CLUT region: setup block + 256-entry palette
+        ClutSetupBlock.CopyTo(o, clutSetupOff);
+        int paletteOff = clutSetupOff + Pad;
+
+        byte[] img = Resample(rgba, srcW, srcH, targetW, targetH);
+        var (palette, indices) = Quantize(img, targetW * targetH, ClutEntries);
+        WritePalette(o, paletteOff, ClutEntries, clut32: false, palette);
+
+        // image region: per-section setup block + swizzled page data
+        for (int s = 0; s < nImg; s++)
+            SectionSetupBlock.CopyTo(o, sec0SetupOff + s * (Pad + Section));
+
+        int startOfImage = sec0SetupOff + Pad;      // first section's data (after its setup block)
+        WriteImagePsmt8(o, startOfImage, targetW, targetH, ClutEntries, indices);
+
+        return o;
+    }
+
+    /// Pick a POT target for a source image: next-POT of each axis, clamped to the section
+    /// grid minimum (128 x 64) and to <paramref name="maxDim"/> (default 512; 1024 opt-in).
+    /// <paramref name="maxDim"/> should itself be a power of two.
+    public static (int W, int H) ChooseTarget(int srcW, int srcH, int maxDim = 512)
+    {
+        int w = Math.Min(Math.Max(NextPot(srcW), 128), maxDim);
+        int h = Math.Min(Math.Max(NextPot(srcH), 64), maxDim);
+        return (w, h);
+    }
+
+    public static int NextPot(int v)
+    {
+        if (v < 1) return 1;
+        int p = 1;
+        while (p < v) p <<= 1;
+        return p;
+    }
+
+    /// GS TEX0 for a POT target: substitute TW=log2(w), TH=log2(h), TBW=w/64, PSM=PSMT8 into
+    /// the retail template; TBP0 stays 0 (the engine patches it, and CBP, at upload time).
+    private static ulong Tex0For(int w, int h)
+    {
+        const ulong mask = (0x3fUL << 14)   // TBW
+                         | (0x3fUL << 20)   // PSM
+                         | (0xfUL << 26)    // TW
+                         | (0xfUL << 30)    // TH
+                         | 0x3fffUL;        // TBP0
+        ulong t = Tex0Template & ~mask;
+        t |= ((ulong)(w / 64) << 14)
+           | (0x13UL << 20)                 // PSMT8
+           | ((ulong)Log2(w) << 26)
+           | ((ulong)Log2(h) << 30);
+        return t;
+    }
+
+    private static void ValidateTarget(int w, int h)
+    {
+        if (w < 128 || h < 64 || !IsPow2(w) || !IsPow2(h))
+            throw new ArgumentException(
+                $"BuildNative target must be power-of-two with w>=128, h>=64 (got {w}x{h}). " +
+                "Use ChooseTarget to derive a valid size.");
+    }
+
+    private static bool IsPow2(int v) => v > 0 && (v & (v - 1)) == 0;
+
+    private static int Log2(int v)
+    {
+        int r = 0;
+        while ((1 << r) < v) r++;
+        return r;
+    }
+
+    // Copy a 0x30 register-block template and patch its +0x04 DMA ref pointer to a setup block.
+    private static void WriteRegBlock(byte[] o, ref int p, byte[] template, int refOff)
+    {
+        template.CopyTo(o, p);
+        W32(o, p + 4, (uint)refOff);
+        p += template.Length;
+    }
+
+    // =================================================================================
+    // Template + patch encoder (unchanged validated path)
+    // =================================================================================
 
     /// Encode <paramref name="rgba"/> (srcW x srcH, 4 bytes/px) into a copy of <paramref name="templateRh2"/>.
     public static byte[] Encode(ReadOnlySpan<byte> templateRh2, byte[] rgba, int srcW, int srcH)
@@ -258,21 +478,42 @@ public static class Rh2Encoder
     }
 
     // ---- helpers ----------------------------------------------------------------------
+
+    // Bilinear resample (replaces the previous nearest sampler). Smooth on both up- and
+    // down-scales. Identity when dimensions already match, so same-size re-encodes (the
+    // validated round-trip path) are untouched. All four channels are filtered; a hard
+    // 1-bit-alpha cutout may soften by one pixel at edges when actually rescaled, which is
+    // inherent to interpolation and accepted per the slot-rebuild plan.
     private static byte[] Resample(byte[] src, int sw, int sh, int dw, int dh)
     {
         if (sw == dw && sh == dh) return src;
         var dst = new byte[dw * dh * 4];
         for (int y = 0; y < dh; y++)
         {
-            int sy = sh <= 1 ? 0 : Math.Min(sh - 1, y * sh / dh);
+            double fy = dh <= 1 ? 0 : (y + 0.5) * sh / (double)dh - 0.5;
+            int y0 = (int)Math.Floor(fy);
+            double wy = fy - y0;
+            int y0c = Math.Clamp(y0, 0, sh - 1);
+            int y1c = Math.Clamp(y0 + 1, 0, sh - 1);
             for (int x = 0; x < dw; x++)
             {
-                int sx = sw <= 1 ? 0 : Math.Min(sw - 1, x * sw / dw);
-                int s = (sy * sw + sx) * 4, d = (y * dw + x) * 4;
-                dst[d] = src[s];
-                dst[d + 1] = src[s + 1];
-                dst[d + 2] = src[s + 2];
-                dst[d + 3] = src[s + 3];
+                double fx = dw <= 1 ? 0 : (x + 0.5) * sw / (double)dw - 0.5;
+                int x0 = (int)Math.Floor(fx);
+                double wx = fx - x0;
+                int x0c = Math.Clamp(x0, 0, sw - 1);
+                int x1c = Math.Clamp(x0 + 1, 0, sw - 1);
+
+                int i00 = (y0c * sw + x0c) * 4;
+                int i01 = (y0c * sw + x1c) * 4;
+                int i10 = (y1c * sw + x0c) * 4;
+                int i11 = (y1c * sw + x1c) * 4;
+                int d = (y * dw + x) * 4;
+                for (int c = 0; c < 4; c++)
+                {
+                    double top = src[i00 + c] * (1 - wx) + src[i01 + c] * wx;
+                    double bot = src[i10 + c] * (1 - wx) + src[i11 + c] * wx;
+                    dst[d + c] = (byte)Math.Clamp((int)Math.Round(top * (1 - wy) + bot * wy), 0, 255);
+                }
             }
         }
         return dst;
@@ -288,4 +529,8 @@ public static class Rh2Encoder
 
     private static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o));
     private static int U16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt16LittleEndian(d.Slice(o));
+
+    private static void W16(byte[] d, int o, ushort v) => BinaryPrimitives.WriteUInt16LittleEndian(d.AsSpan(o), v);
+    private static void W32(byte[] d, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(d.AsSpan(o), v);
+    private static void W64(byte[] d, int o, ulong v) => BinaryPrimitives.WriteUInt64LittleEndian(d.AsSpan(o), v);
 }

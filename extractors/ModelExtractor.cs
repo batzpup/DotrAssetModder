@@ -880,7 +880,20 @@ internal static class ModelExtractor
             foreach (var ch in nodes[i].Children)
                 nodeBuilders[i].AddNode(nodeBuilders[ch]);
 
+        // Recenter the whole model on GNode(1) (the root's first child) — the engine's own
+        // centre-of-model (SzModel_GetCenterOfs = GNode(1).pos / animTransScale, placed via
+        // SzModel_SetPos), so the extracted glb sits the way the duel frames the monster
+        // instead of hanging off the world origin. The shift rides on the MrgRoot wrapper
+        // AND the baked vertices together (a skinned mesh won't move from the wrapper alone —
+        // the inverse-bind matrices cancel it). Round-trip is byte-identical: GlbImporter reads
+        // each node's world matrix with the wrapper folded in while node-0's local stays put,
+        // so the quantised locals are invariant (verified) and the importer needs no change.
+        // A user-added 'origin' empty overrides this pivot on re-import (see PrepareRoot).
+        var pivot = nodes.Count > 1 ? nodes[1].RestWorld.Translation : Vector3.Zero;
+
         var mrgRoot = new NodeBuilder("MrgRoot");
+        mrgRoot.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
+            Vector3.One, System.Numerics.Quaternion.Identity, -pivot);
         mrgRoot.AddNode(nodeBuilders[0]);
 
         var materials = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B), MaterialBuilder>();
@@ -935,7 +948,7 @@ internal static class ModelExtractor
             var pb = meshBuilder.UsePrimitive(mat);
             foreach (var (a, b, c) in prim.Faces)
             {
-                pb.AddTriangle(MakeVertex(built, a), MakeVertex(built, b), MakeVertex(built, c));
+                pb.AddTriangle(MakeVertex(built, a, pivot), MakeVertex(built, b, pivot), MakeVertex(built, c, pivot));
             }
         }
 
@@ -1125,9 +1138,9 @@ internal static class ModelExtractor
         return m > 1e-6f ? v / m : Vector3.Zero;
     }
 
-    private static (VertexPositionNormal, VertexTexture1, VertexJoints4) MakeVertex(BuiltMesh bm, int vi)
+    private static (VertexPositionNormal, VertexTexture1, VertexJoints4) MakeVertex(BuiltMesh bm, int vi, Vector3 pivot)
     {
-        var pos = bm.Vertices[vi];
+        var pos = bm.Vertices[vi] - pivot;
         var nrm = bm.Normals[vi];
         if (nrm == Vector3.Zero) nrm = Vector3.UnitY; // glTF requires a unit normal
         var uv = bm.Uvs[vi];

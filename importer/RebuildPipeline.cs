@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 
 namespace DotrAssetModder;
 
@@ -25,7 +25,9 @@ public static class RebuildPipeline
 {
     private static readonly int[] VuSlots = { 4, 11, 18, 25, 32, 39, 46, 53 };
     private const int MaxBonesPerPage = 8;
+
     private const float UvScale = 4096f;
+
     // The texture-context record sets CLAMP_1 = 5 (GS WMS/WMT = CLAMP), but glTF/Blender
     // author out-of-[0,1] UVs assuming REPEAT (tiling). Folding them back with frac() before
     // quantisation reproduces the tiled sample the artist saw; clamping instead would crush
@@ -35,13 +37,36 @@ public static class RebuildPipeline
     {
         if (float.IsNaN(t) || float.IsInfinity(t)) return 0f;
         float f = t - MathF.Floor(t);
-        if (f == 0f && t != 0f) f = 1f;      // 1.0/-1.0/2.0 -> 1.0 (tile's far edge)
+        if (f == 0f && t != 0f) f = 1f; // 1.0/-1.0/2.0 -> 1.0 (tile's far edge)
         return f;
     }
+
     private const float NormScale = 32767f;
     private const float WeightScale = 4096f;
-    private const float S16Fit = 32000f;          // target ceiling for |position| component
+    private const float S16Fit = 32000f; // target ceiling for |position| component
     private const double BamsPerRad = 32768.0 / Math.PI;
+
+    public sealed class TemplateFrame
+    {
+        /// World-space engine placement pivot: retail GNode(1).pos / animTransScale.
+        public Vector3 PivotWorld;
+
+        /// World-space camera/framing centre from the donor node-tree bounds record.
+        public Vector3 BoundsCenterWorld;
+
+        /// Optional donor bounding radius. When valid, it is emitted unchanged so camera
+        /// distance/deform paths keep the donor slot's original size class.
+        public float BoundsRadius;
+
+        public bool IsValid =>
+            IsFinite(PivotWorld) && IsFinite(BoundsCenterWorld) && BoundsRadius > 1e-5f &&
+            !float.IsNaN(BoundsRadius) && !float.IsInfinity(BoundsRadius);
+
+        private static bool IsFinite(Vector3 v) =>
+            !float.IsNaN(v.X) && !float.IsInfinity(v.X) &&
+            !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
+            !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);
+    }
 
     public sealed class Result
     {
@@ -50,20 +75,28 @@ public static class RebuildPipeline
         public List<EncMotion> Motions = new();
         public float GlobalScale = 1f;
         public float AnimTransScale = 1f;
-        public int MaxMeshSlot;   // highest meshSlot on the 1+7k grid; sizes the Section1 matrix table
+        public int MaxMeshSlot; // highest meshSlot on the 1+7k grid; sizes the Section1 matrix table
 
-        /// UV-atlas merges applied when the model used more (auto-assigned) texture slots
-        /// than the template provides: base slot -> member slots in band order. Pages of
-        /// every member were retargeted onto the base slot with V remapped into band k of
-        /// n ((clamp01(v)+k)/n); Rh0Assembler stacks the member images vertically into the
-        /// base slot's RH2 so each part keeps its own picture (at 1/n vertical resolution).
+        /// Model bounding centre + radius (WORLD units), emitted as the node-tree bounds record
+        /// at tree base +0x30. lSzModel_LoadCB seeds handle+0x90 (centre) / handle+0x1e4 (radius)
+        /// from it; SzModel_GetCenter returns the per-frame world transform of the centre, which the
+        /// duel/3D-battle camera and the 3D monster view aim their VERTICAL look-at at. Centre =
+        /// the model's GEOMETRIC bbox centre so those views frame the body's middle (anchoring it on
+        /// GNode(1) made the camera aim at the feet -> monsters too high). The model's placement pivot
+        /// is GNode(1)/'origin', a SEPARATE knob (SzModel_GetCenterOfs reads the node tree directly,
+        /// not this record). Radius = bounding-sphere radius about that centre.
+        public System.Numerics.Vector3 BoundsCenter;
+
+        public float BoundsRadius = 1f;
+
         public List<(int BaseSlot, List<int> MemberSlots)> TexMerges = new();
 
         /// World auto-fit report. Factor==1 means no rescale. Reason is a human-readable
         /// explanation (e.g. "model too large") or null when untouched.
         public float FitFactor = 1f;
-        public double FitOriginalWorld;   // model's world extent before any rescale
-        public double FitDonorWorld;      // donor template's reference world extent
+
+        public double FitOriginalWorld; // model's world extent before any rescale
+        public double FitDonorWorld; // donor template's reference world extent
         public string? FitReason;
 
         public string Summary() =>
@@ -81,10 +114,36 @@ public static class RebuildPipeline
     /// retailS/ourS — the cause of off-origin identity imports and flung-apart parts on
     /// static replacements.
     public static Result Build(ImportedModel im, float templateAnimTransScale = 0f,
-        int templateTexCount = 0, float worldFitScale = 1f, bool autoFit = true,
-        float fitMinRatio = 0.125f, float fitMaxRatio = 2.0f)
+        int templateTexCount = 0, float warnMinRatio = 0.125f, float warnMaxRatio = 2.0f,
+        TemplateFrame? templateFrame = null, bool fitExternalToTemplateFrame = true,
+        bool scaleExternalToTemplateFrame = true, float externalCameraLookAtHeightRatio = 0.55f)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
+
+        // ---- 0. donor/template coordinate-frame adoption ----
+        // The game is not purely data-driven here: overworld, duel, Act3DView and battle all
+        // use hardcoded/per-card assumptions around the model slot's original GNode(1) pivot,
+        // bounds centre and radius. Replacing Blue-Eyes, for example, works best when the new
+        // geometry is fitted into Blue-Eyes' existing engine frame, not when the importer invents
+        // a fresh feet-origin or centre-origin frame.
+        //
+        // Therefore: keep the donor's camera centre/radius and GNode(1) placement pivot, and
+        // translate the imported GLB's geometry/skeleton so its visual bbox centre lands on the
+        // donor bounds centre. This mirrors what the extractor's MrgRoot wrapper represents:
+        // a Blender-friendly view layered over the engine's native coordinate frame.
+        Vector3? donorPivotWorld = null;
+        Vector3? donorBoundsCenterWorld = null;
+        float donorBoundsRadius = 0f;
+        bool useTemplateFrameForExternal = templateFrame is { IsValid: true } &&
+            fitExternalToTemplateFrame && !im.IsDotrExtractedGlb;
+        if (templateFrame is { IsValid: true })
+        {
+            donorPivotWorld = templateFrame.PivotWorld;
+            donorBoundsCenterWorld = templateFrame.BoundsCenterWorld;
+            donorBoundsRadius = templateFrame.BoundsRadius;
+            if (useTemplateFrameForExternal)
+                ApplyTemplateFrameFit(im, templateFrame, scaleExternalToTemplateFrame, externalCameraLookAtHeightRatio);
+        }
 
         // ---- 0a. UV-atlas merge of excess texture slots ----
         // The template's TexTable has a fixed number of RH2 payload slots; pages on slots
@@ -114,20 +173,28 @@ public static class RebuildPipeline
         var (root0, synthPivot, consumedRootSlot) = PrepareRoot(im);
 
         // ---- 1. DFS preorder; node[0] = root, extra roots re-parented under it ----
-        var order = new List<int>();                 // glb node indices, preorder
+        var order = new List<int>(); // glb node indices, preorder
         var encIndexOf = new Dictionary<int, int>(); // glb index -> position in `order`
+
+        bool IsImportHelperNode(int g) =>
+            GlbPos(im, g) >= 0 && GlbImporter.IsAuthoringMarker(im.Nodes[GlbPos(im, g)].Name);
+
         void Dfs(int g)
         {
+            if (IsImportHelperNode(g)) return;
             encIndexOf[g] = order.Count;
             order.Add(g);
-            foreach (int c in im.Nodes[GlbPos(im, g)].Children) Dfs(c);
+            foreach (int c in im.Nodes[GlbPos(im, g)].Children)
+                if (!IsImportHelperNode(c)) Dfs(c);
         }
+
         Dfs(root0);
         // every scene root except the one PrepareRoot consumed (root0 / its wrapper chain)
         var extraRoots = new List<int>();
         for (int r = 0; r < im.RootNodes.Count; r++)
         {
             if (consumedRootSlot < 0 || r == consumedRootSlot) continue; // -1: all consumed
+            if (IsImportHelperNode(im.RootNodes[r])) continue;
             extraRoots.Add(im.RootNodes[r]);
             Dfs(im.RootNodes[r]);
         }
@@ -138,9 +205,10 @@ public static class RebuildPipeline
         var effectiveJoints = new List<int>(im.JointNodeIndices);
         var seenJoints = new HashSet<int>(effectiveJoints);
         foreach (var prim in im.Primitives)
-            foreach (var v in prim.Vertices)
-                foreach (var inf in v.Influences)
-                    if (seenJoints.Add(inf.JointNode)) effectiveJoints.Add(inf.JointNode);
+        foreach (var v in prim.Vertices)
+        foreach (var inf in v.Influences)
+            if (seenJoints.Add(inf.JointNode))
+                effectiveJoints.Add(inf.JointNode);
 
         // accumulates the world-fit outcome for the caller/UI
         (float Factor, double OriginalWorld, double DonorWorld, string? Reason) fitReport =
@@ -152,70 +220,41 @@ public static class RebuildPipeline
         foreach (int g in effectiveJoints) jointWorld[g] = im.Nodes[GlbPos(im, g)].WorldMatrix;
         double maxLocal = 1e-6;
         foreach (var prim in im.Primitives)
-            foreach (var v in prim.Vertices)
-                foreach (var inf in Influences(v, im))
-                {
-                    if (!jointWorld.TryGetValue(inf.JointNode, out var jw)) continue;
-                    if (!Matrix4x4.Invert(jw, out var invJw)) continue; // singular joint: skip
-                    var lp = Vector3.Transform(v.Pos, invJw);
-                    if (float.IsNaN(lp.X) || float.IsInfinity(lp.X)) continue;
-                    maxLocal = Math.Max(maxLocal, Math.Max(Math.Abs(lp.X), Math.Max(Math.Abs(lp.Y), Math.Abs(lp.Z))));
-                }
-
-        // ---- 2.5 world auto-fit ----
-        // The reconstruction reproduces glb WORLD space 1:1, so a model authored at the
-        // wrong world scale stays wrong in-game regardless of S (a 0.3-unit book is
-        // invisible next to ~30-unit retail monsters). The fit is RELATIVE, not a flat
-        // factor: f = targetWorldSize / currentWorldSize.
-        //   * currentWorldSize = max |component| of the model's WORLD-space vertices
-        //     (v.Pos is world for both rigid-baked and skinned verts). It must NOT be
-        //     measured in per-joint local units (maxLocal): those equal world size only
-        //     when node scales are ~1 - a model authored at +/-200k mesh units with tiny
-        //     node scales would be shrunk into invisibility.
-        //   * targetWorldSize = the donor's implied size class: retail quantisation
-        //     targets ~ +/-32000 node units, so refWorld = 32000 * templS approximates the
-        //     donor's own world extent. Identity re-imports land at ratio ~1.0 and are
-        //     untouched.
-        //   * worldFitScale lets the user tune the result (1 = donor-sized, 0.5 = half,
-        //     2 = double). With the default 1 the fit only triggers far outside the donor
-        //     band; any other value forces the rescale (explicit intent).
-        if (templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
-            !float.IsInfinity(templateAnimTransScale))
+        foreach (var v in prim.Vertices)
+        foreach (var inf in Influences(v, im))
         {
-            double worldMax = 1e-9;
-            foreach (var prim in im.Primitives)
-                foreach (var v in prim.Vertices)
-                {
-                    var p = v.Pos;
-                    if (float.IsNaN(p.X) || float.IsInfinity(p.X)) continue;
-                    worldMax = Math.Max(worldMax,
-                        Math.Max(Math.Abs(p.X), Math.Max(Math.Abs(p.Y), Math.Abs(p.Z))));
-                }
-            float templSFit = 1f / templateAnimTransScale;
-            double refWorld = 32000.0 * templSFit;             // donor's approx max extent
-            double ratio = worldMax / refWorld;
-            fitReport.OriginalWorld = worldMax;
-            fitReport.DonorWorld = refWorld;
+            if (!jointWorld.TryGetValue(inf.JointNode, out var jw)) continue;
+            if (!Matrix4x4.Invert(jw, out var invJw)) continue; // singular joint: skip
+            var lp = Vector3.Transform(v.Pos, invJw);
+            if (float.IsNaN(lp.X) || float.IsInfinity(lp.X)) continue;
+            maxLocal = Math.Max(maxLocal, Math.Max(Math.Abs(lp.X), Math.Max(Math.Abs(lp.Y), Math.Abs(lp.Z))));
+        }
 
-            // worldFitScale != 1 is an explicit user override and always rescales. Otherwise
-            // the auto-fit only triggers (when enabled) for models outside [min,max]x the
-            // donor's size; in-band sizes are taken as intentional.
-            const double FitFrac = 0.75;
-            bool forced = MathF.Abs(worldFitScale - 1f) > 1e-4f;
-            bool tooBig = ratio > fitMaxRatio, tooSmall = ratio < fitMinRatio;
-            if (forced || (autoFit && (tooBig || tooSmall)))
-            {
-                float f = (float)(FitFrac * refWorld * Math.Max(worldFitScale, 1e-4f) / worldMax);
-                ApplyWorldScale(im, f);
-                maxLocal *= f;                                  // locals scale linearly with f
-                foreach (int g in effectiveJoints)              // worlds changed: re-fetch
-                    jointWorld[g] = im.Nodes[GlbPos(im, g)].WorldMatrix;
-                fitReport.Factor = f;
-                fitReport.Reason = forced
-                    ? $"manual scale x{worldFitScale:0.###} applied"
-                    : (tooBig ? $"model is ~{ratio:0.#}x the donor's size (too large) - scaled by x{f:0.####}"
-                              : $"model is ~{ratio:0.###}x the donor's size (too small) - scaled by x{f:0.##}");
-            }
+        // ---- 2.5 size-warning report ----
+        // Use a real model-size metric, not max(|world coordinate|). The older warning used
+        // distance from global origin, so extracted round-trips and donor-frame-fitted models
+        // looked 2-3x "too large" merely because the donor slot lives far from (0,0,0).
+        // Radius-around-camera is stable for both MrgRoot round-trips and external models.
+        if (!im.IsDotrExtractedGlb && ComputeBounds(im, out var warnMin, out var warnMax))
+        {
+            var warnCenter = im.FittedCameraLookAtWorld ?? im.AuthorCameraLookAtWorld ?? ((warnMin + warnMax) * 0.5f);
+            double srcRadius = Math.Max(ComputeRadius(im, warnCenter), 1e-9f);
+            double donorSize = donorBoundsRadius > 1e-5f ? donorBoundsRadius : srcRadius;
+            double ratio = srcRadius / Math.Max(donorSize, 1e-9);
+            fitReport.OriginalWorld = srcRadius;
+            fitReport.DonorWorld = donorSize;
+            if (ratio > warnMaxRatio)
+                fitReport.Reason =
+                    $"model radius is ~{ratio:0.#}x the donor slot radius — it may look oversized in-game.";
+            else if (ratio < warnMinRatio)
+                fitReport.Reason =
+                    $"model radius is ~{ratio:0.###}x the donor slot radius — it may look tiny in-game.";
+        }
+        else
+        {
+            fitReport.OriginalWorld = 0;
+            fitReport.DonorWorld = donorBoundsRadius > 0 ? donorBoundsRadius : 0;
+            fitReport.Reason = null;
         }
 
         float S = (float)(maxLocal / S16Fit);
@@ -224,7 +263,7 @@ public static class RebuildPipeline
             !float.IsInfinity(templateAnimTransScale))
         {
             float templS = 1f / templateAnimTransScale;
-            if (maxLocal / templS <= 32700.0) S = templS;  // adopt template scale when it fits
+            if (maxLocal / templS <= 32700.0) S = templS; // adopt template scale when it fits
         }
 
         // ---- 3. mesh-slot assignment ----
@@ -249,8 +288,9 @@ public static class RebuildPipeline
             // propagates to children unless flags bit2). The root folds the global S in.
             // Note: child translations are divided by the ROOT scale only, so deep chains of
             // scaled intermediate nodes are approximated — rare in practice.
-            nd.Scale = isRoot ? (S * src.Scale.X, S * src.Scale.Y, S * src.Scale.Z)
-                              : (src.Scale.X, src.Scale.Y, src.Scale.Z);
+            nd.Scale = isRoot
+                ? (S * src.Scale.X, S * src.Scale.Y, S * src.Scale.Z)
+                : (src.Scale.X, src.Scale.Y, src.Scale.Z);
             nd.Flags = 0;
             nd.MeshSlot = (ushort)(meshSlotOf.TryGetValue(g, out int ms) ? ms : 0);
             nd.RotBams = QuatToBams(src.Rotation);
@@ -259,12 +299,17 @@ public static class RebuildPipeline
             // parent / children remapped to enc indices (extra roots adopt root0)
             int gp = src.Parent;
             if (g == root0) nd.Parent = -1;
-            else if (gp < 0) nd.Parent = 0;                 // extra root -> under node[0]
-            else nd.Parent = encIndexOf[gp];
+            else if (gp < 0) nd.Parent = 0; // extra root -> under node[0]
+            else if (encIndexOf.TryGetValue(gp, out int epi)) nd.Parent = epi;
+            else nd.Parent = 0; // parent was an import-helper node; adopt under root
 
-            foreach (int c in src.Children) nd.Children.Add(encIndexOf[c]);
+            foreach (int c in src.Children)
+                if (encIndexOf.TryGetValue(c, out int ci))
+                    nd.Children.Add(ci);
         }
-        foreach (int er in extraRoots) nodes[0].Children.Add(encIndexOf[er]);
+        foreach (int er in extraRoots)
+            if (encIndexOf.TryGetValue(er, out int ei))
+                nodes[0].Children.Add(ei);
 
         // ---- 4.5 synthetic GNode(1) pivot for external models ----
         // Extractor glbs ('MrgRoot') keep the retail tree verbatim, so retail node 1 is
@@ -272,33 +317,106 @@ public static class RebuildPipeline
         // index with zero validation - lSzModel_LoadMotionCB@0x1ee4c0) stay aligned.
         // External models get a leaf node inserted as the root's first child at the
         // world-space bounding-box center of the geometry.
-        if (synthPivot) InsertCenterPivot(im, nodes, encIndexOf, S);
+        if (synthPivot)
+            InsertCenterPivot(im, nodes, encIndexOf, S, donorPivotWorld);
+        else if (useTemplateFrameForExternal && donorPivotWorld.HasValue && nodes.Count > 1)
+            nodes[1].Pos = (donorPivotWorld.Value.X / S, donorPivotWorld.Value.Y / S, donorPivotWorld.Value.Z / S);
 
-        // ---- 4.6 world-accurate explicit pivot ('dotr_center') ----
-        // PrepareRoot moved a root child named 'dotr_center' into first-child position, so
-        // it is GNode(1). The engine reads pivot = storedPos * S, and the generic node math
-        // above stored its LOCAL translation - which differs from its world position when
-        // the (collapsed) root carries baked scale/rotation (e.g. ob.glb's root bakes to a
-        // uniform x10). The pivot node is a leaf nothing else references, so override its
-        // stored position with worldTranslation / S: the empty's world-space placement in
-        // the DCC tool IS the in-game pivot, exactly like the synthetic bbox pivot.
-        if (!synthPivot && order.Count > 1)
+        // ---- 4.6 world-accurate explicit pivot ('origin') ----
+        // GNode(1) is what the duel / 3D-battle / enemy-preview camera centers on for ANIMATED
+        // monsters: SzModel_DrawWithFunc_Pipe@0x1ec350 books center(+0x80) = GetAnyCoordinate(1),
+        // and coordinate number 1 == node DFS index 1 == GNode(1) (require_coordinate_index resets
+        // to 0 in RhModel_Draw@0x20d3b8, root visited first; booked in lRhModel_SetupNoMotionRecursive).
+        // The pin (SzModel_SetPos(-GetCenterOfs)) puts GNode(1) at world origin, so the camera aims
+        // at world 0 and the framing is decided by where the geometry sits relative to GNode(1):
+        // GNode(1) at the FEET -> body entirely above origin -> "too high"; GNode(1) mid-body ->
+        // geometry straddles origin -> centered (retail convention). The bounds sphere (+0x90) only
+        // drives STATIC models, so it can't fix this. Keep the empty's X/Z (overworld rotation pivot
+        // is about the vertical axis, so its Y is irrelevant there) and lift GNode(1).Y to the
+        // geometry vertical centre.
+        // Explicit pivot nodes are now honoured as-authored. Do not silently lift their Y
+        // to the bbox centre: that makes Act3DView look better but breaks overworld/duel
+        // placement. External replacement GLBs should use the donor-frame path above;
+        // extracted MrgRoot GLBs should preserve the retail GNode(1) exactly.
+        // ---- 4.7 node-tree bounds record (centre + radius) ----
+        // The duel/3D-battle camera (SzDuel_Draw3DView_Pipe@0x1bf820) and the 3D monster view /
+        // enemy preview (Taku_Camp_Teki_Model_Disp@0x21be30) point the camera's VERTICAL look-at at
+        // the engine's booked centre (SzModel_GetCenter = handle+0x80), which lSzModel_LoadCB@0x1e6880
+        // seeds from THIS record (nodeTreeBase+0x30) and SzModel_DrawWithFunc_Pipe@0x1ec350 transforms
+        // into world space each frame. The model's vertical PLACEMENT, by contrast, is pinned by
+        // GNode(1): the duel does a one-time SetPos(0x1d, -GetCenterOfs) and GetCenterOfs =
+        // GNode(1).pos / animTransScale, read straight from the node tree — it does NOT consult this
+        // record. So these are two independent knobs: GNode(1) decides where the model SITS, this
+        // centre decides where the camera LOOKS.
+        //
+        // Anchoring this centre on GNode(1) (the previous behaviour) makes the camera aim at GNode(1).
+        // For real monsters GNode(1) sits low (root/feet), so the camera framed the feet and the body
+        // rendered above the aim point -> monsters appeared "too high" in the duel, 3D battle and
+        // monster view. The correct anchor is the model's GEOMETRIC centre (the standard meaning of a
+        // bounds record): the camera then frames the body's middle and the monster sits centred. This
+        // is stable under idle/turn spin (rotation about the vertical axis leaves the centre's Y
+        // unchanged) and the framing paths read only .y, so it cannot wobble. Units are already
+        // correct: v.Pos is the glb WORLD position and the reconstruction reproduces glb world 1:1, so
+        // the bbox centre is in the same space the engine transforms handle+0x90 from (radius lands
+        // ~40, inside the retail ~40-133 band).
+        Vector3 boundsCenter;
         {
-            var g1 = im.Nodes[order[1]];
-            if (g1.Name.Equals("dotr_center", StringComparison.OrdinalIgnoreCase) &&
-                g1.Children.Count == 0)
+            var bmin = new Vector3(float.MaxValue);
+            var bmax = new Vector3(float.MinValue);
+            bool anyV = false;
+            foreach (var prim in im.Primitives)
+            foreach (var v in prim.Vertices)
             {
-                var wt = g1.WorldMatrix.Translation;
-                nodes[1].Pos = (wt.X / S, wt.Y / S, wt.Z / S);
+                var p = v.Pos;
+                if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
+                    float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
+                    float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
+                bmin = Vector3.Min(bmin, p);
+                bmax = Vector3.Max(bmax, p);
+                anyV = true;
             }
+            // No usable geometry (e.g. an all-empties model): fall back to GNode(1)'s world position
+            // so the camera at least aims at the pivot rather than the origin.
+            boundsCenter = anyV ? (bmin + bmax) * 0.5f
+                : nodes.Count > 1 ? new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S)
+                : Vector3.Zero;
+            // For external donor-frame imports, the camera point is the transformed
+            // Blender `camera_lookat` marker, or the transformed bbox centre when no marker
+            // exists. Do NOT blindly force the donor's original bounds centre here: that can
+            // preserve world placement while making the viewer/battle camera aim below a
+            // differently-shaped replacement model. Extracted MrgRoot GLBs still round-trip
+            // their own computed/retail centre.
+            if (useTemplateFrameForExternal && im.FittedCameraLookAtWorld.HasValue)
+                boundsCenter = im.FittedCameraLookAtWorld.Value;
+            else if (!useTemplateFrameForExternal && donorBoundsCenterWorld.HasValue)
+                boundsCenter = donorBoundsCenterWorld.Value;
         }
+        // Radius = bounding-sphere radius about the centre over all WORLD-space vertices. Clamp to
+        // a small positive value: the engine computes 40/radius (clamped [0.3,1]) for deform, so a
+        // zero/denormal radius would skew framing/deform. Single-vertex/degenerate models get 1.0.
+        float boundsRadius = 0f;
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        {
+            var p = v.Pos;
+            if (float.IsNaN(p.X) || float.IsInfinity(p.X)) continue;
+            boundsRadius = Math.Max(boundsRadius, Vector3.Distance(p, boundsCenter));
+        }
+        // External replacements get a radius around their own fitted camera point.
+        // Reusing the donor radius is what caused bogus size warnings and can also skew
+        // camera/deform behaviour for very different silhouettes. Keep donor radius only
+        // for non-external/template cases.
+        if (!useTemplateFrameForExternal && donorBoundsRadius > 1e-5f && !float.IsNaN(donorBoundsRadius) && !float.IsInfinity(donorBoundsRadius))
+            boundsRadius = donorBoundsRadius;
+        else if (!(boundsRadius > 1e-3f) || float.IsNaN(boundsRadius) || float.IsInfinity(boundsRadius))
+            boundsRadius = 1f;
 
         // ---- 5. per-joint RestWorldSkin = Scale(S) * glbWorld ; cache inverse + 3x3 inverse ----
         var rwsInv = new Dictionary<int, Matrix4x4>();
         var scaleS = Matrix4x4.CreateScale(S);
         foreach (var kv in jointWorld)
         {
-            var rws = scaleS * kv.Value;                    // row-vector: apply scale then world
+            var rws = scaleS * kv.Value; // row-vector: apply scale then world
             Matrix4x4.Invert(rws, out var inv);
             rwsInv[kv.Key] = inv;
         }
@@ -325,14 +443,15 @@ public static class RebuildPipeline
             foreach (var member in Partition(strips))
             {
                 var bones = new SortedSet<int>();
-                foreach (var s in member) foreach (int b in StripBones(s)) bones.Add(b);
+                foreach (var s in member)
+                foreach (int b in StripBones(s))
+                    bones.Add(b);
 
                 var slot2vu = new Dictionary<int, int>();
                 int k = 0;
                 foreach (int ms in bones) slot2vu[ms] = VuSlots[k++];
 
-                var page = new EncPage
-                {
+                var page = new EncPage {
                     IsAlt = grp.Key.IsAlt,
                     TexIdx = grp.Key.TexIdx,
                     Color = ((float)grp.Key.R, (float)grp.Key.G, (float)grp.Key.B),
@@ -401,10 +520,10 @@ public static class RebuildPipeline
             motions.Add(motion);
         }
 
-        return new Result
-        {
+        return new Result {
             Nodes = nodes, Pages = pages, Motions = motions,
             GlobalScale = S, AnimTransScale = AnimTransScale,
+            BoundsCenter = boundsCenter, BoundsRadius = boundsRadius,
             MaxMeshSlot = effectiveJoints.Count > 0 ? 1 + 7 * (effectiveJoints.Count - 1) : 0,
             TexMerges = texMerges,
             FitFactor = fitReport.Factor,
@@ -412,29 +531,6 @@ public static class RebuildPipeline
             FitDonorWorld = fitReport.DonorWorld,
             FitReason = fitReport.Reason,
         };
-    }
-
-    /// Uniformly scales the imported model's WORLD space by f: vertex positions, node local
-    /// translations, node world-matrix translations, and animation translation keys.
-    /// Rotations/scales are untouched, so every inverse(RWS)*world relation scales
-    /// consistently (local coords scale by exactly f). Normals are directions - unaffected.
-    private static void ApplyWorldScale(ImportedModel im, float f)
-    {
-        foreach (var n in im.Nodes)
-        {
-            n.Translation *= f;
-            var w = n.WorldMatrix;
-            w.M41 *= f; w.M42 *= f; w.M43 *= f;
-            n.WorldMatrix = w;
-        }
-        foreach (var prim in im.Primitives)
-            foreach (var v in prim.Vertices)
-                v.Pos *= f;
-        foreach (var anim in im.Animations)
-            foreach (var ch in anim.Channels.Values)
-                if (ch.Translation != null)
-                    for (int i = 0; i < ch.Translation.Count; i++)
-                        ch.Translation[i] = (ch.Translation[i].Time, ch.Translation[i].V * f);
     }
 
     // ---- UV-atlas slot merging ----------------------------------------------------------
@@ -453,7 +549,9 @@ public static class RebuildPipeline
         {
             var autoSlots = new HashSet<int>(im.MaterialTexAuto.Values);
             var used = new SortedSet<int>();
-            foreach (var p in im.Primitives) if (p.TexIdx >= 0) used.Add(p.TexIdx);
+            foreach (var p in im.Primitives)
+                if (p.TexIdx >= 0)
+                    used.Add(p.TexIdx);
 
             var groups = new SortedDictionary<int, List<int>>();
             foreach (int e in used)
@@ -468,7 +566,7 @@ public static class RebuildPipeline
             {
                 int b = kv.Key;
                 var members = new List<int>();
-                if (used.Contains(b)) members.Add(b);   // base keeps band 0 only if it has pages
+                if (used.Contains(b)) members.Add(b); // base keeps band 0 only if it has pages
                 members.AddRange(kv.Value);
                 int n = members.Count;
                 if (n == 0) continue;
@@ -477,7 +575,7 @@ public static class RebuildPipeline
                 for (int k = 0; k < n; k++)
                 {
                     int slot = members[k];
-                    if (n == 1 && slot == b) break;     // nothing to squeeze
+                    if (n == 1 && slot == b) break; // nothing to squeeze
                     foreach (var prim in im.Primitives)
                     {
                         if (prim.TexIdx != slot) continue;
@@ -493,14 +591,147 @@ public static class RebuildPipeline
                     }
                 }
                 foreach (int e in kv.Value)
-                    foreach (var prim in im.Primitives)
-                        if (prim.TexIdx == e) prim.TexIdx = b;
+                foreach (var prim in im.Primitives)
+                    if (prim.TexIdx == e)
+                        prim.TexIdx = b;
 
                 merges.Add((b, members));
             }
         }
         im.AppliedTexMerges = merges;
         return merges;
+    }
+
+    private static void ApplyTemplateFrameFit(ImportedModel im, TemplateFrame templateFrame, bool allowScale, float cameraLookAtHeightRatio)
+    {
+        if (im.AppliedTemplateFrameFit) return;
+
+        if (!ComputeBounds(im, out var min, out var max)) return;
+        var bboxCenter = (min + max) * 0.5f;
+
+        // Blender-facing convention for external replacements:
+        //   worldPosCenter = the source point that should become the donor GNode(1) pivot.
+        //                    If absent, use Blender/world origin. This is important for
+        //                    rotation: bbox centre can be behind/off-centre on monsters with
+        //                    wings, tails, cloaks, arms, etc., which makes the model rotate
+        //                    around a point behind itself.
+        //   camera_lookat  = the source point that should become the model bounds/camera centre.
+        //                    If absent, use a stable authoring fallback above the model base
+        //                    at sourcePivot.X/Z, rather than the full bbox centre. Full bbox
+        //                    centre is often too high/behind for asymmetric monsters.
+        //
+        // Authoring rule: for normal Blender replacements put the desired world/rotation
+        // pivot at 0,0,0, or add an explicit empty named worldPosCenter. Add camera_lookat
+        // when the default 55% height target is not good enough.
+        var sourcePivot = im.AuthorWorldPosCenterWorld ?? Vector3.Zero;
+        cameraLookAtHeightRatio = Math.Clamp(cameraLookAtHeightRatio, 0.05f, 0.95f);
+        float h = MathF.Max(max.Y - min.Y, 1e-5f);
+        var fallbackCamera = new Vector3(
+            sourcePivot.X,
+            min.Y + h * cameraLookAtHeightRatio,
+            sourcePivot.Z);
+        var sourceCamera = im.AuthorCameraLookAtWorld ?? fallbackCamera;
+        float sourceRadius = ComputeRadius(im, sourceCamera);
+
+        float scale = 1f;
+        if (allowScale)
+        {
+            bool markerScale = false;
+            var sourceDelta = sourceCamera - sourcePivot;
+            var donorDelta = templateFrame.BoundsCenterWorld - templateFrame.PivotWorld;
+
+            // If the user supplied camera_lookat/worldPosCenter, match their vertical
+            // placement-to-camera distance to the donor slot. This preserves the original
+            // hardcoded slot framing while still letting the replacement pick what "feet"
+            // and "look at" mean. Without markers, radius scale is a better default.
+            if (im.AuthorCameraLookAtWorld.HasValue && im.AuthorWorldPosCenterWorld.HasValue)
+            {
+                if (MathF.Abs(sourceDelta.Y) > 1e-5f && MathF.Abs(donorDelta.Y) > 1e-5f)
+                {
+                    scale = MathF.Abs(donorDelta.Y / sourceDelta.Y);
+                    markerScale = scale > 1e-6f && !float.IsNaN(scale) && !float.IsInfinity(scale);
+                }
+                else
+                {
+                    float sl = sourceDelta.Length();
+                    float dl = donorDelta.Length();
+                    if (sl > 1e-5f && dl > 1e-5f)
+                    {
+                        scale = dl / sl;
+                        markerScale = scale > 1e-6f && !float.IsNaN(scale) && !float.IsInfinity(scale);
+                    }
+                }
+            }
+
+            // Do not auto-scale purely from radius when no explicit marker pair exists.
+            // Radius matching made some replacements report/behave several times larger
+            // than the donor and changes authored world placement unexpectedly. With no
+            // marker pair, preserve the Blender-authored size and surface only a warning.
+            if (!markerScale) scale = 1f;
+
+            if (!(scale > 1e-6f) || float.IsNaN(scale) || float.IsInfinity(scale)) scale = 1f;
+        }
+
+        // Placement solve: sourcePivot maps exactly to donor GNode(1). The camera point is
+        // then whatever the transformed camera_lookat/bbox centre becomes; that value is
+        // emitted into the node-tree bounds record later.
+        var delta = templateFrame.PivotWorld - sourcePivot * scale;
+        var xform = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateTranslation(delta);
+        var fittedCamera = Vector3.Transform(sourceCamera, xform);
+
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+            v.Pos = Vector3.Transform(v.Pos, xform);
+
+        // Move root locals and cached world matrices with the same global transform so
+        // inverse bind / RWS math stays coherent. Do not use donor bounds as a hard camera
+        // override for external models; the transformed camera marker is the authored target.
+        foreach (int r in im.RootNodes)
+        {
+            int rp = GlbPos(im, r);
+            if (rp < 0) continue;
+            im.Nodes[rp].Translation = im.Nodes[rp].Translation * scale + delta;
+            im.Nodes[rp].Scale *= scale;
+        }
+        for (int i = 0; i < im.Nodes.Count; i++)
+            im.Nodes[i].WorldMatrix = im.Nodes[i].WorldMatrix * xform;
+
+        im.FittedCameraLookAtWorld = fittedCamera;
+        im.AppliedTemplateFrameFit = true;
+    }
+
+    private static bool ComputeBounds(ImportedModel im, out Vector3 min, out Vector3 max)
+    {
+        bool any = false;
+        min = new Vector3(float.MaxValue);
+        max = new Vector3(float.MinValue);
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        {
+            var p = v.Pos;
+            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
+                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
+                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
+            min = Vector3.Min(min, p);
+            max = Vector3.Max(max, p);
+            any = true;
+        }
+        return any;
+    }
+
+    private static float ComputeRadius(ImportedModel im, Vector3 center)
+    {
+        float radius = 0f;
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        {
+            var p = v.Pos;
+            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
+                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
+                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
+            radius = Math.Max(radius, Vector3.Distance(p, center));
+        }
+        return radius;
     }
 
     // ---- root preparation / pivot guarantee -------------------------------------------
@@ -523,7 +754,12 @@ public static class RebuildPipeline
         // our extractor emits is a childless sibling root)
         int slot = 0;
         for (int r = 0; r < im.RootNodes.Count; r++)
-            if (im.Nodes[im.RootNodes[r]].Children.Count > 0) { slot = r; break; }
+            if (!GlbImporter.IsAuthoringMarker(im.Nodes[im.RootNodes[r]].Name) &&
+                im.Nodes[im.RootNodes[r]].Children.Count > 0)
+            {
+                slot = r;
+                break;
+            }
         int root0 = im.RootNodes[slot];
 
         // -- extractor glb: drop exactly the MrgRoot wrapper, trust the retail tree --
@@ -531,7 +767,12 @@ public static class RebuildPipeline
         if (rn.Name == "MrgRoot" && rn.Children.Count == 1)
         {
             int retailRoot = rn.Children[0];
-            im.Nodes[retailRoot].Parent = -1;   // MrgRoot is identity: no baking needed
+            im.Nodes[retailRoot].Parent = -1; // MrgRoot is identity (or a pure recenter
+            // translation the world matrices already
+            // carry): no baking needed.
+            // Honour a user-added 'origin' empty: hoist it to first-child so §4.6 reads it
+            // as the GNode(1) pivot. Absent one, retail node 1 stays the pivot.
+            HoistPivotChild(im, retailRoot);
             return (retailRoot, false, slot);
         }
 
@@ -543,39 +784,44 @@ public static class RebuildPipeline
         // original root's world transform intact as its local one.
         if (im.RootNodes.Count > 1)
         {
-            var synth = new ImportedNode
-            {
+            var synth = new ImportedNode {
                 Index = im.Nodes.Count,
                 Name = "dotr_root",
                 Parent = -1,
             };
             foreach (int r in im.RootNodes)
             {
+                if (GlbImporter.IsAuthoringMarker(im.Nodes[r].Name)) continue;
                 synth.Children.Add(r);
                 im.Nodes[r].Parent = synth.Index;
             }
             im.Nodes.Add(synth);
-            im.RootNodes = new List<int> { synth.Index };   // idempotent on Build re-runs
-            return (synth.Index, true, -1);                  // -1: ALL scene roots consumed
+            im.RootNodes = new List<int> { synth.Index }; // idempotent on Build re-runs
+            return (synth.Index, true, -1); // -1: ALL scene roots consumed
         }
 
         // -- external glb: collapse trivial wrapper chains --
         bool animated(int g)
         {
-            foreach (var a in im.Animations) if (a.Channels.ContainsKey(g)) return true;
+            foreach (var a in im.Animations)
+                if (a.Channels.ContainsKey(g))
+                    return true;
             return false;
         }
+
         bool referenced(int g)
         {
             foreach (var p in im.Primitives)
             {
                 if (p.NodeIndex == g) return true;
                 foreach (var v in p.Vertices)
-                    foreach (var inf in v.Influences)
-                        if (inf.JointNode == g) return true;
+                foreach (var inf in v.Influences)
+                    if (inf.JointNode == g)
+                        return true;
             }
             return false;
         }
+
         bool collapsed = false;
         while (true)
         {
@@ -594,7 +840,9 @@ public static class RebuildPipeline
             // rotations/scales, e.g. -90degX*1000 then +90degX*0.01 in ob.glb)
             if (Matrix4x4.Decompose(newRoot.WorldMatrix, out var sc, out var rot, out var tr))
             {
-                newRoot.Scale = sc; newRoot.Rotation = rot; newRoot.Translation = tr;
+                newRoot.Scale = sc;
+                newRoot.Rotation = rot;
+                newRoot.Translation = tr;
             }
             else
             {
@@ -602,10 +850,11 @@ public static class RebuildPipeline
             }
         }
 
-        // explicit pivot: a direct child named 'dotr_center' becomes the first child
+        // explicit pivot: a direct child named 'origin' (or 'dotr_center') becomes the
+        // first child so it is read as GNode(1)
         for (int i = 0; i < newRoot.Children.Count; i++)
         {
-            if (!im.Nodes[newRoot.Children[i]].Name.Equals("dotr_center", StringComparison.OrdinalIgnoreCase))
+            if (!IsPivotName(im.Nodes[newRoot.Children[i]].Name))
                 continue;
             int c = newRoot.Children[i];
             newRoot.Children.RemoveAt(i);
@@ -613,6 +862,32 @@ public static class RebuildPipeline
             return (root0, false, slot);
         }
         return (root0, true, slot);
+    }
+
+    /// A node the user designates as the model's origin / pivot (the engine's GNode(1)).
+    /// 'origin' is the documented Blender-facing name; 'dotr_center' is kept as a legacy alias.
+    private static bool IsPivotName(string? n) =>
+        n != null && (n.Equals("origin", StringComparison.OrdinalIgnoreCase)
+                      || n.Equals("dotr_center", StringComparison.OrdinalIgnoreCase));
+
+    /// Move a pivot-named leaf child of <paramref name="root"/> into first-child position so
+    /// the DFS reads it as GNode(1). Used for extractor ('MrgRoot') glbs, where the retail
+    /// tree is otherwise kept verbatim. Returns true if a pivot child was hoisted.
+    private static bool HoistPivotChild(ImportedModel im, int root)
+    {
+        var ch = im.Nodes[root].Children;
+        for (int i = 0; i < ch.Count; i++)
+            if (IsPivotName(im.Nodes[ch[i]].Name) && im.Nodes[ch[i]].Children.Count == 0)
+            {
+                if (i != 0)
+                {
+                    int p = ch[i];
+                    ch.RemoveAt(i);
+                    ch.Insert(0, p);
+                }
+                return true;
+            }
+        return false;
     }
 
     /// Inserts a leaf pivot node at enc index 1 (the root's FIRST child) so GNode(1)
@@ -624,7 +899,7 @@ public static class RebuildPipeline
     /// irrelevant; only GetGNode(1)/GetCenterOfs read it. All existing enc indices >= 1
     /// shift by +1 (Parent/Children lists and encIndexOf, which step 8 uses for motions).
     private static void InsertCenterPivot(ImportedModel im, List<EncNode> nodes,
-        Dictionary<int, int> encIndexOf, float S)
+        Dictionary<int, int> encIndexOf, float S, Vector3? donorPivotWorld = null)
     {
         if (nodes.Count == 0 || S <= 0f) return;
 
@@ -632,27 +907,28 @@ public static class RebuildPipeline
         var min = new Vector3(float.MaxValue);
         var max = new Vector3(float.MinValue);
         foreach (var prim in im.Primitives)
-            foreach (var v in prim.Vertices)
-            {
-                min = Vector3.Min(min, v.Pos);
-                max = Vector3.Max(max, v.Pos);
-                any = true;
-            }
+        foreach (var v in prim.Vertices)
+        {
+            min = Vector3.Min(min, v.Pos);
+            max = Vector3.Max(max, v.Pos);
+            any = true;
+        }
         if (!any) return;
-        var center = (min + max) * 0.5f;
+        var center = donorPivotWorld ?? (min + max) * 0.5f;
 
         // remap every index >= 1 to +1
         foreach (var nd in nodes)
         {
             if (nd.Parent >= 1) nd.Parent += 1;
             for (int i = 0; i < nd.Children.Count; i++)
-                if (nd.Children[i] >= 1) nd.Children[i] += 1;
+                if (nd.Children[i] >= 1)
+                    nd.Children[i] += 1;
         }
         foreach (var key in encIndexOf.Keys.ToList())
-            if (encIndexOf[key] >= 1) encIndexOf[key] += 1;
+            if (encIndexOf[key] >= 1)
+                encIndexOf[key] += 1;
 
-        var pivot = new EncNode
-        {
+        var pivot = new EncNode {
             Scale = (1f, 1f, 1f),
             Flags = 0,
             MeshSlot = 0,
@@ -692,6 +968,7 @@ public static class RebuildPipeline
     {
         // per-vertex valid joints (filtered exactly like materialisation filters influences)
         var jointsCache = new Dictionary<int, int[]>();
+
         int[] ValidJoints(int vi)
         {
             if (jointsCache.TryGetValue(vi, out var a)) return a;
@@ -701,6 +978,7 @@ public static class RebuildPipeline
             jointsCache[vi] = a;
             return a;
         }
+
         int VnumShared(int vi) => 1 + 3 * ValidJoints(vi).Length; // (3 + 9*ninf) shorts / 3
 
         var rigid = new SortedDictionary<int, List<(int A, int B, int C)>>(); // joint -> tris
@@ -710,17 +988,27 @@ public static class RebuildPipeline
         foreach (var tri in prim.Triangles)
         {
             var (a, b, c) = tri;
-            if (a == b || b == c || c == a) continue;                  // degenerate
+            if (a == b || b == c || c == a) continue; // degenerate
             int[] j0 = ValidJoints(a), j1 = ValidJoints(b), j2 = ValidJoints(c);
-            if (j0.Length == 0 || j1.Length == 0 || j2.Length == 0) { fallback.Add(tri); continue; }
+            if (j0.Length == 0 || j1.Length == 0 || j2.Length == 0)
+            {
+                fallback.Add(tri);
+                continue;
+            }
             if (j0.Length == 1 && j1.Length == 1 && j2.Length == 1 && j0[0] == j1[0] && j1[0] == j2[0])
             {
                 if (!rigid.TryGetValue(j0[0], out var lst)) rigid[j0[0]] = lst = new List<(int, int, int)>();
                 lst.Add(tri);
                 continue;
             }
-            var distinct = new HashSet<int>(j0); distinct.UnionWith(j1); distinct.UnionWith(j2);
-            if (distinct.Count > MaxBonesPerPage) { fallback.Add(tri); continue; }
+            var distinct = new HashSet<int>(j0);
+            distinct.UnionWith(j1);
+            distinct.UnionWith(j2);
+            if (distinct.Count > MaxBonesPerPage)
+            {
+                fallback.Add(tri);
+                continue;
+            }
             shared.Add(tri);
         }
 
@@ -738,8 +1026,7 @@ public static class RebuildPipeline
                     var v = prim.Vertices[vi];
                     var (x, y, z) = QPos(v.Pos, inv);
                     var (nx, ny, nz) = QNorm(v.Normal, inv);
-                    strip.Verts.Add(new EncVertex
-                    {
+                    strip.Verts.Add(new EncVertex {
                         U = Q(v.Uv.X * UvScale), V = Q(v.Uv.Y * UvScale), Flag = 0,
                         Nx = nx, Ny = ny, Nz = nz, X = x, Y = y, Z = z,
                     });
@@ -761,8 +1048,7 @@ public static class RebuildPipeline
                     if (!rwsInv.TryGetValue(inf.JointNode, out var inv) || !meshSlotOf.TryGetValue(inf.JointNode, out int ms)) continue;
                     var (x, y, z) = QPos(v.Pos, inv);
                     var (nx, ny, nz) = QNorm(v.Normal, inv);
-                    ev.Influences.Add(new EncInfluence
-                    {
+                    ev.Influences.Add(new EncInfluence {
                         Bone = (ushort)ms /* placeholder mesh slot */,
                         Weight = Q(inf.Weight * WeightScale), Flag = 0,
                         Nx = nx, Ny = ny, Nz = nz, X = x, Y = y, Z = z,
@@ -793,16 +1079,20 @@ public static class RebuildPipeline
         if (tris.Count == 0) return strips;
 
         var edgeMap = new Dictionary<(int, int), List<int>>();
+
         void AddEdge(int p, int q, int t)
         {
             var k = p < q ? (p, q) : (q, p);
             if (!edgeMap.TryGetValue(k, out var l)) edgeMap[k] = l = new List<int>();
             l.Add(t);
         }
+
         for (int t = 0; t < tris.Count; t++)
         {
             var (a, b, c) = tris[t];
-            AddEdge(a, b, t); AddEdge(b, c, t); AddEdge(c, a, t);
+            AddEdge(a, b, t);
+            AddEdge(b, c, t);
+            AddEdge(c, a, t);
         }
 
         var used = new bool[tris.Count];
@@ -834,14 +1124,20 @@ public static class RebuildPipeline
                 if (!edgeMap.TryGetValue(k, out var cand)) break;
                 int next = -1;
                 foreach (int t in cand)
-                    if (!used[t] && !localUsed.Contains(t)) { next = t; break; }
+                    if (!used[t] && !localUsed.Contains(t))
+                    {
+                        next = t;
+                        break;
+                    }
                 if (next < 0) break;
                 int r = Third(next, p, q);
                 if (vu + vnumOf(r) > StripVuBudget) break;
                 if (joints != null)
                 {
                     int grow = 0;
-                    foreach (int j in jointsOf!(r)) if (!joints.Contains(j)) grow++;
+                    foreach (int j in jointsOf!(r))
+                        if (!joints.Contains(j))
+                            grow++;
                     if (joints.Count + grow > maxJoints) break;
                     joints.UnionWith(jointsOf(r));
                 }
@@ -861,8 +1157,8 @@ public static class RebuildPipeline
             var w2 = Walk(t, b, c, a);
             var w3 = Walk(t, c, a, b);
             var best = w1.Strip.Count >= w2.Strip.Count
-                     ? (w1.Strip.Count >= w3.Strip.Count ? w1 : w3)
-                     : (w2.Strip.Count >= w3.Strip.Count ? w2 : w3);
+                ? (w1.Strip.Count >= w3.Strip.Count ? w1 : w3)
+                : (w2.Strip.Count >= w3.Strip.Count ? w2 : w3);
             foreach (int u in best.Tris) used[u] = true;
             strips.Add(best.Strip);
         }
@@ -890,8 +1186,7 @@ public static class RebuildPipeline
             {
                 var (x, y, z) = QPos(v.Pos, inv);
                 var (nx, ny, nz) = QNorm(v.Normal, inv);
-                strip.Verts.Add(new EncVertex
-                {
+                strip.Verts.Add(new EncVertex {
                     U = Q(v.Uv.X * UvScale), V = Q(v.Uv.Y * UvScale), Flag = 0,
                     Nx = nx, Ny = ny, Nz = nz, X = x, Y = y, Z = z,
                 });
@@ -910,8 +1205,7 @@ public static class RebuildPipeline
                 if (!rwsInv.TryGetValue(inf.JointNode, out var inv) || !meshSlotOf.TryGetValue(inf.JointNode, out int ms)) continue;
                 var (x, y, z) = QPos(v.Pos, inv);
                 var (nx, ny, nz) = QNorm(v.Normal, inv);
-                ev.Influences.Add(new EncInfluence
-                {
+                ev.Influences.Add(new EncInfluence {
                     Bone = (ushort)ms /* placeholder mesh slot */,
                     Weight = Q(inf.Weight * WeightScale), Flag = 0,
                     Nx = nx, Ny = ny, Nz = nz, X = x, Y = y, Z = z,
@@ -929,13 +1223,15 @@ public static class RebuildPipeline
     private static void CapTriangleBones(List<ImportedInfluence>[] vinfs, int maxBones)
     {
         var distinct = new HashSet<int>();
-        foreach (var lst in vinfs) foreach (var inf in lst) distinct.Add(inf.JointNode);
+        foreach (var lst in vinfs)
+        foreach (var inf in lst)
+            distinct.Add(inf.JointNode);
         while (distinct.Count > maxBones)
         {
             var total = new Dictionary<int, float>();
             foreach (var lst in vinfs)
-                foreach (var inf in lst)
-                    total[inf.JointNode] = total.GetValueOrDefault(inf.JointNode) + inf.Weight;
+            foreach (var inf in lst)
+                total[inf.JointNode] = total.GetValueOrDefault(inf.JointNode) + inf.Weight;
             int drop = total.OrderBy(kv => kv.Value).First().Key;
             foreach (var lst in vinfs) lst.RemoveAll(inf => inf.JointNode == drop);
             distinct.Remove(drop);
@@ -943,7 +1239,12 @@ public static class RebuildPipeline
             {
                 float s = lst.Sum(i => i.Weight);
                 if (s <= 0f) continue;
-                for (int i = 0; i < lst.Count; i++) { var x = lst[i]; x.Weight /= s; lst[i] = x; }
+                for (int i = 0; i < lst.Count; i++)
+                {
+                    var x = lst[i];
+                    x.Weight /= s;
+                    lst[i] = x;
+                }
             }
         }
     }
@@ -982,12 +1283,18 @@ public static class RebuildPipeline
                 {
                     var bs = StripBones(remaining[i]);
                     int union = page.Count + bs.Count(b => !page.Contains(b));
-                    if (union <= MaxBonesPerPage && (union - page.Count) < bestNew) { bestNew = union - page.Count; bestIdx = i; }
+                    if (union <= MaxBonesPerPage && (union - page.Count) < bestNew)
+                    {
+                        bestNew = union - page.Count;
+                        bestIdx = i;
+                    }
                 }
                 if (bestIdx >= 0)
                 {
                     foreach (int b in StripBones(remaining[bestIdx])) page.Add(b);
-                    members.Add(remaining[bestIdx]); remaining.RemoveAt(bestIdx); progress = true;
+                    members.Add(remaining[bestIdx]);
+                    remaining.RemoveAt(bestIdx);
+                    progress = true;
                 }
             }
             pages.Add(members);
@@ -999,7 +1306,11 @@ public static class RebuildPipeline
     {
         var set = new HashSet<int>();
         if (s.Kind == StripKind.Indep) set.Add(s.IndepVuAddr); // placeholder = mesh slot pre-remap
-        else foreach (var v in s.Verts) if (v.Influences != null) foreach (var inf in v.Influences) set.Add(inf.Bone);
+        else
+            foreach (var v in s.Verts)
+                if (v.Influences != null)
+                    foreach (var inf in v.Influences)
+                        set.Add(inf.Bone);
         return set;
     }
 
@@ -1033,7 +1344,8 @@ public static class RebuildPipeline
     private static short Q(float v)
     {
         int r = (int)MathF.Round(v);
-        if (r > 32767) r = 32767; else if (r < -32768) r = -32768;
+        if (r > 32767) r = 32767;
+        else if (r < -32768) r = -32768;
         return (short)r;
     }
 
@@ -1051,11 +1363,15 @@ public static class RebuildPipeline
 
     private readonly struct MatKey : IEquatable<MatKey>
     {
-        public readonly int TexIdx; public readonly bool IsAlt;
-        public readonly int R, G, B; public readonly float A;
+        public readonly int TexIdx;
+        public readonly bool IsAlt;
+        public readonly int R, G, B;
+        public readonly float A;
+
         public MatKey(int tex, bool alt, Vector4 baseColor)
         {
-            TexIdx = tex; IsAlt = alt;
+            TexIdx = tex;
+            IsAlt = alt;
             // The +0x20 row is a lighting input the engine scales at runtime; retail's
             // neutral is (178,178,178), so exact White (the glTF default / "no tint")
             // maps to that for normal pages - emitting 255 bakes in a permanent ~1.43x
@@ -1076,6 +1392,7 @@ public static class RebuildPipeline
             if (R == 0) R = 1;
             A = Math.Clamp(baseColor.W, 0, 1) * 128f;
         }
+
         public bool Equals(MatKey o) => TexIdx == o.TexIdx && IsAlt == o.IsAlt && R == o.R && G == o.G && B == o.B && A == o.A;
         public override bool Equals(object? o) => o is MatKey m && Equals(m);
         public override int GetHashCode() => HashCode.Combine(TexIdx, IsAlt, R, G, B, A);

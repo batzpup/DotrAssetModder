@@ -1,4 +1,4 @@
-﻿namespace DotrAssetModder;
+namespace DotrAssetModder;
 
 // === Step 6 — Rebuilder facade =======================================================
 // One-call entry point for the GLB -> .mrg reimporter. Uses the original .mrg as the
@@ -14,29 +14,54 @@
 
 public static class Rebuilder
 {
-    /// Tunables for the GLB -> .mrg reimport. Defaults reproduce the previous behaviour.
+    /// Tunables for the GLB -> .mrg reimport.
     public sealed class Options
     {
-        /// Manual size multiplier relative to the donor's world size. 1 = leave the
-        /// auto-fit in charge; any other value forces a rescale to that fraction of the
-        /// donor (0.5 = half donor size, 2 = double).
-        public float WorldFitScale = 1f;
-        /// Master switch for automatic rescaling of far-off-size models.
-        public bool AutoFit = true;
-        /// Auto-fit triggers only when the model's size is below MinRatio or above MaxRatio
-        /// times the donor's world size. In-band sizes are left untouched.
-        public float FitMinRatio = 0.125f;
-        public float FitMaxRatio = 2.0f;
+        /// Size-warning band, as a fraction of the donor's world size. If the model is
+        /// below WarnMinRatio or above WarnMaxRatio of the donor's size, the rebuild
+        /// surfaces a warning (FitInfo.Message) so the user can rescale it themselves.
+        /// No automatic rescaling is ever applied — the model is imported as authored.
+        public float WarnMinRatio = 0.125f;
+        public float WarnMaxRatio = 2.0f;
+
+        /// Rebuild imported textures at their native (power-of-two) size via
+        /// Rh2Encoder.BuildNative instead of squeezing them into the donor slot's
+        /// dimensions. A source that already fits its donor keeps the cheaper template-patch
+        /// path regardless. For the fixed 1 MiB monster.mrg block, native slots that would
+        /// overflow are downgraded back to the donor-fit path (largest first) until the block
+        /// fits. Default off (preserves the previous squeeze-to-donor behaviour).
+        public bool RebuildTexturesNative = false;
+        /// Max width/height for a native rebuild target (power of two). 512 is the
+        /// retail-plausible default; 1024 is opt-in and untested on hardware.
+        public int MaxTextureDim = 512;
+
+        /// External Blender/Sketchfab GLBs do not carry DotR's slot-specific pivot/camera
+        /// frame. When this is true, non-MrgRoot GLBs are transformed into the original
+        /// donor MRG's frame: camera_lookat/bbox-centre maps to donor bounds centre, and
+        /// GNode(1) is written at the donor pivot. Extracted DotR GLBs are never fitted;
+        /// they round-trip their original tree.
+        public bool FitExternalModelsToTemplateFrame = true;
+
+        /// When fitting an external model to the donor frame, scale it uniformly to match
+        /// either the donor pivot->camera distance (when camera_lookat + worldPosCenter
+        /// markers are present) or the donor bounds radius. Disable this to only translate
+        /// into the donor frame.
+        public bool ScaleExternalModelsToTemplateFrame = true;
+
+        /// Fallback camera target height for external Blender GLBs when no camera_lookat
+        /// empty exists. 0.55 means aim slightly above the vertical midpoint, using
+        /// worldPosCenter/Blender origin for X/Z so asymmetric geometry does not pull the
+        /// camera/pivot behind the model.
+        public float ExternalCameraLookAtHeightRatio = 0.55f;
     }
 
-    /// Outcome of the world auto-fit, for surfacing in the UI.
+    /// Size-check outcome, for surfacing a warning in the UI. No rescaling is performed.
     public sealed class FitInfo
     {
-        public float Factor = 1f;             // 1 == no rescale
-        public double OriginalWorld;          // model's world extent before fit
+        public double OriginalWorld;          // model's world extent
         public double DonorWorld;             // donor template's reference extent
-        public string? Message;               // human-readable explanation, or null
-        public bool Rescaled => MathF.Abs(Factor - 1f) > 1e-4f;
+        public string? Message;               // size warning, or null when in-band
+        public bool HasWarning => Message != null;
     }
 
     public static byte[] Rebuild(string glbPath, byte[] originalMrg,
@@ -74,16 +99,58 @@ public static class Rebuilder
             if (tt > 0 && tt + 4 <= originalMrg.Length)
                 templateTexCount = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(originalMrg.AsSpan(tt));
         }
+        var templateFrame = ReadTemplateFrame(originalMrg);
         var rebuilt = RebuildPipeline.Build(model, templateATS, templateTexCount,
-            opt.WorldFitScale, opt.AutoFit, opt.FitMinRatio, opt.FitMaxRatio);
+            opt.WarnMinRatio, opt.WarnMaxRatio, templateFrame,
+            opt.FitExternalModelsToTemplateFrame, opt.ScaleExternalModelsToTemplateFrame, opt.ExternalCameraLookAtHeightRatio);
 
         if (fit != null)
         {
-            fit.Factor = rebuilt.FitFactor;
             fit.OriginalWorld = rebuilt.FitOriginalWorld;
             fit.DonorWorld = rebuilt.FitDonorWorld;
             fit.Message = rebuilt.FitReason;
         }
-        return Rh0Assembler.Assemble(originalMrg, rebuilt, textures);
+        return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, 0x100000,
+            opt.RebuildTexturesNative, opt.MaxTextureDim);
     }
+    private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)
+    {
+        if (originalMrg.Length < 0x68) return null;
+        uint U32(int o) => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(originalMrg.AsSpan(o));
+        int I32(int o) => System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(originalMrg.AsSpan(o));
+        float F32(int o) => System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(originalMrg.AsSpan(o));
+
+        if (U32(0) != Rh0Assembler.Rh0Magic) return null;
+        int nodeTree = (int)U32(0x10);
+        float ats = F32(0x64);
+        if (nodeTree <= 0 || nodeTree + 0x40 > originalMrg.Length || ats <= 0f ||
+            float.IsNaN(ats) || float.IsInfinity(ats)) return null;
+
+        var bounds = new System.Numerics.Vector3(
+            F32(nodeTree + 0x30), F32(nodeTree + 0x34), F32(nodeTree + 0x38));
+        float radius = F32(nodeTree + 0x3C);
+
+        int gnode1 = I32(nodeTree + 0x1C); // root's first child, offsets are node-tree-relative
+        if (gnode1 <= 0 || nodeTree + gnode1 + 0x2C > originalMrg.Length) return null;
+        var pivotRaw = new System.Numerics.Vector3(
+            F32(nodeTree + gnode1 + 0x20),
+            F32(nodeTree + gnode1 + 0x24),
+            F32(nodeTree + gnode1 + 0x28));
+        var pivot = pivotRaw / ats;
+
+        if (!IsFinite(bounds) || !IsFinite(pivot) || !(radius > 1e-5f) ||
+            float.IsNaN(radius) || float.IsInfinity(radius)) return null;
+
+        return new RebuildPipeline.TemplateFrame {
+            PivotWorld = pivot,
+            BoundsCenterWorld = bounds,
+            BoundsRadius = radius,
+        };
+
+        static bool IsFinite(System.Numerics.Vector3 v) =>
+            !float.IsNaN(v.X) && !float.IsInfinity(v.X) &&
+            !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
+            !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);
+    }
+
 }

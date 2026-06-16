@@ -33,17 +33,19 @@ public static class Rh0Assembler
     public sealed class TextureInput
     {
         public int TexIdx;
-        public byte[]? Rgba;        // edited texture (null => keep the original RH2 verbatim)
+        public byte[]? Rgba; // edited texture (null => keep the original RH2 verbatim)
         public int Width, Height;
     }
 
     public static byte[] Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
-        IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000)
+        IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
+        bool rebuildNative = false, int maxTexDim = 512)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
 
         // ---- regenerate blocks ----
-        byte[] nodeTree = NodeTreeWriter.Write(rebuilt.Nodes);
+        byte[] nodeTree = NodeTreeWriter.Write(rebuilt.Nodes,
+            (rebuilt.BoundsCenter.X, rebuilt.BoundsCenter.Y, rebuilt.BoundsCenter.Z), rebuilt.BoundsRadius);
         GeometryWriteResult geo = GeometryWriter.Write(rebuilt.Pages, rebuilt.MaxMeshSlot); // also fills EncPage.WalkOff
         var (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions);
 
@@ -81,11 +83,13 @@ public static class Rh0Assembler
         // slots BELOW the highest used index are positional and must stay - they keep the
         // template's RH2 verbatim.
         int texCount = 0;
-        foreach (var (ti_, _) in geo.TexDispatch) if (ti_ + 1 > texCount) texCount = ti_ + 1;
-        if (texCount == 0) texCount = Math.Min(origCount, 1);  // degenerate: no textured pages
+        foreach (var (ti_, _) in geo.TexDispatch)
+            if (ti_ + 1 > texCount)
+                texCount = ti_ + 1;
+        if (texCount == 0) texCount = Math.Min(origCount, 1); // degenerate: no textured pages
 
         var byTex = (textures ?? Array.Empty<TextureInput>()).Where(t => t != null)
-                    .GroupBy(t => t.TexIdx).ToDictionary(g => g.Key, g => g.First());
+            .GroupBy(t => t.TexIdx).ToDictionary(g => g.Key, g => g.First());
 
         // ---- UV-atlas composites for merged texture slots ----
         // RebuildPipeline.ApplyTexMerges retargeted excess slots' pages onto base slots
@@ -101,11 +105,19 @@ public static class Rh0Assembler
             bool anyImg = false;
             for (int k = 0; k < n; k++)
                 if (byTex.TryGetValue(members[k], out var t) && t.Rgba != null && t.Width > 0 && t.Height > 0)
-                { imgs[k] = t; anyImg = true; }
+                {
+                    imgs[k] = t;
+                    anyImg = true;
+                }
             if (!anyImg) continue;
 
             int w = 0, bandH = 0;
-            foreach (var t in imgs) if (t != null) { w = Math.Max(w, t.Width); bandH = Math.Max(bandH, t.Height); }
+            foreach (var t in imgs)
+                if (t != null)
+                {
+                    w = Math.Max(w, t.Width);
+                    bandH = Math.Max(bandH, t.Height);
+                }
             var canvas = new byte[w * bandH * n * 4];
             for (int k = 0; k < n; k++)
             {
@@ -116,12 +128,19 @@ public static class Rh0Assembler
                     for (int x = 0; x < w; x++)
                     {
                         int di = rowBase + x * 4;
-                        if (s == null) { canvas[di] = canvas[di + 1] = canvas[di + 2] = 128; canvas[di + 3] = 255; continue; }
+                        if (s == null)
+                        {
+                            canvas[di] = canvas[di + 1] = canvas[di + 2] = 128;
+                            canvas[di + 3] = 255;
+                            continue;
+                        }
                         int sx = w == s.Width ? x : x * s.Width / w;
                         int sy = bandH == s.Height ? y : y * s.Height / bandH;
                         int si = (sy * s.Width + sx) * 4;
-                        canvas[di] = s.Rgba![si]; canvas[di + 1] = s.Rgba[si + 1];
-                        canvas[di + 2] = s.Rgba[si + 2]; canvas[di + 3] = s.Rgba[si + 3];
+                        canvas[di] = s.Rgba![si];
+                        canvas[di + 1] = s.Rgba[si + 1];
+                        canvas[di + 2] = s.Rgba[si + 2];
+                        canvas[di + 3] = s.Rgba[si + 3];
                     }
                 }
             }
@@ -139,18 +158,20 @@ public static class Rh0Assembler
 
         var rh2 = new byte[texCount][];
         var anm = new byte[texCount][];
+        var usedNative = new bool[texCount];
         for (int i = 0; i < texCount; i++)
         {
             // donor: the template's own slot for i < origCount, wrapped around for extras
             int donorSlot = origCount > 0 ? i % origCount : -1;
             var donor = OrigRh2(i < origCount ? i : donorSlot);
-            if (donor.IsEmpty && origCount > 0)               // wrap hit an empty slot
-                for (int k = 0; k < origCount && donor.IsEmpty; k++) donor = OrigRh2(k);
+            if (donor.IsEmpty && origCount > 0) // wrap hit an empty slot
+                for (int k = 0; k < origCount && donor.IsEmpty; k++)
+                    donor = OrigRh2(k);
 
-            if (byTex.TryGetValue(i, out var ti) && ti.Rgba != null && !donor.IsEmpty)
-                rh2[i] = Rh2Encoder.Encode(donor, ti.Rgba, ti.Width, ti.Height);
+            if (byTex.TryGetValue(i, out var ti) && ti.Rgba != null && ti.Width > 0 && ti.Height > 0)
+                rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, rebuildNative, maxTexDim, out usedNative[i]);
             else
-                rh2[i] = donor.ToArray();                     // template texture verbatim
+                rh2[i] = donor.ToArray(); // template texture verbatim
 
             // ANM (texture-animation frames) only exists for the template's own slots
             int postOff = i < origCount ? (int)U32(originalMrg, origTt + 0x10 + i * 16 + 8) : 0;
@@ -176,19 +197,64 @@ public static class Rh0Assembler
 
         // ---- shed extra texture slots that would overflow the 1 MiB block ----
         byte[] postMotEarly = CapturePostMotChain(originalMrg);
+
         int EstimateTotal(int count)
         {
             int c = HeaderPreambleEnd;
-            int Add(int len) { if (len > 0) c = ((c + 0xF) & ~0xF) + len; return c; }
-            Add(nodeTree.Length); Add(geo.Section1.Length); Add(geo.Section2.Length);
-            Add(geo.Section1Alt.Length); Add(geo.Section2Alt.Length); Add(geo.RelocWalk.Length);
+
+            int Add(int len)
+            {
+                if (len > 0) c = ((c + 0xF) & ~0xF) + len;
+                return c;
+            }
+
+            Add(nodeTree.Length);
+            Add(geo.Section1.Length);
+            Add(geo.Section2.Length);
+            Add(geo.Section1Alt.Length);
+            Add(geo.Section2Alt.Length);
+            Add(geo.RelocWalk.Length);
             Add(Align16(0x10 + count * 16 + count * 8 + geo.TexDispatch.Count * 4)); // texTable
-            Add(aux0.Length); Add(aux1.Length); Add(aux2.Length);
+            Add(aux0.Length);
+            Add(aux1.Length);
+            Add(aux2.Length);
             for (int i = 0; i < count; i++) Add(rh2[i].Length);
             for (int i = 0; i < count; i++) Add(anm[i].Length);
-            Add(motBlocks.Length); Add(postMotEarly.Length);
+            Add(motBlocks.Length);
+            Add(postMotEarly.Length);
             return c;
         }
+
+        // ---- native-rebuild budget: downgrade oversized native slots to fit the block ----
+        // BuildNative slots can dwarf the donor's footprint. For the fixed 1 MiB monster.mrg
+        // block, if the layout would overflow, downgrade native slots (largest first) back to
+        // the donor-fit Encode/verbatim path until it fits. This keeps a valid render (lower
+        // res) instead of throwing; the proper "grow the archive" handling is Phase 2/3.
+        if (rebuildNative)
+        {
+            while (EstimateTotal(texCount) > blockSize)
+            {
+                int big = -1, bigLen = -1;
+                for (int i = 0; i < texCount; i++)
+                    if (usedNative[i] && rh2[i].Length > bigLen)
+                    {
+                        bigLen = rh2[i].Length;
+                        big = i;
+                    }
+                if (big < 0) break; // nothing native left to downgrade
+
+                int dSlot = big < origCount ? big : (origCount > 0 ? big % origCount : -1);
+                var donor = OrigRh2(dSlot);
+                if (donor.IsEmpty && origCount > 0)
+                    for (int k = 0; k < origCount && donor.IsEmpty; k++)
+                        donor = OrigRh2(k);
+                rh2[big] = (byTex.TryGetValue(big, out var t) && t.Rgba != null && !donor.IsEmpty)
+                    ? Rh2Encoder.Encode(donor, t.Rgba, t.Width, t.Height)
+                    : donor.ToArray();
+                usedNative[big] = false;
+            }
+        }
+
         while (texCount > origCount && EstimateTotal(texCount) > blockSize) texCount--;
         if (texCount != rh2.Length)
         {
@@ -198,7 +264,12 @@ public static class Rh0Assembler
 
         // ---- dispatch remap: every entry must land on a slot with a real RH2 ----
         int fallbackSlot = -1;
-        for (int i = 0; i < texCount; i++) if (rh2[i].Length > 0) { fallbackSlot = i; break; }
+        for (int i = 0; i < texCount; i++)
+            if (rh2[i].Length > 0)
+            {
+                fallbackSlot = i;
+                break;
+            }
         var dispatch = new List<(int TexIdx, uint Entry)>(geo.TexDispatch.Count);
         foreach (var (ti_, entry) in geo.TexDispatch)
         {
@@ -208,10 +279,11 @@ public static class Rh0Assembler
                 int wrapped = texCount > 0 ? t % texCount : -1;
                 t = (wrapped >= 0 && rh2[wrapped].Length > 0) ? wrapped : fallbackSlot;
             }
-            if (t < 0) throw new InvalidOperationException(
-                "the template model carries no RH2 texture payloads, so there is no donor " +
-                "block to encode the import's textures into (RH2 synthesis from scratch is " +
-                "not supported) - inject over a template that has at least one texture");
+            if (t < 0)
+                throw new InvalidOperationException(
+                    "the template model carries no RH2 texture payloads, so there is no donor " +
+                    "block to encode the import's textures into (RH2 synthesis from scratch is " +
+                    "not supported) - inject over a template that has at least one texture");
             dispatch.Add((t, entry));
         }
 
@@ -220,7 +292,15 @@ public static class Rh0Assembler
         Array.Copy(originalMrg, 0, outBuf, 0, Math.Min(HeaderPreambleEnd, originalMrg.Length));
 
         int cursor = HeaderPreambleEnd;
-        int Place(byte[] data) { int o = Align16(cursor); cursor = o + data.Length; if (cursor > blockSize) throw new InvalidOperationException("RH0 exceeds 1 MiB block"); Array.Copy(data, 0, outBuf, o, data.Length); return o; }
+
+        int Place(byte[] data)
+        {
+            int o = Align16(cursor);
+            cursor = o + data.Length;
+            if (cursor > blockSize) throw new InvalidOperationException("RH0 exceeds 1 MiB block");
+            Array.Copy(data, 0, outBuf, o, data.Length);
+            return o;
+        }
 
         int nodeTreeOff = Place(nodeTree);
         int section1Off = Place(geo.Section1);
@@ -242,10 +322,15 @@ public static class Rh0Assembler
         int texDataOff = 0;
         for (int i = 0; i < texCount; i++)
         {
-            if (rh2[i].Length > 0) { rh2Offs[i] = Place(rh2[i]); if (texDataOff == 0) texDataOff = rh2Offs[i]; }
+            if (rh2[i].Length > 0)
+            {
+                rh2Offs[i] = Place(rh2[i]);
+                if (texDataOff == 0) texDataOff = rh2Offs[i];
+            }
         }
         for (int i = 0; i < texCount; i++)
-            if (anm[i].Length > 0) anmOffs[i] = Place(anm[i]);
+            if (anm[i].Length > 0)
+                anmOffs[i] = Place(anm[i]);
 
         // ---- header[0x0C] trailing-region chain ----
         // lSzModel_BindModelByAddr@0x1ee190 walks a cursor starting at header[0x0C], driven
@@ -278,15 +363,24 @@ public static class Rh0Assembler
         W32(outBuf, 0x0C, (uint)motOff);
         W32(outBuf, 0x10, (uint)nodeTreeOff);
         W32(outBuf, 0x14, (uint)nodeTree.Length);
-        W32(outBuf, 0x18, (uint)section1Off);  W32(outBuf, 0x1C, (uint)geo.Section1.Length);
-        W32(outBuf, 0x20, (uint)section2Off);  W32(outBuf, 0x24, (uint)geo.Section2.Length);
-        W32(outBuf, 0x28, (uint)section1AltOff); W32(outBuf, 0x2C, (uint)geo.Section1Alt.Length);
-        W32(outBuf, 0x30, (uint)section2AltOff); W32(outBuf, 0x34, (uint)geo.Section2Alt.Length);
-        W32(outBuf, 0x38, (uint)texTableOff);  W32(outBuf, 0x3C, (uint)texTable.Length);
-        W32(outBuf, 0x40, (uint)aux0Off);      W32(outBuf, 0x44, (uint)aux0.Length);
-        W32(outBuf, 0x48, (uint)aux1Off);      W32(outBuf, 0x4C, (uint)aux1.Length);
-        W32(outBuf, 0x50, (uint)relocWalkOff); W32(outBuf, 0x54, (uint)geo.RelocWalk.Length);
-        W32(outBuf, 0x58, (uint)aux2Off);      W32(outBuf, 0x5C, (uint)aux2.Length);
+        W32(outBuf, 0x18, (uint)section1Off);
+        W32(outBuf, 0x1C, (uint)geo.Section1.Length);
+        W32(outBuf, 0x20, (uint)section2Off);
+        W32(outBuf, 0x24, (uint)geo.Section2.Length);
+        W32(outBuf, 0x28, (uint)section1AltOff);
+        W32(outBuf, 0x2C, (uint)geo.Section1Alt.Length);
+        W32(outBuf, 0x30, (uint)section2AltOff);
+        W32(outBuf, 0x34, (uint)geo.Section2Alt.Length);
+        W32(outBuf, 0x38, (uint)texTableOff);
+        W32(outBuf, 0x3C, (uint)texTable.Length);
+        W32(outBuf, 0x40, (uint)aux0Off);
+        W32(outBuf, 0x44, (uint)aux0.Length);
+        W32(outBuf, 0x48, (uint)aux1Off);
+        W32(outBuf, 0x4C, (uint)aux1.Length);
+        W32(outBuf, 0x50, (uint)relocWalkOff);
+        W32(outBuf, 0x54, (uint)geo.RelocWalk.Length);
+        W32(outBuf, 0x58, (uint)aux2Off);
+        W32(outBuf, 0x5C, (uint)aux2.Length);
         W32(outBuf, 0x60, 0);
         BinaryPrimitives.WriteSingleLittleEndian(outBuf.AsSpan(0x64), rebuilt.AnimTransScale);
 
@@ -303,16 +397,18 @@ public static class Rh0Assembler
         if ((flags & 0x003FFF00u) == 0) return Array.Empty<byte>();
 
         int cur = (int)U32(orig, 0x0C);
-        for (int slot = 0; slot < 8; slot++)                 // skip original MOTs
-            if ((flags & (1u << slot)) != 0) cur += (int)U32(orig, cur + 4);
+        for (int slot = 0; slot < 8; slot++) // skip original MOTs
+            if ((flags & (1u << slot)) != 0)
+                cur += (int)U32(orig, cur + 4);
         int start = cur;
 
-        if ((flags & 0x100u) != 0) cur += 0x8000;            // bit 8: fixed-size region
-        if ((flags & 0x200u) != 0) cur += (int)U32(orig, cur + 8);   // bit 9: RhText block
-        if ((flags & 0x400u) != 0) cur += 0x8000;            // bit 10: fixed-size region
-        for (int i = 0; i < 8; i++)                          // bits 11-18: RhText blocks
-            if ((flags & (1u << (11 + i))) != 0) cur += (int)U32(orig, cur + 8);
-        if ((flags & 0x80000u) != 0) cur += ((int)U32(orig, cur + 8) + 0xF) & ~0xF;  // bit 19
+        if ((flags & 0x100u) != 0) cur += 0x8000; // bit 8: fixed-size region
+        if ((flags & 0x200u) != 0) cur += (int)U32(orig, cur + 8); // bit 9: RhText block
+        if ((flags & 0x400u) != 0) cur += 0x8000; // bit 10: fixed-size region
+        for (int i = 0; i < 8; i++) // bits 11-18: RhText blocks
+            if ((flags & (1u << (11 + i))) != 0)
+                cur += (int)U32(orig, cur + 8);
+        if ((flags & 0x80000u) != 0) cur += ((int)U32(orig, cur + 8) + 0xF) & ~0xF; // bit 19
         if ((flags & 0x100000u) != 0) cur += ((int)U32(orig, cur + 8) + 0xF) & ~0xF; // bit 20
         if ((flags & 0x200000u) != 0)
         {
@@ -360,11 +456,17 @@ public static class Rh0Assembler
             // per texture-context record, pointing at its TEX0_1 placeholder (record + 0x70).
             // Emission order (main, then alt) is preserved.
             var entries = new List<uint>();
-            foreach (var (texIdx, entry) in texDispatch) if (texIdx == t) entries.Add(entry);
+            foreach (var (texIdx, entry) in texDispatch)
+                if (texIdx == t)
+                    entries.Add(entry);
             int d = ttOff + descOff + t * 8;
-            W32(buf, d + 0x00, (uint)entries.Count);  // nDisp
+            W32(buf, d + 0x00, (uint)entries.Count); // nDisp
             W32(buf, d + 0x04, (uint)(disp - ttOff)); // dispOff (rel TexTable)
-            foreach (var e in entries) { W32(buf, disp, e); disp += 4; }
+            foreach (var e in entries)
+            {
+                W32(buf, disp, e);
+                disp += 4;
+            }
         }
     }
 
@@ -378,7 +480,41 @@ public static class Rh0Assembler
         return b;
     }
 
+    // ---- texture encode strategy ----------------------------------------------------
+    // Native (from-scratch POT RH2 via BuildNative) is used only when enabled AND the source
+    // exceeds the donor's decoded dimensions; otherwise the validated donor template-patch
+    // path (Encode) is kept. With no donor, native is the only way to produce a slot.
+    private static byte[] EncodeTexture(ReadOnlySpan<byte> donor, byte[] rgba, int w, int h,
+        bool allowNative, int maxDim, out bool wentNative)
+    {
+        wentNative = false;
+        bool haveDonor = !donor.IsEmpty && donor.Length >= 0x60;
+        if (haveDonor)
+        {
+            var (decW, decH) = DonorDecodedDims(donor);
+            if (!allowNative || (w <= decW && h <= decH))
+                return Rh2Encoder.Encode(donor, rgba, w, h);
+        }
+        else if (!allowNative)
+        {
+            return donor.ToArray(); // empty donor and native off: nothing to encode into
+        }
+
+        var (tw, th) = Rh2Encoder.ChooseTarget(w, h, maxDim);
+        wentNative = true;
+        return Rh2Encoder.BuildNative(rgba, w, h, tw, th);
+    }
+
+    // Decoded image dimensions a donor RH2 represents (PSMT4 decodes to half size).
+    private static (int W, int H) DonorDecodedDims(ReadOnlySpan<byte> donor)
+    {
+        int psm = U16(donor, 0x50);
+        int w = U16(donor, 0x54), h = U16(donor, 0x56);
+        return psm == 0x14 ? (Math.Max(w / 2, 1), Math.Max(h / 2, 1)) : (w, h);
+    }
+
     private static int Align16(int v) => (v + (Align - 1)) & ~(Align - 1);
     private static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o));
+    private static int U16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt16LittleEndian(d.Slice(o));
     private static void W32(byte[] d, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(d.AsSpan(o), v);
 }

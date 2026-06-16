@@ -197,6 +197,13 @@ public class ModelViewerWindow
             return;
         }
 
+        // Advance the texture-animation clock (DOTR_texAnim frame cycling). It runs in
+        // lockstep with skeletal speed and is frozen above in static pose; for models with
+        // no skeleton it still plays so texture-only animations are visible. Without this
+        // tick TexAnimTime stays 0 and every animated texture is pinned to frame 0.
+        if (animPlaying || model.AnimationCount == 0)
+            model.AdvanceTextureAnim(Raylib.GetFrameTime() * animSpeed);
+
         if (model.AnimationCount > 0 && animPlaying)
         {
             float dur = model.Duration(currentAnim);

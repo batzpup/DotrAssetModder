@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using SharpGLTF.Schema2;
 
 namespace DotrAssetModder;
@@ -91,6 +91,34 @@ public sealed class ImportedModel
     /// same instance. Carries the merge plan (base slot -> member slots in band order).
     public List<(int BaseSlot, List<int> MemberSlots)>? AppliedTexMerges;
 
+    /// True for GLBs produced by this project's extractor. Extracted GLBs contain an
+    /// `MrgRoot` wrapper and already have skinned positions baked into the extractor's
+    /// round-trip coordinate space, so the importer must not treat them like generic
+    /// Blender/Sketchfab GLBs.
+    public bool IsDotrExtractedGlb;
+
+    /// Optional Blender authoring marker. Empty/node named `camera_lookat` marks the
+    /// source point that should map to the donor MRG's bounds/camera centre. When absent,
+    /// the importer uses the source geometry bbox centre.
+    public Vector3? AuthorCameraLookAtWorld;
+
+    /// Optional Blender authoring marker. Empty/node named `worldPosCenter` marks the
+    /// source placement/pivot point. Used with camera_lookat to infer a better scale into
+    /// the donor frame; GNode(1) itself is still written from the donor MRG for external
+    /// replacements.
+    public Vector3? AuthorWorldPosCenterWorld;
+
+    /// RebuildPipeline may fit an external imported model into the donor/template model's
+    /// coordinate frame before encoding. These are the fitted/output-space equivalents
+    /// of the authoring markers, used later when writing the node-tree bounds record
+    /// and for diagnostics.
+    public Vector3? FittedCameraLookAtWorld;
+
+    /// RebuildPipeline may fit an external imported model into the donor/template model's
+    /// coordinate frame before encoding. This guard prevents applying the same transform
+    /// twice when callers reuse an ImportedModel instance across preview/build passes.
+    public bool AppliedTemplateFrameFit;
+
     public string Summary() =>
         $"nodes={Nodes.Count} joints={JointNodeIndices.Count} prims={Primitives.Count} " +
         $"tris={Primitives.Sum(p => p.Triangles.Count)} verts={Primitives.Sum(p => p.Vertices.Count)} " +
@@ -105,7 +133,11 @@ public static class GlbImporter
 
     private static ImportedModel FromModel(ModelRoot model)
     {
-        var im = new ImportedModel();
+        var im = new ImportedModel
+        {
+            IsDotrExtractedGlb = model.LogicalNodes.Any(n =>
+                string.Equals(n.Name, "MrgRoot", StringComparison.Ordinal))
+        };
 
         // --- nodes / hierarchy ---
         var byLogical = new Dictionary<int, int>(); // logical index -> position in im.Nodes
@@ -130,6 +162,13 @@ public static class GlbImporter
             node.Parent = n.VisualParent != null ? n.VisualParent.LogicalIndex : -1;
             if (node.Parent < 0) im.RootNodes.Add(node.Index);
             foreach (var c in n.VisualChildren) node.Children.Add(c.LogicalIndex);
+
+            // Authoring-only empties/markers. These are NOT meant to be emitted as real
+            // GNodes; RebuildPipeline skips them during DFS.
+            if (IsCameraLookAtMarker(node.Name))
+                im.AuthorCameraLookAtWorld = node.WorldMatrix.Translation;
+            else if (IsWorldPosCenterMarker(node.Name))
+                im.AuthorWorldPosCenterWorld = node.WorldMatrix.Translation;
         }
 
         // --- skin joints ---
@@ -215,8 +254,23 @@ public static class GlbImporter
                     var iv = new ImportedVertex();
                     if (skinnedPrim)
                     {
-                        iv.Pos = pos[v];
-                        iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
+                        if (im.IsDotrExtractedGlb)
+                        {
+                            // Extractor GLBs are already baked/recentred for lossless round-trip.
+                            // Applying the mesh node's world matrix here double-applies MrgRoot.
+                            iv.Pos = pos[v];
+                            iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
+                        }
+                        else
+                        {
+                            // Generic Blender/Sketchfab GLBs often carry meaningful Armature/root
+                            // transforms. Bake them so bounds, donor-frame fitting and bind math all
+                            // use the actual authored world position.
+                            iv.Pos = Vector3.Transform(pos[v], nodeWorld);
+                            iv.Normal = nrm != null
+                                ? SafeNormalize(Vector3.TransformNormal(nrm[v], nodeWorld))
+                                : Vector3.UnitY;
+                        }
                     }
                     else
                     {
@@ -274,6 +328,21 @@ public static class GlbImporter
         }
         return im;
     }
+
+    internal static bool IsCameraLookAtMarker(string? name) =>
+        name != null &&
+        (name.Equals("camera_lookat", StringComparison.OrdinalIgnoreCase) ||
+         name.Equals("cameraLookAt", StringComparison.OrdinalIgnoreCase) ||
+         name.Equals("dotr_camera_lookat", StringComparison.OrdinalIgnoreCase));
+
+    internal static bool IsWorldPosCenterMarker(string? name) =>
+        name != null &&
+        (name.Equals("worldPosCenter", StringComparison.OrdinalIgnoreCase) ||
+         name.Equals("world_pos_center", StringComparison.OrdinalIgnoreCase) ||
+         name.Equals("dotr_world_pos_center", StringComparison.OrdinalIgnoreCase));
+
+    internal static bool IsAuthoringMarker(string? name) =>
+        IsCameraLookAtMarker(name) || IsWorldPosCenterMarker(name);
 
     // JOINTS_0 holds skin-joint indices; map to the actual glb node index via the skin order.
     private static void AddInfluence(ImportedVertex iv, ImportedModel im, int skinJointIndex, float weight)

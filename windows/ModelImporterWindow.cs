@@ -16,13 +16,14 @@ public class ModelImporterWindow
     string status;
     bool statusOk;
 
-    // ---- auto-scale controls ----
-    bool autoScale = true;          // master toggle
-    bool manualScale = false;       // override the auto-fit with an explicit multiplier
-    float manualScaleValue = 1.0f;  // fraction of donor size when manualScale is on
-    float fitMinRatio = 0.125f;     // below this * donor size -> "too small", auto-upscale
-    float fitMaxRatio = 2.0f;       // above this * donor size -> "too large", auto-downscale
-    string fitMessage;              // last import's fit explanation (for display)
+   
+    const float WarnMinRatio = 0.25f;  // below this * donor size -> warn "too small"
+    const float WarnMaxRatio = 1.75f;    // above this * donor size -> warn "too large"
+    bool rebuildTexNative = false;  // rebuild imported textures at native POT size (vs squeeze-to-donor)
+    int maxTexDimIndex = 1;         // 0 = 256, 1 = 512, 2 = 1024 (opt-in)
+    static readonly int[] MaxTexDims = { 256, 512, 1024 };
+    static readonly string[] MaxTexDimLabels = { "256", "512 (recommended)", "1024 (opt-in for non monster, untested)" };
+    string fitMessage;              
 
     public void Render()
     {
@@ -57,31 +58,25 @@ public class ModelImporterWindow
         modelIndex = Math.Clamp(modelIndex, 0, Math.Max(0, maxModelIndex));
 
         ImGui.Separator();
-        ImGui.Checkbox("Auto-scale to fit", ref autoScale);
+        // No auto-scaling: models import at their authored size. A size warning (set after
+        // each import) is shown so the user can rescale in their editor if it's off.
+        if (fitMessage != null)
+            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.7f, 0.3f, 1f), "\u26A0 " + fitMessage);
+        ImGui.Separator();
+
+        ImGui.Checkbox("Rebuild textures to native size", ref rebuildTexNative);
         if (ImGui.IsItemHovered())
-            ImGui.SetTooltip("Automatically resize models that are far larger or smaller " +
-                             "than the slot they replace, so they appear at a sensible size.");
-        if (autoScale)
+            ImGui.SetTooltip("Rebuild each imported texture as a fresh power-of-two RH2 slot \n" +
+                "instead of squeezing it into the donor slot's dimensions. Sources that already \n" +
+                "fit their donor keep the cheaper path. Native slots that would overflow the \n" +
+                "1 MiB model block are downgraded back to the donor size (largest first).");
+        if (rebuildTexNative)
         {
             ImGui.Indent();
-            ImGui.SetNextItemWidth(120);
-            ImGui.DragFloat("Min size (x donor)", ref fitMinRatio, 0.01f, 0.01f, 1.0f, "%.3f");
-            ImGui.SetNextItemWidth(120);
-            ImGui.DragFloat("Max size (x donor)", ref fitMaxRatio, 0.05f, 1.0f, 64.0f, "%.2f");
-            if (fitMaxRatio < fitMinRatio) fitMaxRatio = fitMinRatio;
-            if (ImGui.IsItemHovered())
-                ImGui.SetTooltip("A model is only rescaled if its size falls outside " +
-                                 "[min, max] times the donor slot's own size.");
-            ImGui.Checkbox("Manual scale override", ref manualScale);
-            if (manualScale)
-            {
-                ImGui.SetNextItemWidth(160);
-                ImGui.SliderFloat("Scale (x donor size)", ref manualScaleValue, 0.05f, 8.0f, "%.2fx");
-            }
+            ImGui.SetNextItemWidth(220);
+            ImGui.Combo("Max texture size", ref maxTexDimIndex, MaxTexDimLabels, MaxTexDimLabels.Length);
             ImGui.Unindent();
         }
-        if (fitMessage != null)
-            ImGui.TextColored(new System.Numerics.Vector4(1f, 0.85f, 0.4f, 1f), fitMessage);
         ImGui.Separator();
 
         ImGui.BeginDisabled(modelPath is null);
@@ -165,16 +160,14 @@ public class ModelImporterWindow
 
             var opt = new Rebuilder.Options
             {
-                AutoFit = autoScale,
-                FitMinRatio = fitMinRatio,
-                FitMaxRatio = fitMaxRatio,
-                WorldFitScale = (autoScale && manualScale) ? manualScaleValue : 1f,
+                WarnMinRatio = WarnMinRatio,
+                WarnMaxRatio = WarnMaxRatio,
+                RebuildTexturesNative = rebuildTexNative,
+                MaxTextureDim = MaxTexDims[Math.Clamp(maxTexDimIndex, 0, MaxTexDims.Length - 1)],
             };
             var fitInfo = new Rebuilder.FitInfo();
             byte[] newBlock = Rebuilder.Rebuild(model, template, texInputs, opt, fitInfo);
-            fitMessage = fitInfo.Rescaled
-                ? "Scaled: " + fitInfo.Message
-                : "No rescale (model size within range).";
+            fitMessage = fitInfo.HasWarning ? fitInfo.Message : null;
 
             long isoOffset = fl.GetStartOfModel(dataPath, modelIndex);
             if (isoOffset < 0) throw new Exception("could not locate this file inside the ISO");
