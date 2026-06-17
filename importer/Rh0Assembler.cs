@@ -39,7 +39,8 @@ public static class Rh0Assembler
 
     public static byte[] Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
         IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
-        bool rebuildNative = false, int maxTexDim = 512)
+        bool rebuildNative = false, int maxTexDim = 512,
+        bool neutralMissingTextures = true, bool preserveTemplateAnm = false)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
 
@@ -169,12 +170,35 @@ public static class Rh0Assembler
                     donor = OrigRh2(k);
 
             if (byTex.TryGetValue(i, out var ti) && ti.Rgba != null && ti.Width > 0 && ti.Height > 0)
+            {
                 rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, rebuildNative, maxTexDim, out usedNative[i]);
+            }
+            else if (neutralMissingTextures)
+            {
+                // Do not inherit whatever picture happened to be in this slot from a previous import.
+                // Encode a small neutral white texture into the donor RH2 container when possible, or
+                // build a native RH2 from scratch if no donor texture exists.
+                int nw = 128, nh = 128;
+                if (!donor.IsEmpty && donor.Length >= 0x60)
+                {
+                    var dims = DonorDecodedDims(donor);
+                    nw = Math.Clamp(dims.W, 1, Math.Max(1, maxTexDim));
+                    nh = Math.Clamp(dims.H, 1, Math.Max(1, maxTexDim));
+                }
+                var neutral = CreateNeutralRgba(nw, nh);
+                bool allowNativeFallback = donor.IsEmpty || rebuildNative;
+                rh2[i] = EncodeTexture(donor, neutral, nw, nh, allowNativeFallback, maxTexDim, out usedNative[i]);
+            }
             else
-                rh2[i] = donor.ToArray(); // template texture verbatim
+            {
+                rh2[i] = donor.ToArray(); // explicit legacy mode: template texture verbatim
+            }
 
-            // ANM (texture-animation frames) only exists for the template's own slots
-            int postOff = i < origCount ? (int)U32(originalMrg, origTt + 0x10 + i * 16 + 8) : 0;
+            // Texture animation is layout/slot data from the template. Default off for custom imports
+            // to prevent previous-slot ANM from contaminating unrelated GLBs.
+            int postOff = preserveTemplateAnm && i < origCount
+                ? (int)U32(originalMrg, origTt + 0x10 + i * 16 + 8)
+                : 0;
             anm[i] = postOff > 0 ? TexAnmWriter.ExtractEntries(originalMrg, postOff) : Array.Empty<byte>();
         }
 
@@ -484,6 +508,21 @@ public static class Rh0Assembler
     // Native (from-scratch POT RH2 via BuildNative) is used only when enabled AND the source
     // exceeds the donor's decoded dimensions; otherwise the validated donor template-patch
     // path (Encode) is kept. With no donor, native is the only way to produce a slot.
+    private static byte[] CreateNeutralRgba(int w, int h)
+    {
+        w = Math.Max(1, w);
+        h = Math.Max(1, h);
+        var rgba = new byte[w * h * 4];
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            rgba[i + 0] = 255;
+            rgba[i + 1] = 255;
+            rgba[i + 2] = 255;
+            rgba[i + 3] = 255;
+        }
+        return rgba;
+    }
+
     private static byte[] EncodeTexture(ReadOnlySpan<byte> donor, byte[] rgba, int w, int h,
         bool allowNative, int maxDim, out bool wentNative)
     {

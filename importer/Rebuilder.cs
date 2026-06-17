@@ -1,3 +1,5 @@
+using System.Numerics;
+
 namespace DotrAssetModder;
 
 // === Step 6 — Rebuilder facade =======================================================
@@ -22,6 +24,7 @@ public static class Rebuilder
         /// surfaces a warning (FitInfo.Message) so the user can rescale it themselves.
         /// No automatic rescaling is ever applied — the model is imported as authored.
         public float WarnMinRatio = 0.125f;
+
         public float WarnMaxRatio = 2.0f;
 
         /// Rebuild imported textures at their native (power-of-two) size via
@@ -31,36 +34,40 @@ public static class Rebuilder
         /// overflow are downgraded back to the donor-fit path (largest first) until the block
         /// fits. Default off (preserves the previous squeeze-to-donor behaviour).
         public bool RebuildTexturesNative = false;
+
         /// Max width/height for a native rebuild target (power of two). 512 is the
         /// retail-plausible default; 1024 is opt-in and untested on hardware.
         public int MaxTextureDim = 512;
 
-        /// External Blender/Sketchfab GLBs do not carry DotR's slot-specific pivot/camera
-        /// frame. When this is true, non-MrgRoot GLBs are transformed into the original
-        /// donor MRG's frame: camera_lookat/bbox-centre maps to donor bounds centre, and
-        /// GNode(1) is written at the donor pivot. Extracted DotR GLBs are never fitted;
-        /// they round-trip their original tree.
-        public bool FitExternalModelsToTemplateFrame = true;
+        /// Deprecated compatibility flags. They are intentionally ignored by the generated-frame
+        /// pipeline: the donor MRG is diagnostics/container data only, never spatial authority.
+        public bool FitExternalModelsToTemplateFrame = false;
 
-        /// When fitting an external model to the donor frame, scale it uniformly to match
-        /// either the donor pivot->camera distance (when camera_lookat + worldPosCenter
-        /// markers are present) or the donor bounds radius. Disable this to only translate
-        /// into the donor frame.
-        public bool ScaleExternalModelsToTemplateFrame = true;
+        public bool ScaleExternalModelsToTemplateFrame = false;
 
-        /// Fallback camera target height for external Blender GLBs when no camera_lookat
-        /// empty exists. 0.55 means aim slightly above the vertical midpoint, using
-        /// worldPosCenter/Blender origin for X/Z so asymmetric geometry does not pull the
-        /// camera/pivot behind the model.
-        public float ExternalCameraLookAtHeightRatio = 0.55f;
+        /// Custom GLBs generate their own rootScale/animTransScale by default. Enable this
+        /// only if intentionally testing retail-slot/template scale compatibility.
+        public bool AdoptTemplateScaleForCustomModels = false;
+
+        /// When true, missing GLB texture slots are filled with a generated neutral texture
+        /// instead of copying whatever RH2 happened to be in the template slot. This prevents
+        /// one imported model's textures from contaminating the next import.
+        public bool UseNeutralTextureForMissingSlots = true;
+
+        /// When false, template texture animation post entries are not copied into custom
+        /// imports. Enable only when intentionally preserving original slot texture animation.
+        public bool PreserveTemplateTextureAnimation = false;
+
+        /// Print frame diagnostics to the console during rebuild.
+        public bool DebugFrame = true;
     }
 
     /// Size-check outcome, for surfacing a warning in the UI. No rescaling is performed.
     public sealed class FitInfo
     {
-        public double OriginalWorld;          // model's world extent
-        public double DonorWorld;             // donor template's reference extent
-        public string? Message;               // size warning, or null when in-band
+        public double OriginalWorld; // model's world extent
+        public double DonorWorld; // donor template's reference extent
+        public string? Message; // size warning, or null when in-band
         public bool HasWarning => Message != null;
     }
 
@@ -102,7 +109,8 @@ public static class Rebuilder
         var templateFrame = ReadTemplateFrame(originalMrg);
         var rebuilt = RebuildPipeline.Build(model, templateATS, templateTexCount,
             opt.WarnMinRatio, opt.WarnMaxRatio, templateFrame,
-            opt.FitExternalModelsToTemplateFrame, opt.ScaleExternalModelsToTemplateFrame, opt.ExternalCameraLookAtHeightRatio);
+            opt.FitExternalModelsToTemplateFrame, opt.ScaleExternalModelsToTemplateFrame,
+            opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels);
 
         if (fit != null)
         {
@@ -111,8 +119,10 @@ public static class Rebuilder
             fit.Message = rebuilt.FitReason;
         }
         return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, 0x100000,
-            opt.RebuildTexturesNative, opt.MaxTextureDim);
+            opt.RebuildTexturesNative, opt.MaxTextureDim,
+            opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation);
     }
+
     private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)
     {
         if (originalMrg.Length < 0x68) return null;
@@ -145,6 +155,10 @@ public static class Rebuilder
             PivotWorld = pivot,
             BoundsCenterWorld = bounds,
             BoundsRadius = radius,
+            NodeTreeOffset = nodeTree,
+            AnimTransScale = ats,
+            RootScale = 1f / ats,
+            PivotRaw = pivotRaw,
         };
 
         static bool IsFinite(System.Numerics.Vector3 v) =>
@@ -152,5 +166,4 @@ public static class Rebuilder
             !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
             !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);
     }
-
 }

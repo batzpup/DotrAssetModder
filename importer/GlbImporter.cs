@@ -26,6 +26,7 @@ public sealed class ImportedNode
     public int Parent = -1;
     public List<int> Children = new();
     public bool IsJoint;                    // referenced by the skin
+    public bool HasMesh;                    // true when this node instantiates a glTF mesh
 }
 
 public struct ImportedInfluence
@@ -36,8 +37,21 @@ public struct ImportedInfluence
 
 public sealed class ImportedVertex
 {
-    public Vector3 Pos;                     // world-space bind position
-    public Vector3 Normal;                  // world-space normal (unit)
+    /// Position used by the geometry/skinning encoder.
+    /// For skinned meshes this stays in the mesh/skin bind space so animation remains coherent.
+    /// For unskinned meshes this is already world-baked.
+    public Vector3 Pos;
+
+    /// Position transformed by the glTF mesh node's world matrix.
+    /// This is useful for frame/pivot/camera diagnostics on some external skinned GLBs,
+    /// but must not be used for skin encoding unless deliberately selected.
+    public Vector3 MeshNodeWorldPos;
+
+    /// Current frame-generation position. RebuildPipeline selects this from Pos or
+    /// MeshNodeWorldPos depending on ExternalSkinnedFrameSource. Do not use this for skinning.
+    public Vector3 FramePos;
+
+    public Vector3 Normal;                  // normal used by the geometry encoder
     public Vector2 Uv;
     public List<ImportedInfluence> Influences = new(); // 0 => rigid to the prim's mesh node
 }
@@ -97,15 +111,10 @@ public sealed class ImportedModel
     /// Blender/Sketchfab GLBs.
     public bool IsDotrExtractedGlb;
 
-    /// Optional Blender authoring marker. Empty/node named `camera_lookat` marks the
-    /// source point that should map to the donor MRG's bounds/camera centre. When absent,
-    /// the importer uses the source geometry bbox centre.
+    /// Deprecated/unused in DOTR-convention mode. Marker names are intentionally ignored.
     public Vector3? AuthorCameraLookAtWorld;
 
-    /// Optional Blender authoring marker. Empty/node named `worldPosCenter` marks the
-    /// source placement/pivot point. Used with camera_lookat to infer a better scale into
-    /// the donor frame; GNode(1) itself is still written from the donor MRG for external
-    /// replacements.
+    /// Deprecated/unused in DOTR-convention mode. Marker names are intentionally ignored.
     public Vector3? AuthorWorldPosCenterWorld;
 
     /// RebuildPipeline may fit an external imported model into the donor/template model's
@@ -162,13 +171,6 @@ public static class GlbImporter
             node.Parent = n.VisualParent != null ? n.VisualParent.LogicalIndex : -1;
             if (node.Parent < 0) im.RootNodes.Add(node.Index);
             foreach (var c in n.VisualChildren) node.Children.Add(c.LogicalIndex);
-
-            // Authoring-only empties/markers. These are NOT meant to be emitted as real
-            // GNodes; RebuildPipeline skips them during DFS.
-            if (IsCameraLookAtMarker(node.Name))
-                im.AuthorCameraLookAtWorld = node.WorldMatrix.Translation;
-            else if (IsWorldPosCenterMarker(node.Name))
-                im.AuthorWorldPosCenterWorld = node.WorldMatrix.Translation;
         }
 
         // --- skin joints ---
@@ -221,6 +223,8 @@ public static class GlbImporter
         foreach (var meshNode in model.LogicalNodes)
         {
             if (meshNode.Mesh == null) continue;
+            if (byLogical.TryGetValue(meshNode.LogicalIndex, out int meshNodePos))
+                im.Nodes[meshNodePos].HasMesh = true;
             bool nodeSkinned = meshNode.Skin != null;
             Matrix4x4 nodeWorld = meshNode.WorldMatrix;
             if (!nodeSkinned)
@@ -254,27 +258,28 @@ public static class GlbImporter
                     var iv = new ImportedVertex();
                     if (skinnedPrim)
                     {
-                        if (im.IsDotrExtractedGlb)
-                        {
-                            // Extractor GLBs are already baked/recentred for lossless round-trip.
-                            // Applying the mesh node's world matrix here double-applies MrgRoot.
-                            iv.Pos = pos[v];
-                            iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
-                        }
-                        else
-                        {
-                            // Generic Blender/Sketchfab GLBs often carry meaningful Armature/root
-                            // transforms. Bake them so bounds, donor-frame fitting and bind math all
-                            // use the actual authored world position.
-                            iv.Pos = Vector3.Transform(pos[v], nodeWorld);
-                            iv.Normal = nrm != null
-                                ? SafeNormalize(Vector3.TransformNormal(nrm[v], nodeWorld))
-                                : Vector3.UnitY;
-                        }
+                        // Skinned vertex positions must stay in skin/bind space for the encoder.
+                        // Baking the mesh node world matrix here can make the skeleton/rest basis
+                        // disagree with the vertices, causing 90-degree rotation or broken animation
+                        // on external Armature-rooted GLBs.
+                        iv.Pos = pos[v];
+                        iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
+
+                        // Keep the mesh-node-world version separately for frame generation. Some
+                        // custom GLBs use this as their authored visual space, while others need the
+                        // raw skin space. RebuildPipeline chooses via ExternalSkinnedFrameSource.
+                        iv.MeshNodeWorldPos = im.IsDotrExtractedGlb
+                            ? iv.Pos
+                            : Vector3.Transform(pos[v], nodeWorld);
+                        iv.FramePos = iv.Pos;
                     }
                     else
                     {
+                        // Static/unskinned meshes are rigidly attached to their mesh node, so bake
+                        // the node world transform directly into the encoded vertices.
                         iv.Pos = Vector3.Transform(pos[v], nodeWorld);
+                        iv.MeshNodeWorldPos = iv.Pos;
+                        iv.FramePos = iv.Pos;
                         iv.Normal = nrm != null ? SafeNormalize(Vector3.TransformNormal(nrm[v], nodeWorld)) : Vector3.UnitY;
                     }
                     iv.Uv = uv != null ? uv[v] : Vector2.Zero;
@@ -329,20 +334,14 @@ public static class GlbImporter
         return im;
     }
 
-    internal static bool IsCameraLookAtMarker(string? name) =>
-        name != null &&
-        (name.Equals("camera_lookat", StringComparison.OrdinalIgnoreCase) ||
-         name.Equals("cameraLookAt", StringComparison.OrdinalIgnoreCase) ||
-         name.Equals("dotr_camera_lookat", StringComparison.OrdinalIgnoreCase));
+    // DOTR-convention mode intentionally does not use string-named authoring markers.
+    // New/custom GLBs should be authored in DOTR space: scene/model origin is the
+    // placement/control point, and geometry is positioned relative to that origin.
+    internal static bool IsCameraLookAtMarker(string? name) => false;
 
-    internal static bool IsWorldPosCenterMarker(string? name) =>
-        name != null &&
-        (name.Equals("worldPosCenter", StringComparison.OrdinalIgnoreCase) ||
-         name.Equals("world_pos_center", StringComparison.OrdinalIgnoreCase) ||
-         name.Equals("dotr_world_pos_center", StringComparison.OrdinalIgnoreCase));
+    internal static bool IsWorldPosCenterMarker(string? name) => false;
 
-    internal static bool IsAuthoringMarker(string? name) =>
-        IsCameraLookAtMarker(name) || IsWorldPosCenterMarker(name);
+    internal static bool IsAuthoringMarker(string? name) => false;
 
     // JOINTS_0 holds skin-joint indices; map to the actual glb node index via the skin order.
     private static void AddInfluence(ImportedVertex iv, ImportedModel im, int skinJointIndex, float weight)

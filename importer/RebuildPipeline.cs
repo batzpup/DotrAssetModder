@@ -46,6 +46,46 @@ public static class RebuildPipeline
     private const float S16Fit = 32000f; // target ceiling for |position| component
     private const double BamsPerRad = 32768.0 / Math.PI;
 
+
+    public enum ExternalSkinnedFrameSource
+    {
+        /// Automatically chooses raw or mesh-node-world frame positions for external skinned GLBs.
+        /// If the mesh-node-world bounds explode compared to raw skin bounds, raw is used.
+        Auto,
+
+        /// Use raw skinned POSITION values for frame/bounds/camera. Animation-safe, often best for
+        /// Armature-rooted models whose node-world transform is not a useful authored frame.
+        RawSkinPositions,
+
+        /// Use mesh-node-world transformed positions for frame/bounds/camera only. This is never used
+        /// for the actual skinned geometry encoding.
+        MeshNodeWorldPositions,
+
+        /// Use raw skin positions, but trim extreme bbox outliers before picking centre/radius.
+        TrimmedRawSkinPositions,
+
+        /// Use mesh-node-world positions, but trim extreme bbox outliers before picking centre/radius.
+        TrimmedMeshNodeWorldPositions,
+    }
+
+    private sealed class FrameDebugState
+    {
+        public int Root0;
+        public string Root0Name = "";
+        public bool SynthPivot;
+        public int ConsumedRootSlot;
+        public Vector3 BBoxMin;
+        public Vector3 BBoxMax;
+        public Vector3 BBoxCenter;
+        public bool HasGeometry;
+        public string RequestedSkinnedFrameSource = "n/a";
+        public string EffectiveSkinnedFrameSource = "n/a";
+        public Vector3 PlacementPivot;
+        public string PlacementPivotSource = "unknown";
+        public Vector3 CameraTarget;
+        public string CameraTargetSource = "unknown";
+    }
+
     public sealed class TemplateFrame
     {
         /// World-space engine placement pivot: retail GNode(1).pos / animTransScale.
@@ -54,9 +94,14 @@ public static class RebuildPipeline
         /// World-space camera/framing centre from the donor node-tree bounds record.
         public Vector3 BoundsCenterWorld;
 
-        /// Optional donor bounding radius. When valid, it is emitted unchanged so camera
-        /// distance/deform paths keep the donor slot's original size class.
+        /// Optional donor bounding radius. Used for diagnostics/comparison only unless an
+        /// explicit compatibility path is intentionally reintroduced elsewhere.
         public float BoundsRadius;
+
+        public int NodeTreeOffset;
+        public float AnimTransScale;
+        public float RootScale;
+        public Vector3 PivotRaw;
 
         public bool IsValid =>
             IsFinite(PivotWorld) && IsFinite(BoundsCenterWorld) && BoundsRadius > 1e-5f &&
@@ -115,35 +160,22 @@ public static class RebuildPipeline
     /// static replacements.
     public static Result Build(ImportedModel im, float templateAnimTransScale = 0f,
         int templateTexCount = 0, float warnMinRatio = 0.125f, float warnMaxRatio = 2.0f,
-        TemplateFrame? templateFrame = null, bool fitExternalToTemplateFrame = true,
-        bool scaleExternalToTemplateFrame = true, float externalCameraLookAtHeightRatio = 0.55f)
+        TemplateFrame? templateFrame = null, bool fitExternalToTemplateFrame = false,
+        bool scaleExternalToTemplateFrame = false,
+        bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
 
-        // ---- 0. donor/template coordinate-frame adoption ----
-        // The game is not purely data-driven here: overworld, duel, Act3DView and battle all
-        // use hardcoded/per-card assumptions around the model slot's original GNode(1) pivot,
-        // bounds centre and radius. Replacing Blue-Eyes, for example, works best when the new
-        // geometry is fitted into Blue-Eyes' existing engine frame, not when the importer invents
-        // a fresh feet-origin or centre-origin frame.
-        //
-        // Therefore: keep the donor's camera centre/radius and GNode(1) placement pivot, and
-        // translate the imported GLB's geometry/skeleton so its visual bbox centre lands on the
-        // donor bounds centre. This mirrors what the extractor's MrgRoot wrapper represents:
-        // a Blender-friendly view layered over the engine's native coordinate frame.
-        Vector3? donorPivotWorld = null;
-        Vector3? donorBoundsCenterWorld = null;
-        float donorBoundsRadius = 0f;
-        bool useTemplateFrameForExternal = templateFrame is { IsValid: true } &&
-            fitExternalToTemplateFrame && !im.IsDotrExtractedGlb;
-        if (templateFrame is { IsValid: true })
-        {
-            donorPivotWorld = templateFrame.PivotWorld;
-            donorBoundsCenterWorld = templateFrame.BoundsCenterWorld;
-            donorBoundsRadius = templateFrame.BoundsRadius;
-            if (useTemplateFrameForExternal)
-                ApplyTemplateFrameFit(im, templateFrame, scaleExternalToTemplateFrame, externalCameraLookAtHeightRatio);
-        }
+        // ---- 0. donor/template frame is diagnostic only ------------------------------
+        // The imported GLB is the spatial authority. The donor/template MRG is still used
+        // for binary/container/texture/layout data and for comparison in debug output, but
+        // it must not decide the imported model's pivot, camera target, or bounds radius.
+        // Otherwise the same GLB would behave differently depending on the monster slot it
+        // replaces.
+        bool useTemplateFrameForExternal = false;
+        float donorBoundsRadius = templateFrame is { IsValid: true } ? templateFrame.BoundsRadius : 0f;
+        _ = fitExternalToTemplateFrame;
+        _ = scaleExternalToTemplateFrame;
 
         // ---- 0a. UV-atlas merge of excess texture slots ----
         // The template's TexTable has a fixed number of RH2 payload slots; pages on slots
@@ -171,13 +203,35 @@ public static class RebuildPipeline
         // it"). PrepareRoot collapses those wrappers; for external models it additionally
         // requests a synthetic pivot (inserted after step 4).
         var (root0, synthPivot, consumedRootSlot) = PrepareRoot(im);
+        var frameDebug = new FrameDebugState {
+            Root0 = root0,
+            Root0Name = GlbPos(im, root0) >= 0 ? im.Nodes[GlbPos(im, root0)].Name : "<unknown>",
+            SynthPivot = synthPivot,
+            ConsumedRootSlot = consumedRootSlot,
+        };
+
+        // DOTR-convention mode: no string markers and no automatic pivot/camera selection.
+        // Skinned external GLBs use their raw skin/bind positions for frame diagnostics/bounds,
+        // matching extracted DOTR GLBs. Static meshes keep their baked world positions.
+        var effectiveSkinnedFrameSource = ResolveExternalSkinnedFrameSource(im);
+        ApplyFramePositionSource(im, effectiveSkinnedFrameSource);
+        frameDebug.RequestedSkinnedFrameSource = "DOTR convention";
+        frameDebug.EffectiveSkinnedFrameSource = effectiveSkinnedFrameSource.ToString();
 
         // ---- 1. DFS preorder; node[0] = root, extra roots re-parented under it ----
         var order = new List<int>(); // glb node indices, preorder
         var encIndexOf = new Dictionary<int, int>(); // glb index -> position in `order`
 
-        bool IsImportHelperNode(int g) =>
-            GlbPos(im, g) >= 0 && GlbImporter.IsAuthoringMarker(im.Nodes[GlbPos(im, g)].Name);
+        bool IsImportHelperNode(int g)
+        {
+            int pos = GlbPos(im, g);
+            if (pos < 0) return false;
+            var n = im.Nodes[pos];
+            // Ignore loose, root-level empty helper nodes without relying on specific names.
+            // This lets old marker empties remain in a GLB without becoming DOTR GNodes,
+            // while preserving real bones/armatures/mesh nodes.
+            return n.Parent < 0 && !n.HasMesh && !n.IsJoint && n.Children.Count == 0;
+        }
 
         void Dfs(int g)
         {
@@ -185,7 +239,8 @@ public static class RebuildPipeline
             encIndexOf[g] = order.Count;
             order.Add(g);
             foreach (int c in im.Nodes[GlbPos(im, g)].Children)
-                if (!IsImportHelperNode(c)) Dfs(c);
+                if (!IsImportHelperNode(c))
+                    Dfs(c);
         }
 
         Dfs(root0);
@@ -232,13 +287,13 @@ public static class RebuildPipeline
 
         // ---- 2.5 size-warning report ----
         // Use a real model-size metric, not max(|world coordinate|). The older warning used
-        // distance from global origin, so extracted round-trips and donor-frame-fitted models
-        // looked 2-3x "too large" merely because the donor slot lives far from (0,0,0).
-        // Radius-around-camera is stable for both MrgRoot round-trips and external models.
-        if (!im.IsDotrExtractedGlb && ComputeBounds(im, out var warnMin, out var warnMax))
+        // distance from global origin, so extracted round-trips looked 2-3x "too large"
+        // merely because the authored slot lives far from (0,0,0). Radius-around-camera is
+        // stable for both MrgRoot round-trips and external models.
+        if (!im.IsDotrExtractedGlb && ComputeBounds(im, effectiveSkinnedFrameSource, out var warnMin, out var warnMax))
         {
             var warnCenter = im.FittedCameraLookAtWorld ?? im.AuthorCameraLookAtWorld ?? ((warnMin + warnMax) * 0.5f);
-            double srcRadius = Math.Max(ComputeRadius(im, warnCenter), 1e-9f);
+            double srcRadius = Math.Max(ComputeRadius(im, effectiveSkinnedFrameSource, warnCenter), 1e-9f);
             double donorSize = donorBoundsRadius > 1e-5f ? donorBoundsRadius : srcRadius;
             double ratio = srcRadius / Math.Max(donorSize, 1e-9);
             fitReport.OriginalWorld = srcRadius;
@@ -258,12 +313,19 @@ public static class RebuildPipeline
         }
 
         float S = (float)(maxLocal / S16Fit);
-        if (S <= 0f || float.IsNaN(S)) S = 1f;
-        if (templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
+        if (S <= 0f || float.IsNaN(S) || float.IsInfinity(S)) S = 1f;
+
+        // Scale policy:
+        //   * Extracted DotR GLBs may keep the template scale for round-trip / retail-motion compatibility.
+        //   * Custom GLBs generate their own rootScale/animTransScale by default so the same GLB is
+        //     not affected by whichever monster slot, or previous import, is used as the binary template.
+        // Enable adoptTemplateScaleForCustomModels only for explicit compatibility experiments.
+        bool mayAdoptTemplateScale = im.IsDotrExtractedGlb || adoptTemplateScaleForCustomModels;
+        if (mayAdoptTemplateScale && templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
             !float.IsInfinity(templateAnimTransScale))
         {
             float templS = 1f / templateAnimTransScale;
-            if (maxLocal / templS <= 32700.0) S = templS; // adopt template scale when it fits
+            if (maxLocal / templS <= 32700.0) S = templS; // adopt template scale only when requested/safe
         }
 
         // ---- 3. mesh-slot assignment ----
@@ -311,6 +373,13 @@ public static class RebuildPipeline
             if (encIndexOf.TryGetValue(er, out int ei))
                 nodes[0].Children.Add(ei);
 
+        bool hasBounds = ComputeBounds(im, effectiveSkinnedFrameSource, out var geomMin, out var geomMax);
+        var geomCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
+        frameDebug.HasGeometry = hasBounds;
+        frameDebug.BBoxMin = hasBounds ? geomMin : Vector3.Zero;
+        frameDebug.BBoxMax = hasBounds ? geomMax : Vector3.Zero;
+        frameDebug.BBoxCenter = geomCenter;
+
         // ---- 4.5 synthetic GNode(1) pivot for external models ----
         // Extractor glbs ('MrgRoot') keep the retail tree verbatim, so retail node 1 is
         // already the pivot AND externally loaded retail motions (.nab, applied by node
@@ -318,9 +387,12 @@ public static class RebuildPipeline
         // External models get a leaf node inserted as the root's first child at the
         // world-space bounding-box center of the geometry.
         if (synthPivot)
-            InsertCenterPivot(im, nodes, encIndexOf, S, donorPivotWorld);
-        else if (useTemplateFrameForExternal && donorPivotWorld.HasValue && nodes.Count > 1)
-            nodes[1].Pos = (donorPivotWorld.Value.X / S, donorPivotWorld.Value.Y / S, donorPivotWorld.Value.Z / S);
+            InsertGeneratedPivot(im, nodes, encIndexOf, S, frameDebug);
+        else if (nodes.Count > 1)
+        {
+            frameDebug.PlacementPivot = new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S);
+            frameDebug.PlacementPivotSource = "existing GNode(1)";
+        }
 
         // ---- 4.6 world-accurate explicit pivot ('origin') ----
         // GNode(1) is what the duel / 3D-battle / enemy-preview camera centers on for ANIMATED
@@ -336,8 +408,8 @@ public static class RebuildPipeline
         // geometry vertical centre.
         // Explicit pivot nodes are now honoured as-authored. Do not silently lift their Y
         // to the bbox centre: that makes Act3DView look better but breaks overworld/duel
-        // placement. External replacement GLBs should use the donor-frame path above;
-        // extracted MrgRoot GLBs should preserve the retail GNode(1) exactly.
+        // placement. External replacement GLBs should use explicit pivot/camera target policy;
+        // extracted MrgRoot GLBs should preserve their generated GNode(1) order.
         // ---- 4.7 node-tree bounds record (centre + radius) ----
         // The duel/3D-battle camera (SzDuel_Draw3DView_Pipe@0x1bf820) and the 3D monster view /
         // enemy preview (Taku_Camp_Teki_Model_Disp@0x21be30) point the camera's VERTICAL look-at at
@@ -361,35 +433,12 @@ public static class RebuildPipeline
         // ~40, inside the retail ~40-133 band).
         Vector3 boundsCenter;
         {
-            var bmin = new Vector3(float.MaxValue);
-            var bmax = new Vector3(float.MinValue);
-            bool anyV = false;
-            foreach (var prim in im.Primitives)
-            foreach (var v in prim.Vertices)
-            {
-                var p = v.Pos;
-                if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
-                    float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
-                    float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
-                bmin = Vector3.Min(bmin, p);
-                bmax = Vector3.Max(bmax, p);
-                anyV = true;
-            }
-            // No usable geometry (e.g. an all-empties model): fall back to GNode(1)'s world position
-            // so the camera at least aims at the pivot rather than the origin.
-            boundsCenter = anyV ? (bmin + bmax) * 0.5f
-                : nodes.Count > 1 ? new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S)
-                : Vector3.Zero;
-            // For external donor-frame imports, the camera point is the transformed
-            // Blender `camera_lookat` marker, or the transformed bbox centre when no marker
-            // exists. Do NOT blindly force the donor's original bounds centre here: that can
-            // preserve world placement while making the viewer/battle camera aim below a
-            // differently-shaped replacement model. Extracted MrgRoot GLBs still round-trip
-            // their own computed/retail centre.
-            if (useTemplateFrameForExternal && im.FittedCameraLookAtWorld.HasValue)
-                boundsCenter = im.FittedCameraLookAtWorld.Value;
-            else if (!useTemplateFrameForExternal && donorBoundsCenterWorld.HasValue)
-                boundsCenter = donorBoundsCenterWorld.Value;
+            // DOTR-convention mode: the live animated camera/control coordinate is GNode(1).
+            // The node-tree bounds record remains a real geometry bounds centre only; it is
+            // not an authoring camera target and does not use markers.
+            boundsCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
+            frameDebug.CameraTarget = boundsCenter;
+            frameDebug.CameraTargetSource = hasBounds ? "geometry bounds center" : "no-geometry fallback: origin";
         }
         // Radius = bounding-sphere radius about the centre over all WORLD-space vertices. Clamp to
         // a small positive value: the engine computes 40/radius (clamped [0.3,1]) for deform, so a
@@ -398,17 +447,16 @@ public static class RebuildPipeline
         foreach (var prim in im.Primitives)
         foreach (var v in prim.Vertices)
         {
-            var p = v.Pos;
-            if (float.IsNaN(p.X) || float.IsInfinity(p.X)) continue;
+            var p = v.FramePos;
+            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
+                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
+                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
             boundsRadius = Math.Max(boundsRadius, Vector3.Distance(p, boundsCenter));
         }
-        // External replacements get a radius around their own fitted camera point.
-        // Reusing the donor radius is what caused bogus size warnings and can also skew
-        // camera/deform behaviour for very different silhouettes. Keep donor radius only
-        // for non-external/template cases.
-        if (!useTemplateFrameForExternal && donorBoundsRadius > 1e-5f && !float.IsNaN(donorBoundsRadius) && !float.IsInfinity(donorBoundsRadius))
-            boundsRadius = donorBoundsRadius;
-        else if (!(boundsRadius > 1e-3f) || float.IsNaN(boundsRadius) || float.IsInfinity(boundsRadius))
+        // Radius is always generated from the imported geometry around the selected camera
+        // target. The donor/template radius is diagnostic only; using it here would make the
+        // result depend on the replaced slot.
+        if (!(boundsRadius > 1e-3f) || float.IsNaN(boundsRadius) || float.IsInfinity(boundsRadius))
             boundsRadius = 1f;
 
         // ---- 5. per-joint RestWorldSkin = Scale(S) * glbWorld ; cache inverse + 3x3 inverse ----
@@ -520,6 +568,9 @@ public static class RebuildPipeline
             motions.Add(motion);
         }
 
+        if (debugFrame)
+            DumpFrameDebug(im, templateFrame, frameDebug, nodes, S, AnimTransScale, boundsCenter, boundsRadius);
+
         return new Result {
             Nodes = nodes, Pages = pages, Motions = motions,
             GlobalScale = S, AnimTransScale = AnimTransScale,
@@ -602,105 +653,133 @@ public static class RebuildPipeline
         return merges;
     }
 
-    private static void ApplyTemplateFrameFit(ImportedModel im, TemplateFrame templateFrame, bool allowScale, float cameraLookAtHeightRatio)
+    private static bool ComputeBounds(ImportedModel im, ExternalSkinnedFrameSource source, out Vector3 min, out Vector3 max)
     {
-        if (im.AppliedTemplateFrameFit) return;
-
-        if (!ComputeBounds(im, out var min, out var max)) return;
-        var bboxCenter = (min + max) * 0.5f;
-
-        // Blender-facing convention for external replacements:
-        //   worldPosCenter = the source point that should become the donor GNode(1) pivot.
-        //                    If absent, use Blender/world origin. This is important for
-        //                    rotation: bbox centre can be behind/off-centre on monsters with
-        //                    wings, tails, cloaks, arms, etc., which makes the model rotate
-        //                    around a point behind itself.
-        //   camera_lookat  = the source point that should become the model bounds/camera centre.
-        //                    If absent, use a stable authoring fallback above the model base
-        //                    at sourcePivot.X/Z, rather than the full bbox centre. Full bbox
-        //                    centre is often too high/behind for asymmetric monsters.
-        //
-        // Authoring rule: for normal Blender replacements put the desired world/rotation
-        // pivot at 0,0,0, or add an explicit empty named worldPosCenter. Add camera_lookat
-        // when the default 55% height target is not good enough.
-        var sourcePivot = im.AuthorWorldPosCenterWorld ?? Vector3.Zero;
-        cameraLookAtHeightRatio = Math.Clamp(cameraLookAtHeightRatio, 0.05f, 0.95f);
-        float h = MathF.Max(max.Y - min.Y, 1e-5f);
-        var fallbackCamera = new Vector3(
-            sourcePivot.X,
-            min.Y + h * cameraLookAtHeightRatio,
-            sourcePivot.Z);
-        var sourceCamera = im.AuthorCameraLookAtWorld ?? fallbackCamera;
-        float sourceRadius = ComputeRadius(im, sourceCamera);
-
-        float scale = 1f;
-        if (allowScale)
+        var pts = CollectValidFramePositions(im);
+        if (pts.Count == 0)
         {
-            bool markerScale = false;
-            var sourceDelta = sourceCamera - sourcePivot;
-            var donorDelta = templateFrame.BoundsCenterWorld - templateFrame.PivotWorld;
-
-            // If the user supplied camera_lookat/worldPosCenter, match their vertical
-            // placement-to-camera distance to the donor slot. This preserves the original
-            // hardcoded slot framing while still letting the replacement pick what "feet"
-            // and "look at" mean. Without markers, radius scale is a better default.
-            if (im.AuthorCameraLookAtWorld.HasValue && im.AuthorWorldPosCenterWorld.HasValue)
-            {
-                if (MathF.Abs(sourceDelta.Y) > 1e-5f && MathF.Abs(donorDelta.Y) > 1e-5f)
-                {
-                    scale = MathF.Abs(donorDelta.Y / sourceDelta.Y);
-                    markerScale = scale > 1e-6f && !float.IsNaN(scale) && !float.IsInfinity(scale);
-                }
-                else
-                {
-                    float sl = sourceDelta.Length();
-                    float dl = donorDelta.Length();
-                    if (sl > 1e-5f && dl > 1e-5f)
-                    {
-                        scale = dl / sl;
-                        markerScale = scale > 1e-6f && !float.IsNaN(scale) && !float.IsInfinity(scale);
-                    }
-                }
-            }
-
-            // Do not auto-scale purely from radius when no explicit marker pair exists.
-            // Radius matching made some replacements report/behave several times larger
-            // than the donor and changes authored world placement unexpectedly. With no
-            // marker pair, preserve the Blender-authored size and surface only a warning.
-            if (!markerScale) scale = 1f;
-
-            if (!(scale > 1e-6f) || float.IsNaN(scale) || float.IsInfinity(scale)) scale = 1f;
+            min = Vector3.Zero;
+            max = Vector3.Zero;
+            return false;
         }
 
-        // Placement solve: sourcePivot maps exactly to donor GNode(1). The camera point is
-        // then whatever the transformed camera_lookat/bbox centre becomes; that value is
-        // emitted into the node-tree bounds record later.
-        var delta = templateFrame.PivotWorld - sourcePivot * scale;
-        var xform = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateTranslation(delta);
-        var fittedCamera = Vector3.Transform(sourceCamera, xform);
-
-        foreach (var prim in im.Primitives)
-        foreach (var v in prim.Vertices)
-            v.Pos = Vector3.Transform(v.Pos, xform);
-
-        // Move root locals and cached world matrices with the same global transform so
-        // inverse bind / RWS math stays coherent. Do not use donor bounds as a hard camera
-        // override for external models; the transformed camera marker is the authored target.
-        foreach (int r in im.RootNodes)
+        if (IsTrimmedFrameSource(source) && pts.Count >= 16)
         {
-            int rp = GlbPos(im, r);
-            if (rp < 0) continue;
-            im.Nodes[rp].Translation = im.Nodes[rp].Translation * scale + delta;
-            im.Nodes[rp].Scale *= scale;
+            // Use trimmed percentiles to avoid tails/wings/weapons pulling the generated
+            // camera/pivot far away from the body. Y is trimmed less aggressively than X/Z
+            // so tall bodies still frame correctly.
+            min = new Vector3(Percentile(pts, static p => p.X, 0.10f),
+                              Percentile(pts, static p => p.Y, 0.05f),
+                              Percentile(pts, static p => p.Z, 0.10f));
+            max = new Vector3(Percentile(pts, static p => p.X, 0.90f),
+                              Percentile(pts, static p => p.Y, 0.95f),
+                              Percentile(pts, static p => p.Z, 0.90f));
+            return true;
         }
-        for (int i = 0; i < im.Nodes.Count; i++)
-            im.Nodes[i].WorldMatrix = im.Nodes[i].WorldMatrix * xform;
 
-        im.FittedCameraLookAtWorld = fittedCamera;
-        im.AppliedTemplateFrameFit = true;
+        min = new Vector3(float.MaxValue);
+        max = new Vector3(float.MinValue);
+        foreach (var p in pts)
+        {
+            min = Vector3.Min(min, p);
+            max = Vector3.Max(max, p);
+        }
+        return true;
     }
 
-    private static bool ComputeBounds(ImportedModel im, out Vector3 min, out Vector3 max)
+    private static float ComputeRadius(ImportedModel im, ExternalSkinnedFrameSource source, Vector3 center)
+    {
+        var pts = CollectValidFramePositions(im);
+        if (pts.Count == 0) return 0f;
+
+        // For trimmed frame modes, use the same trimmed point cloud for the radius so a long
+        // tail/weapon does not force the camera distance/preview radius to balloon.
+        if (IsTrimmedFrameSource(source) && pts.Count >= 16)
+        {
+            var min = new Vector3(Percentile(pts, static p => p.X, 0.10f),
+                                  Percentile(pts, static p => p.Y, 0.05f),
+                                  Percentile(pts, static p => p.Z, 0.10f));
+            var max = new Vector3(Percentile(pts, static p => p.X, 0.90f),
+                                  Percentile(pts, static p => p.Y, 0.95f),
+                                  Percentile(pts, static p => p.Z, 0.90f));
+            float r = 0f;
+            foreach (var p in pts)
+            {
+                if (p.X < min.X || p.X > max.X || p.Y < min.Y || p.Y > max.Y || p.Z < min.Z || p.Z > max.Z)
+                    continue;
+                r = Math.Max(r, Vector3.Distance(p, center));
+            }
+            return r;
+        }
+
+        float radius = 0f;
+        foreach (var p in pts)
+            radius = Math.Max(radius, Vector3.Distance(p, center));
+        return radius;
+    }
+
+    private static List<Vector3> CollectValidFramePositions(ImportedModel im)
+    {
+        var pts = new List<Vector3>();
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        {
+            var p = v.FramePos;
+            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
+                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
+                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
+            pts.Add(p);
+        }
+        return pts;
+    }
+
+    private static bool IsTrimmedFrameSource(ExternalSkinnedFrameSource source) =>
+        source == ExternalSkinnedFrameSource.TrimmedRawSkinPositions ||
+        source == ExternalSkinnedFrameSource.TrimmedMeshNodeWorldPositions;
+
+    private static float Percentile(List<Vector3> pts, Func<Vector3, float> selector, float q)
+    {
+        var values = new float[pts.Count];
+        for (int i = 0; i < pts.Count; i++) values[i] = selector(pts[i]);
+        Array.Sort(values);
+        if (values.Length == 1) return values[0];
+        float f = Math.Clamp(q, 0f, 1f) * (values.Length - 1);
+        int lo = (int)MathF.Floor(f);
+        int hi = (int)MathF.Ceiling(f);
+        if (lo == hi) return values[lo];
+        return values[lo] + (values[hi] - values[lo]) * (f - lo);
+    }
+
+    private static ExternalSkinnedFrameSource ResolveExternalSkinnedFrameSource(ImportedModel im)
+    {
+        // DOTR-convention mode: skinned models are treated like extracted DOTR GLBs.
+        // Their raw POSITION data is the model-space frame. Static models are already
+        // baked to world space by GlbImporter and also end up using Pos.
+        return ExternalSkinnedFrameSource.RawSkinPositions;
+    }
+
+    private static void ApplyFramePositionSource(ImportedModel im, ExternalSkinnedFrameSource source)
+    {
+        bool externalSkinned = !im.IsDotrExtractedGlb && im.JointNodeIndices.Count > 0;
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        {
+            if (!externalSkinned)
+            {
+                v.FramePos = v.Pos;
+                continue;
+            }
+
+            v.FramePos = source switch
+            {
+                ExternalSkinnedFrameSource.MeshNodeWorldPositions => v.MeshNodeWorldPos,
+                ExternalSkinnedFrameSource.TrimmedMeshNodeWorldPositions => v.MeshNodeWorldPos,
+                _ => v.Pos,
+            };
+        }
+    }
+
+    private static bool TryBounds(ImportedModel im, Func<ImportedVertex, Vector3> selector, out Vector3 min, out Vector3 max)
     {
         bool any = false;
         min = new Vector3(float.MaxValue);
@@ -708,7 +787,7 @@ public static class RebuildPipeline
         foreach (var prim in im.Primitives)
         foreach (var v in prim.Vertices)
         {
-            var p = v.Pos;
+            var p = selector(v);
             if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
                 float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
                 float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
@@ -719,20 +798,8 @@ public static class RebuildPipeline
         return any;
     }
 
-    private static float ComputeRadius(ImportedModel im, Vector3 center)
-    {
-        float radius = 0f;
-        foreach (var prim in im.Primitives)
-        foreach (var v in prim.Vertices)
-        {
-            var p = v.Pos;
-            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
-                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
-                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
-            radius = Math.Max(radius, Vector3.Distance(p, center));
-        }
-        return radius;
-    }
+    private static float BoundsRadius(Vector3 min, Vector3 max) =>
+        Vector3.Distance(min, max) * 0.5f;
 
     // ---- root preparation / pivot guarantee -------------------------------------------
 
@@ -750,12 +817,18 @@ public static class RebuildPipeline
     ///     position); otherwise the caller inserts a synthetic one.
     private static (int Root, bool SynthPivot, int ConsumedRootSlot) PrepareRoot(ImportedModel im)
     {
+        static bool LooseEmptyRoot(ImportedModel im, int g)
+        {
+            var n = im.Nodes[g];
+            return n.Parent < 0 && !n.HasMesh && !n.IsJoint && n.Children.Count == 0;
+        }
+
         // prefer the first scene root that actually has children (the skinned-mesh node
-        // our extractor emits is a childless sibling root)
+        // our extractor emits is a childless sibling root). Loose empty root helpers are
+        // ignored generically, without checking names.
         int slot = 0;
         for (int r = 0; r < im.RootNodes.Count; r++)
-            if (!GlbImporter.IsAuthoringMarker(im.Nodes[im.RootNodes[r]].Name) &&
-                im.Nodes[im.RootNodes[r]].Children.Count > 0)
+            if (!LooseEmptyRoot(im, im.RootNodes[r]) && im.Nodes[im.RootNodes[r]].Children.Count > 0)
             {
                 slot = r;
                 break;
@@ -791,7 +864,7 @@ public static class RebuildPipeline
             };
             foreach (int r in im.RootNodes)
             {
-                if (GlbImporter.IsAuthoringMarker(im.Nodes[r].Name)) continue;
+                if (LooseEmptyRoot(im, r)) continue;
                 synth.Children.Add(r);
                 im.Nodes[r].Parent = synth.Index;
             }
@@ -866,9 +939,7 @@ public static class RebuildPipeline
 
     /// A node the user designates as the model's origin / pivot (the engine's GNode(1)).
     /// 'origin' is the documented Blender-facing name; 'dotr_center' is kept as a legacy alias.
-    private static bool IsPivotName(string? n) =>
-        n != null && (n.Equals("origin", StringComparison.OrdinalIgnoreCase)
-                      || n.Equals("dotr_center", StringComparison.OrdinalIgnoreCase));
+    private static bool IsPivotName(string? n) => false;
 
     /// Move a pivot-named leaf child of <paramref name="root"/> into first-child position so
     /// the DFS reads it as GNode(1). Used for extractor ('MrgRoot') glbs, where the retail
@@ -890,31 +961,24 @@ public static class RebuildPipeline
         return false;
     }
 
-    /// Inserts a leaf pivot node at enc index 1 (the root's FIRST child) so GNode(1)
-    /// lands on it. The engine computes pivot = node.pos / animTransScale = node.pos * S,
-    /// so storing worldCenter / S makes the pivot exactly the geometry's world-space
-    /// bounding-box center (vertex Pos in ImportedModel is world-space bind position,
-    /// which equals the final rendered frame for the reconstruction this pipeline emits).
-    /// The node has no mesh slot and nothing references it, so its drawn placement is
-    /// irrelevant; only GetGNode(1)/GetCenterOfs read it. All existing enc indices >= 1
-    /// shift by +1 (Parent/Children lists and encIndexOf, which step 8 uses for motions).
-    private static void InsertCenterPivot(ImportedModel im, List<EncNode> nodes,
-        Dictionary<int, int> encIndexOf, float S, Vector3? donorPivotWorld = null)
+    /// Inserts a leaf pivot node at enc index 1 (the root's FIRST child).
+    ///
+    /// DOTR-convention mode:
+    ///   * custom/new GLBs are authored around the Blender/glTF scene origin.
+    ///   * GNode(1) is always generated at world origin.
+    ///   * no string marker names and no bbox-derived pivot are used.
+    ///
+    /// This matches the extracted DOTR pattern: root/node_0 is neutral at origin and
+    /// the model is positioned by its authored geometry/node hierarchy relative to that
+    /// origin. All existing enc indices >= 1 shift by +1.
+    private static void InsertGeneratedPivot(ImportedModel im, List<EncNode> nodes,
+        Dictionary<int, int> encIndexOf, float S, FrameDebugState debug)
     {
         if (nodes.Count == 0 || S <= 0f) return;
 
-        bool any = false;
-        var min = new Vector3(float.MaxValue);
-        var max = new Vector3(float.MinValue);
-        foreach (var prim in im.Primitives)
-        foreach (var v in prim.Vertices)
-        {
-            min = Vector3.Min(min, v.Pos);
-            max = Vector3.Max(max, v.Pos);
-            any = true;
-        }
-        if (!any) return;
-        var center = donorPivotWorld ?? (min + max) * 0.5f;
+        var pivotWorld = Vector3.Zero;
+        debug.PlacementPivot = pivotWorld;
+        debug.PlacementPivotSource = "DOTR convention: Blender/glTF origin";
 
         // remap every index >= 1 to +1
         foreach (var nd in nodes)
@@ -933,11 +997,82 @@ public static class RebuildPipeline
             Flags = 0,
             MeshSlot = 0,
             RotBams = (0, 0, 0),
-            Pos = (center.X / S, center.Y / S, center.Z / S),
+            Pos = (0f, 0f, 0f),
             Parent = 0,
         };
         nodes.Insert(1, pivot);
         nodes[0].Children.Insert(0, 1);
+    }
+
+    private static void DumpFrameDebug(ImportedModel im, TemplateFrame? templateFrame, FrameDebugState dbg,
+        List<EncNode> nodes, float rootScale, float animTransScale, Vector3 boundsCenter, float boundsRadius)
+    {
+        static string V(Vector3 v) => $"({v.X:G9}, {v.Y:G9}, {v.Z:G9})";
+        static string N(string? s) => string.IsNullOrWhiteSpace(s) ? "<unnamed>" : s!;
+
+        Console.WriteLine("=== DOTR FRAME DEBUG ===");
+        Console.WriteLine("GLB:");
+        Console.WriteLine($"  IsDotrExtractedGlb: {im.IsDotrExtractedGlb}");
+        Console.WriteLine($"  Nodes: {im.Nodes.Count}");
+        Console.WriteLine($"  Joints: {im.JointNodeIndices.Count}");
+        Console.WriteLine($"  Root nodes: {string.Join(", ", im.RootNodes.Select(r =>
+        {
+            int pos = GlbPos(im, r);
+            return pos >= 0 ? $"{r}:{N(im.Nodes[pos].Name)}" : $"{r}:<missing>";
+        }))}");
+        Console.WriteLine($"  Has MrgRoot: {im.Nodes.Any(n => n.Name == "MrgRoot")}");
+        Console.WriteLine("  Authoring markers: ignored in DOTR-convention mode");
+        Console.WriteLine($"  Geometry bbox valid: {dbg.HasGeometry}");
+        Console.WriteLine($"  Geometry bbox min: {V(dbg.BBoxMin)}");
+        Console.WriteLine($"  Geometry bbox max: {V(dbg.BBoxMax)}");
+        Console.WriteLine($"  Geometry bbox center: {V(dbg.BBoxCenter)}");
+        Console.WriteLine($"  requested skinned frame source: {dbg.RequestedSkinnedFrameSource}");
+        Console.WriteLine($"  effective skinned frame source: {dbg.EffectiveSkinnedFrameSource}");
+        Console.WriteLine();
+
+        Console.WriteLine("Template MRG diagnostics only:");
+        if (templateFrame is { IsValid: true })
+        {
+            Console.WriteLine($"  nodeTree offset: 0x{templateFrame.NodeTreeOffset:X}");
+            Console.WriteLine($"  animTransScale: {templateFrame.AnimTransScale:G9}");
+            Console.WriteLine($"  rootScale: {templateFrame.RootScale:G9}");
+            Console.WriteLine($"  GNode(1) raw pos: {V(templateFrame.PivotRaw)}");
+            Console.WriteLine($"  GNode(1) world pivot: {V(templateFrame.PivotWorld)}");
+            Console.WriteLine($"  bounds center: {V(templateFrame.BoundsCenterWorld)}");
+            Console.WriteLine($"  bounds radius: {templateFrame.BoundsRadius:G9}");
+        }
+        else
+        {
+            Console.WriteLine("  <unavailable>");
+        }
+        Console.WriteLine();
+
+        Console.WriteLine("Generated:");
+        Console.WriteLine($"  root0: {dbg.Root0}:{N(dbg.Root0Name)}");
+        Console.WriteLine($"  synthPivot: {dbg.SynthPivot}");
+        Console.WriteLine($"  consumedRootSlot: {dbg.ConsumedRootSlot}");
+        Console.WriteLine($"  generated node count: {nodes.Count}");
+        Console.WriteLine($"  generated animTransScale: {animTransScale:G9}");
+        Console.WriteLine($"  generated rootScale: {rootScale:G9}");
+        if (nodes.Count > 1)
+        {
+            var raw = new Vector3(nodes[1].Pos.X, nodes[1].Pos.Y, nodes[1].Pos.Z);
+            var world = raw * rootScale;
+            Console.WriteLine($"  generated GNode(1) raw pos: {V(raw)}");
+            Console.WriteLine($"  generated GNode(1) world pivot: {V(world)}");
+        }
+        else
+        {
+            Console.WriteLine("  generated GNode(1): <missing>");
+        }
+        Console.WriteLine($"  selected pivot source: {dbg.PlacementPivotSource}");
+        Console.WriteLine($"  selected pivot world: {V(dbg.PlacementPivot)}");
+        Console.WriteLine($"  bounds center source: {dbg.CameraTargetSource}");
+        Console.WriteLine($"  selected bounds center world: {V(dbg.CameraTarget)}");
+        Console.WriteLine($"  generated bounds center: {V(boundsCenter)}");
+        Console.WriteLine($"  generated bounds radius: {boundsRadius:G9}");
+        Console.WriteLine("  note: DOTR convention uses GNode(1) at origin as the animated control/camera coordinate.");
+        Console.WriteLine("========================");
     }
 
     // glb animation names from the extractor are "slot_N"; fall back to a sequential slot (0..7).
