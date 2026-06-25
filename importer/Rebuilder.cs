@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 
 namespace DotrAssetModder;
 
@@ -39,12 +39,6 @@ public static class Rebuilder
         /// retail-plausible default; 1024 is opt-in and untested on hardware.
         public int MaxTextureDim = 512;
 
-        /// Deprecated compatibility flags. They are intentionally ignored by the generated-frame
-        /// pipeline: the donor MRG is diagnostics/container data only, never spatial authority.
-        public bool FitExternalModelsToTemplateFrame = false;
-
-        public bool ScaleExternalModelsToTemplateFrame = false;
-
         /// Custom GLBs generate their own rootScale/animTransScale by default. Enable this
         /// only if intentionally testing retail-slot/template scale compatibility.
         public bool AdoptTemplateScaleForCustomModels = false;
@@ -60,6 +54,23 @@ public static class Rebuilder
 
         /// Print frame diagnostics to the console during rebuild.
         public bool DebugFrame = true;
+
+        /// Upper bound (bytes) the assembled RH0 block must fit within - Rh0Assembler's
+        /// texture-table growth/shrink budgeting and the final Place() bounds check both
+        /// use this. Defaults to the monster-MRG fixed slot size. For MODEL.MRG-style
+        /// variable packs, pass the replaced model's own size budget instead (see
+        /// TrimToContent below - this should still be set generously so the texture
+        /// budgeting logic has room to work, NOT set to the exact old model's size, since
+        /// the actual returned array is trimmed to content regardless of this ceiling).
+        public int MaxOutputSize = 0x100000;
+
+        /// When true, the returned byte[] is trimmed to the model's actual content length
+        /// (header + node tree + geometry + textures + motion, 16-byte aligned) instead of
+        /// being padded out to MaxOutputSize. Monster MRG imports must leave this false
+        /// (the fixed 1 MiB slot is the contract every other system - ISO offset math,
+        /// the importer's own template loader - assumes). MODEL.MRG-style variable-pack
+        /// replacement should set this true, since there is no fixed slot to pad to.
+        public bool TrimToContent = false;
     }
 
     /// Size-check outcome, for surfacing a warning in the UI. No rescaling is performed.
@@ -83,14 +94,17 @@ public static class Rebuilder
 
     /// Overload for callers that pre-load the glb (e.g. to decode model.TextureImages into
     /// TextureInputs first) so the file isn't parsed twice. Pass a FitInfo to receive the
-    /// auto-fit outcome (factor + message) for display.
+    /// auto-fit outcome (factor + message) for display. Pass a RebuildPipeline.Result-typed
+    /// out box (resultOut) to also capture the pre-assembly pipeline result (node/page/strip
+    /// counts etc) for diagnostics, without re-running the pipeline a second time.
     public static byte[] Rebuild(ImportedModel model, byte[] originalMrg,
         IReadOnlyList<Rh0Assembler.TextureInput>? textures = null,
-        Options? options = null, FitInfo? fit = null)
-        => Assemble(model, originalMrg, textures, options, fit);
+        Options? options = null, FitInfo? fit = null, RebuildPipeline.Result[]? resultOut = null)
+        => Assemble(model, originalMrg, textures, options, fit, resultOut);
 
     private static byte[] Assemble(ImportedModel model, byte[] originalMrg,
-        IReadOnlyList<Rh0Assembler.TextureInput>? textures, Options? options, FitInfo? fit)
+        IReadOnlyList<Rh0Assembler.TextureInput>? textures, Options? options, FitInfo? fit,
+        RebuildPipeline.Result[]? resultOut = null)
     {
         var opt = options ?? new Options();
 
@@ -109,8 +123,9 @@ public static class Rebuilder
         var templateFrame = ReadTemplateFrame(originalMrg);
         var rebuilt = RebuildPipeline.Build(model, templateATS, templateTexCount,
             opt.WarnMinRatio, opt.WarnMaxRatio, templateFrame,
-            opt.FitExternalModelsToTemplateFrame, opt.ScaleExternalModelsToTemplateFrame,
             opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels);
+
+        if (resultOut != null && resultOut.Length > 0) resultOut[0] = rebuilt;
 
         if (fit != null)
         {
@@ -118,9 +133,10 @@ public static class Rebuilder
             fit.DonorWorld = rebuilt.FitDonorWorld;
             fit.Message = rebuilt.FitReason;
         }
-        return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, 0x100000,
+        return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
             opt.RebuildTexturesNative, opt.MaxTextureDim,
-            opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation);
+            opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation,
+            opt.TrimToContent);
     }
 
     private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)

@@ -73,9 +73,7 @@ public class AssetExtractor
         return result;
     }
 }
-// Shared little-endian readers. Consolidated from per-file duplicates in
-// ModelExtractor / TextureExtractor / TexAnim. byte[] binds implicitly to the
-// span parameter, so existing call sites are unchanged via `using static`.
+
 internal static class Bin
 {
     public static uint   U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o, 4));

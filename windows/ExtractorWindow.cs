@@ -23,10 +23,11 @@ public class ExtractorWindow
         if (ImGui.Button("Load ISO"))
         {
             DialogResult result;
-            result = Dialog.FileOpen("iso");
+            result = Dialog.FileOpen("iso", Path.GetDirectoryName(Program.config.lastIsoPath));
             if (result.IsOk)
             {
                 FileLoader.Instance.OpenIso(result.Path);
+                Program.config.lastIsoPath = result.Path;
             }
             else
             {
@@ -42,10 +43,11 @@ public class ExtractorWindow
             ImGui.SameLine();
             if (ImGui.Button("Destination Folder"))
             {
-                DialogResult dialogResult = Dialog.FolderPicker();
+                DialogResult dialogResult = Dialog.FolderPicker(Program.config.lastExtractPath);
                 if (dialogResult.IsOk)
                 {
                     destinationPath = dialogResult.Path;
+                    Program.config.lastExtractPath = destinationPath;
                 }
                 else
                 {
@@ -56,10 +58,12 @@ public class ExtractorWindow
             ImGui.SameLine();
             if (ImGui.Button("Load Wordlist"))
             {
-                DialogResult dialogResult = Dialog.FileOpen("txt");
+                DialogResult dialogResult = Dialog.FileOpen("txt", Path.GetDirectoryName(Program.config.lastWordlistPath));
+                
                 if (dialogResult.IsOk)
                 {
                     wordlistPath = dialogResult.Path;
+                    Program.config.lastWordlistPath = wordlistPath;
                 }
                 else
                 {

@@ -11,6 +11,7 @@ public class MainWindow
     TextureViewerWindow texture_window;
     ModelViewerWindow model_window;
     ModelImporterWindow import_window;
+    
 
     public enum Windows
     {
@@ -29,11 +30,10 @@ public class MainWindow
         import_window = new();
     }
 
+   
+
     public void Render()
     {
-
-
-
         ImGui.PushFont(glRD.MainFont);
         ImGui.SetNextWindowSize(glRD.cur_win_dims);
         ImGui.SetNextWindowPos(Vector2.Zero);
@@ -78,3 +78,4 @@ public class MainWindow
         ImGui.End();
     }
 }
+

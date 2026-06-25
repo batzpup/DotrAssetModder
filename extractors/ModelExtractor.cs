@@ -163,15 +163,7 @@ internal static class ModelExtractor
             textures.Add(new DecodedTexInfo(1, 1, MagentaPixel));
             texHasAlpha.Add(false);
         }
-
-        // ---- Texture animation (.anm / RH2 post-section) ----------------------
-        // Apply one-time static stamps to the decoded image so the still texture
-        // matches in-game, and bake composite frames for anything that animates.
-        // The runtime gates every entry by (slotMask & (1<<currentAnimSlot)); the
-        // glb represents the model's default animation (the lowest present slot,
-        // which the viewer shows as animation 0), so only entries active in that
-        // slot are baked. Entries tied to other slots (event-only effects) stay
-        // static. If the model has no animation slots, match any slot.
+        
         int slotsByte = (int)(hdr.SectionFlags & 0xFF);
         int activeSlotMask = slotsByte != 0 ? (slotsByte & -slotsByte) : 0xFF;
         var texAnims = new Dictionary<int, TexAnimBake>();
@@ -189,7 +181,7 @@ internal static class ModelExtractor
                 var bake = TexAnim.Bake(tex.Rgba, tex.Width, tex.Height, entries, activeSlotMask);
                 if (bake != null) texAnims[ti] = bake;
             }
-            catch { /* ignore malformed anim blocks */ }
+            catch {  }
         }
 
         var packets = new List<Packet>(mainPages.Count + altPages.Count);
@@ -246,8 +238,7 @@ internal static class ModelExtractor
             int rx = I32(data, off + 0x10);
             int ry = I32(data, off + 0x14);
             int rz = I32(data, off + 0x18);
-            // childOff/sibOff carry a relocation tag in the top nibble; the runtime
-            // traversal (lSzModel_TraceGNode) resolves them as treeBase + (off & 0x0FFFFFFF).
+       
             int childOff = I32(data, off + 0x1C) & 0x0FFFFFFF;
             float px = U32f(data, off + 0x20);
             float py = U32f(data, off + 0x24);
@@ -281,6 +272,7 @@ internal static class ModelExtractor
             {
                 Idx = idx,
                 Pidx = pidx,
+                Flags = flags,
                 Mslot = mslot,
                 RestPos = (rpx, rpy, rpz),
                 RestRotBams = (rrx, rry, rrz),
@@ -865,7 +857,7 @@ internal static class ModelExtractor
         for (int i = 0; i < nodes.Count; i++)
         {
             var n = nodes[i];
-            var nb = new NodeBuilder($"node_{n.Idx}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
+            var nb = new NodeBuilder($"node_{n.Idx}_f{n.Flags:X4}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
             var quat = M.EulerToQuatXyz(
                 n.RestRotBams.X * M.BamsRad,
                 n.RestRotBams.Y * M.BamsRad,
@@ -1205,6 +1197,7 @@ internal sealed class GNode
 {
     public int Idx;
     public int Pidx;
+    public ushort Flags;
     public int Mslot;
     public (float X, float Y, float Z) RestPos;
     public (int X, int Y, int Z) RestRotBams;

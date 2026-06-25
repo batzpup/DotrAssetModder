@@ -56,6 +56,4 @@ public static class TexAnmWriter
         }
         return outBuf;
     }
-
-    public static int EntryCount(ReadOnlySpan<byte> entries) => entries.Length / EntrySize;
 }

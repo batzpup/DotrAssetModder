@@ -1,5 +1,10 @@
+﻿using System.IO;
 using System.Numerics;
+using Raylib_cs;
 using SharpGLTF.Schema2;
+using Buffer = System.Buffer;
+using Image = Raylib_cs.Image;
+using Material = SharpGLTF.Schema2.Material;
 
 namespace DotrAssetModder;
 
@@ -42,13 +47,9 @@ public sealed class ImportedVertex
     /// For unskinned meshes this is already world-baked.
     public Vector3 Pos;
 
-    /// Position transformed by the glTF mesh node's world matrix.
-    /// This is useful for frame/pivot/camera diagnostics on some external skinned GLBs,
-    /// but must not be used for skin encoding unless deliberately selected.
-    public Vector3 MeshNodeWorldPos;
-
-    /// Current frame-generation position. RebuildPipeline selects this from Pos or
-    /// MeshNodeWorldPos depending on ExternalSkinnedFrameSource. Do not use this for skinning.
+    /// Frame-generation position (bounds/pivot/radius diagnostics in RebuildPipeline).
+    /// Always equal to Pos - kept as a separate field since some diagnostics historically
+    /// read a different source; do not use this for skinning.
     public Vector3 FramePos;
 
     public Vector3 Normal;                  // normal used by the geometry encoder
@@ -93,6 +94,28 @@ public sealed class ImportedModel
     /// Rh0Assembler.TextureInput to re-encode them into the RH2 blocks; textures absent
     /// here keep the template model's RH2 verbatim.
     public Dictionary<int, SharpGLTF.Memory.MemoryImage> TextureImages = new();
+
+    /// Animated-texture frame sequences, keyed by the same texIdx as TextureImages. Frames
+    /// are sourced from extra embedded glb images named "tex{N}_anim{frame}" (frame =
+    /// 0,1,2... any width, any count) - a naming convention chosen because glTF has no
+    /// native concept of an image sequence / flipbook texture, so Blender's "Image
+    /// Sequence" texture node needs flattening into individually-named still images at
+    /// export time (give each frame's Image datablock that name in Blender before export).
+    /// Frames are sorted by trailing frame number and packed into one sprite-sheet by
+    /// GlbImporter.DecodeGlbTextures, which Rh0Assembler then uses to synthesize the
+    /// matching TexAnm flipbook entry. A texIdx with no matching images falls through to
+    /// the normal static TextureImages[texIdx] path unchanged - purely additive. Fewer
+    /// than 2 frames found = not treated as animated (ignored, likely a naming accident);
+    /// frame 0's image is harvested into TextureImages too either way so the slot still
+    /// imports fine as a static texture.
+    public Dictionary<int, List<SharpGLTF.Memory.MemoryImage>> TextureAnimFrames = new();
+
+    /// Per-texture flipbook tick rate (hold time per frame, forwarded into the ANM
+    /// entry's aux0/aux1 - see Rh0Assembler.BuildCustomTexAnimEntry), parsed from an
+    /// optional "_tN" suffix on any of that slot's "tex{N}_anim{frame}" image names,
+    /// e.g. "tex0_anim0_t10" = 10 ticks/frame. Defaults to 5 (matching the one real
+    /// retail sample) for any texIdx with no explicit suffix found.
+    public Dictionary<int, int> TextureAnimTicks = new();
 
     /// Auto-assigned texture index per glb material (LogicalIndex), used when a material is
     /// not explicitly named "mat_texN". Pre-assigned deterministically in material
@@ -264,13 +287,6 @@ public static class GlbImporter
                         // on external Armature-rooted GLBs.
                         iv.Pos = pos[v];
                         iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
-
-                        // Keep the mesh-node-world version separately for frame generation. Some
-                        // custom GLBs use this as their authored visual space, while others need the
-                        // raw skin space. RebuildPipeline chooses via ExternalSkinnedFrameSource.
-                        iv.MeshNodeWorldPos = im.IsDotrExtractedGlb
-                            ? iv.Pos
-                            : Vector3.Transform(pos[v], nodeWorld);
                         iv.FramePos = iv.Pos;
                     }
                     else
@@ -278,7 +294,6 @@ public static class GlbImporter
                         // Static/unskinned meshes are rigidly attached to their mesh node, so bake
                         // the node world transform directly into the encoded vertices.
                         iv.Pos = Vector3.Transform(pos[v], nodeWorld);
-                        iv.MeshNodeWorldPos = iv.Pos;
                         iv.FramePos = iv.Pos;
                         iv.Normal = nrm != null ? SafeNormalize(Vector3.TransformNormal(nrm[v], nodeWorld)) : Vector3.UnitY;
                     }
@@ -331,7 +346,77 @@ public static class GlbImporter
             }
             im.Animations.Add(ia);
         }
+
+        // --- animated-texture frame sequences ("tex{N}_anim{frame}" image naming) ---
+        // Scans ALL embedded images, not just ones a material currently references, since
+        // Blender's glTF exporter can leave extra-frame images attached only via the
+        // Image datablock name (only frame 0 needs a real material link so the mesh has
+        // something to preview/shade with in Blender). Purely additive.
+        {
+            var byTex = new Dictionary<int, List<(int frame, SharpGLTF.Memory.MemoryImage img)>>();
+            var ticksByTex = new Dictionary<int, int>();
+            foreach (var img in model.LogicalImages)
+            {
+                if (TryParseAnimImageName(img.Name, out int texIdx, out int frame, out int ticks) && img.Content.IsValid)
+                {
+                    if (!byTex.TryGetValue(texIdx, out var list))
+                        byTex[texIdx] = list = new();
+                    list.Add((frame, img.Content));
+                    if (ticks > 0) ticksByTex[texIdx] = ticks; // last one found wins if multiple frames specify it differently
+                }
+            }
+            foreach (var (texIdx, frames) in byTex)
+            {
+                if (frames.Count < 2) continue; // see TextureAnimFrames remarks - ignore accidental singletons
+                frames.Sort((a, b) => a.frame.CompareTo(b.frame));
+                im.TextureAnimFrames[texIdx] = frames.Select(f => f.img).ToList();
+                if (ticksByTex.TryGetValue(texIdx, out int t)) im.TextureAnimTicks[texIdx] = t;
+                // Frame 0 also becomes (or overrides) the static fallback image for this
+                // slot, so a path that ignores TextureAnimFrames entirely still gets a
+                // sane single texture instead of whatever the material channel happened
+                // to reference.
+                im.TextureImages[texIdx] = frames[0].img;
+            }
+        }
+
         return im;
+    }
+
+    /// Matches image names of the form "tex{N}_anim{frame}" (case-insensitive), with an
+    /// optional trailing "_tN" tick-rate suffix, e.g. "tex1_anim0", "tex1_anim0_t10"
+    /// (10 ticks/frame hold time), "TEX2_ANIM03_T3". N, frame, and the tick count are
+    /// plain non-negative integers. Returns false for anything else, including the
+    /// unrelated "mat_texN" material-naming convention (different prefix, different
+    /// purpose). `ticks` is -1 when no "_tN" suffix is present (caller should fall back
+    /// to a default in that case, not treat -1 as a real value).
+    private static bool TryParseAnimImageName(string? name, out int texIdx, out int frame, out int ticks)
+    {
+        texIdx = -1; frame = -1; ticks = -1;
+        if (string.IsNullOrEmpty(name)) return false;
+        int p = name.IndexOf("tex", StringComparison.OrdinalIgnoreCase);
+        if (p < 0) return false;
+        int i = p + 3, texStart = i;
+        while (i < name.Length && char.IsDigit(name[i])) i++;
+        if (i == texStart) return false;
+        if (!int.TryParse(name.AsSpan(texStart, i - texStart), out texIdx)) return false;
+
+        int a = name.IndexOf("anim", i, StringComparison.OrdinalIgnoreCase);
+        if (a < 0) { texIdx = -1; return false; }
+        int j = a + 4, frameStart = j;
+        while (j < name.Length && char.IsDigit(name[j])) j++;
+        if (j == frameStart) { texIdx = -1; return false; }
+        if (!int.TryParse(name.AsSpan(frameStart, j - frameStart), out frame)) { texIdx = -1; return false; }
+
+        // optional "_tN" suffix anywhere after the frame number
+        int t = name.IndexOf("_t", j, StringComparison.OrdinalIgnoreCase);
+        if (t >= 0)
+        {
+            int k = t + 2, tickStart = k;
+            while (k < name.Length && char.IsDigit(name[k])) k++;
+            if (k > tickStart && int.TryParse(name.AsSpan(tickStart, k - tickStart), out int parsedTicks))
+                ticks = Math.Max(1, parsedTicks);
+        }
+        return true;
     }
 
     // DOTR-convention mode intentionally does not use string-named authoring markers.
@@ -551,4 +636,180 @@ public static class GlbImporter
             v.Uv = new Vector2(wx, wy);
         }
     }
+
+    /// Decode the glb's embedded base-colour images (per "mat_texN" texture index) into raw
+    /// RGBA TextureInputs for the RH2 re-encoder. Uses the same SaveToFile -> Raylib.LoadImage
+    /// path as the model viewer (version-safe across SharpGLTF releases). Best-effort: a
+    /// texture that fails to decode is skipped and keeps the template's original RH2.
+    /// `maxDim`: same per-axis cap used everywhere else native textures get built (see
+    /// Rh2Encoder.ChooseTarget / Rh0Assembler's maxTexDim) - default 512, matching the
+    /// rest of this codebase's default. THIS MATTERS MORE for animated slots than static
+    /// ones: a flipbook sheet's width grows with frame count, so an unclamped per-frame
+    /// cell size (e.g. a raw 1012px-wide source rounding up to 1024) multiplies directly
+    /// by frame count in the final sheet - a 4-frame flipbook from an uncapped 1024px
+    /// source becomes a 4096x1024 sheet (~4 MB encoded), which cannot fit in either a
+    /// fixed 1 MiB monster.mrg slot or a typical MODEL.MRG model's real budget. Clamping
+    /// each cell to maxDim first keeps sheet size bounded and predictable the same way
+    /// static textures already are.
+    public static List<Rh0Assembler.TextureInput> DecodeGlbTextures(ImportedModel model, int maxDim = 512)
+    {
+        var inputs = new List<Rh0Assembler.TextureInput>();
+        var animSlots = model.TextureAnimFrames.Keys.ToHashSet();
+
+        foreach (var (texIdx, img) in model.TextureImages)
+        {
+            if (animSlots.Contains(texIdx)) continue; // handled by the anim branch below instead
+            string tmp = null;
+            try
+            {
+                string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
+                tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_" + Guid.NewGuid().ToString("N") + "." + ext);
+                img.SaveToFile(tmp);
+
+                Image cpu = Raylib.LoadImage(tmp);
+                if (cpu.Width <= 0 || cpu.Height <= 0) continue;
+                Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
+
+                byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
+                unsafe
+                {
+                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length);
+                }
+                inputs.Add(new Rh0Assembler.TextureInput {
+                    TexIdx = texIdx,
+                    Rgba = rgba,
+                    Width = cpu.Width,
+                    Height = cpu.Height,
+                });
+                Raylib.UnloadImage(cpu);
+            }
+            catch
+            {
+                /* skip this texture; the template RH2 stays */
+            }
+            finally
+            {
+                try
+                {
+                    if (tmp != null && File.Exists(tmp)) File.Delete(tmp);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        // --- animated slots: decode every frame, pack into one sprite sheet ---
+        foreach (var (texIdx, frames) in model.TextureAnimFrames)
+        {
+            try
+            {
+                var decoded = new List<(byte[] rgba, int w, int h)>();
+                foreach (var f in frames)
+                {
+                    string tmp = null;
+                    try
+                    {
+                        string ext = string.IsNullOrEmpty(f.FileExtension) ? "png" : f.FileExtension;
+                        tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_anim_" + Guid.NewGuid().ToString("N") + "." + ext);
+                        f.SaveToFile(tmp);
+                        Image cpu = Raylib.LoadImage(tmp);
+                        if (cpu.Width <= 0 || cpu.Height <= 0) continue;
+
+                        // Clamp BEFORE extracting bytes - a flipbook sheet's width grows
+                        // with frame count (cols*blockW), so an unclamped per-frame size
+                        // multiplies directly into the final sheet. Retail's own flipbook
+                        // sample is tiny (128x64 stored for 8 frames, ~32x16 px/cell) -
+                        // animated cells are meant to be small, not full-resolution copies
+                        // of the source art. Resize (not crop/pad) so the whole frame's
+                        // content survives, just at a lower resolution.
+                        if (cpu.Width > maxDim || cpu.Height > maxDim)
+                        {
+                            float scale = Math.Min((float)maxDim / cpu.Width, (float)maxDim / cpu.Height);
+                            int nw = Math.Max(1, (int)Math.Round(cpu.Width * scale));
+                            int nh = Math.Max(1, (int)Math.Round(cpu.Height * scale));
+                            Raylib.ImageResize(ref cpu, nw, nh);
+                        }
+
+                        Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
+                        byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
+                        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length); }
+                        decoded.Add((rgba, cpu.Width, cpu.Height));
+                        Raylib.UnloadImage(cpu);
+                    }
+                    finally
+                    {
+                        try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { }
+                    }
+                }
+                if (decoded.Count < 2) continue; // matches TextureAnimFrames' own >=2 rule
+
+                // All frames must share one size for a flipbook (the engine's "grid" entry
+                // is one fixed blockW/blockH for every cell). Mismatched frame sizes most
+                // likely mean the Blender export wasn't set up consistently (or rounded
+                // differently during the maxDim resize above); rather than silently
+                // distort frames, fall back to treating this slot as static (frame 0
+                // only) so the import doesn't fail outright.
+                int rawW = decoded[0].w, rawH = decoded[0].h;
+                bool uniform = decoded.All(d => d.w == rawW && d.h == rawH);
+                if (!uniform)
+                {
+                    inputs.Add(new Rh0Assembler.TextureInput { TexIdx = texIdx, Rgba = decoded[0].rgba, Width = rawW, Height = rawH });
+                    continue;
+                }
+
+                // Pad each (already maxDim-clamped) cell up to a power-of-two, then pad
+                // the FULL sheet (bw*n, bh) up to Rh2Encoder.BuildNative's real
+                // requirement - width a POT multiple of 128, height a POT multiple of 64
+                // - so it can be passed in as an exact target with no resampling at all
+                // (Resample's sw==dw&&sh==dh short-circuit). This keeps every frame's
+                // cell boundary on an exact texel grid.
+                int n = decoded.Count;
+                int bw = Math.Max(1, Rh2Encoder.NextPot(rawW));
+                int bh = Math.Max(1, Rh2Encoder.NextPot(rawH));
+
+                int sheetW = Rh2Encoder.NextPot(bw * n);
+                sheetW = ((sheetW + 127) / 128) * 128;
+                if (!IsPow2Local(sheetW)) sheetW = Rh2Encoder.NextPot(sheetW);
+                int sheetH = Rh2Encoder.NextPot(bh);
+                sheetH = ((sheetH + 63) / 64) * 64;
+                if (!IsPow2Local(sheetH)) sheetH = Rh2Encoder.NextPot(sheetH);
+                sheetW = Math.Max(sheetW, 128);
+                sheetH = Math.Max(sheetH, 64);
+
+                byte[] sheet = new byte[sheetW * sheetH * 4];
+                for (int f = 0; f < n; f++)
+                {
+                    var (rgba, w, h) = decoded[f];
+                    int cellX = f * bw;
+                    if (cellX >= sheetW) break; // shouldn't happen given the rounding above, but stay safe
+                    for (int y = 0; y < h && y < bh && y < sheetH; y++)
+                        Buffer.BlockCopy(rgba, y * w * 4, sheet, ((y * sheetW) + cellX) * 4, Math.Min(w, sheetW - cellX) * 4);
+                    // any remaining padding bytes stay transparent-black (default array init)
+                }
+
+                inputs.Add(new Rh0Assembler.TextureInput {
+                    TexIdx = texIdx,
+                    Rgba = sheet,
+                    Width = sheetW,
+                    Height = sheetH,
+                    AnimFrameCount = n,
+                    AnimBlockW = bw,
+                    AnimBlockH = bh,
+                    AnimTicksPerFrame = model.TextureAnimTicks.TryGetValue(texIdx, out int customTicks)
+                        ? customTicks
+                        : 5, // default matches the one real retail sample (see TextureInput remarks)
+                });
+            }
+            catch
+            {
+                /* skip this texture's animation; falls through with no TextureInput for
+                   this slot, so the template's existing texture/anim is kept untouched */
+            }
+        }
+
+        return inputs;
+    }
+
+    private static bool IsPow2Local(int v) => v > 0 && (v & (v - 1)) == 0;
 }

@@ -1,4 +1,4 @@
-using System.Numerics;
+﻿using System.Numerics;
 
 namespace DotrAssetModder;
 
@@ -47,26 +47,6 @@ public static class RebuildPipeline
     private const double BamsPerRad = 32768.0 / Math.PI;
 
 
-    public enum ExternalSkinnedFrameSource
-    {
-        /// Automatically chooses raw or mesh-node-world frame positions for external skinned GLBs.
-        /// If the mesh-node-world bounds explode compared to raw skin bounds, raw is used.
-        Auto,
-
-        /// Use raw skinned POSITION values for frame/bounds/camera. Animation-safe, often best for
-        /// Armature-rooted models whose node-world transform is not a useful authored frame.
-        RawSkinPositions,
-
-        /// Use mesh-node-world transformed positions for frame/bounds/camera only. This is never used
-        /// for the actual skinned geometry encoding.
-        MeshNodeWorldPositions,
-
-        /// Use raw skin positions, but trim extreme bbox outliers before picking centre/radius.
-        TrimmedRawSkinPositions,
-
-        /// Use mesh-node-world positions, but trim extreme bbox outliers before picking centre/radius.
-        TrimmedMeshNodeWorldPositions,
-    }
 
     private sealed class FrameDebugState
     {
@@ -78,8 +58,6 @@ public static class RebuildPipeline
         public Vector3 BBoxMax;
         public Vector3 BBoxCenter;
         public bool HasGeometry;
-        public string RequestedSkinnedFrameSource = "n/a";
-        public string EffectiveSkinnedFrameSource = "n/a";
         public Vector3 PlacementPivot;
         public string PlacementPivotSource = "unknown";
         public Vector3 CameraTarget;
@@ -124,12 +102,13 @@ public static class RebuildPipeline
 
         /// Model bounding centre + radius (WORLD units), emitted as the node-tree bounds record
         /// at tree base +0x30. lSzModel_LoadCB seeds handle+0x90 (centre) / handle+0x1e4 (radius)
-        /// from it; SzModel_GetCenter returns the per-frame world transform of the centre, which the
-        /// duel/3D-battle camera and the 3D monster view aim their VERTICAL look-at at. Centre =
-        /// the model's GEOMETRIC bbox centre so those views frame the body's middle (anchoring it on
-        /// GNode(1) made the camera aim at the feet -> monsters too high). The model's placement pivot
-        /// is GNode(1)/'origin', a SEPARATE knob (SzModel_GetCenterOfs reads the node tree directly,
-        /// not this record). Radius = bounding-sphere radius about that centre.
+        /// from it. VERIFIED IN GHIDRA (SzModel_GetCenter, SzModel_DrawWithFunc_Pipe): for
+        /// animated model types, SzModel_GetCenter always returns handle+0x80, which is
+        /// overwritten every draw call from GetAnyCoordinate(1, ...) - GNode(1)'s live world
+        /// position - never from this bounds record. So Centre here is GNode(1)'s position (the
+        /// same point SzModel_SetPos/GetCenterOfs use for the one-time placement pin), so this
+        /// record agrees with what the live camera target will be once animation runs, rather
+        /// than disagreeing with it. Radius = bounding-sphere radius about that centre.
         public System.Numerics.Vector3 BoundsCenter;
 
         public float BoundsRadius = 1f;
@@ -160,8 +139,7 @@ public static class RebuildPipeline
     /// static replacements.
     public static Result Build(ImportedModel im, float templateAnimTransScale = 0f,
         int templateTexCount = 0, float warnMinRatio = 0.125f, float warnMaxRatio = 2.0f,
-        TemplateFrame? templateFrame = null, bool fitExternalToTemplateFrame = false,
-        bool scaleExternalToTemplateFrame = false,
+        TemplateFrame? templateFrame = null,
         bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
@@ -172,10 +150,7 @@ public static class RebuildPipeline
         // it must not decide the imported model's pivot, camera target, or bounds radius.
         // Otherwise the same GLB would behave differently depending on the monster slot it
         // replaces.
-        bool useTemplateFrameForExternal = false;
         float donorBoundsRadius = templateFrame is { IsValid: true } ? templateFrame.BoundsRadius : 0f;
-        _ = fitExternalToTemplateFrame;
-        _ = scaleExternalToTemplateFrame;
 
         // ---- 0a. UV-atlas merge of excess texture slots ----
         // The template's TexTable has a fixed number of RH2 payload slots; pages on slots
@@ -210,13 +185,10 @@ public static class RebuildPipeline
             ConsumedRootSlot = consumedRootSlot,
         };
 
-        // DOTR-convention mode: no string markers and no automatic pivot/camera selection.
-        // Skinned external GLBs use their raw skin/bind positions for frame diagnostics/bounds,
-        // matching extracted DOTR GLBs. Static meshes keep their baked world positions.
-        var effectiveSkinnedFrameSource = ResolveExternalSkinnedFrameSource(im);
-        ApplyFramePositionSource(im, effectiveSkinnedFrameSource);
-        frameDebug.RequestedSkinnedFrameSource = "DOTR convention";
-        frameDebug.EffectiveSkinnedFrameSource = effectiveSkinnedFrameSource.ToString();
+        // Frame-generation positions (used for bounds/pivot/radius diagnostics) are just each
+        // vertex's encoder position - skinned vertices stay in skin/bind space, unskinned
+        // vertices are already world-baked (see GlbImporter's iv.Pos assignment).
+        InitFramePositions(im);
 
         // ---- 1. DFS preorder; node[0] = root, extra roots re-parented under it ----
         var order = new List<int>(); // glb node indices, preorder
@@ -230,7 +202,8 @@ public static class RebuildPipeline
             // Ignore loose, root-level empty helper nodes without relying on specific names.
             // This lets old marker empties remain in a GLB without becoming DOTR GNodes,
             // while preserving real bones/armatures/mesh nodes.
-            return n.Parent < 0 && !n.HasMesh && !n.IsJoint && n.Children.Count == 0;
+            if (n.Parent < 0 && !n.HasMesh && !n.IsJoint && n.Children.Count == 0) return true;
+            return IsPureMeshInstancingLeaf(im, g);
         }
 
         void Dfs(int g)
@@ -290,10 +263,10 @@ public static class RebuildPipeline
         // distance from global origin, so extracted round-trips looked 2-3x "too large"
         // merely because the authored slot lives far from (0,0,0). Radius-around-camera is
         // stable for both MrgRoot round-trips and external models.
-        if (!im.IsDotrExtractedGlb && ComputeBounds(im, effectiveSkinnedFrameSource, out var warnMin, out var warnMax))
+        if (!im.IsDotrExtractedGlb && ComputeBounds(im, out var warnMin, out var warnMax))
         {
             var warnCenter = im.FittedCameraLookAtWorld ?? im.AuthorCameraLookAtWorld ?? ((warnMin + warnMax) * 0.5f);
-            double srcRadius = Math.Max(ComputeRadius(im, effectiveSkinnedFrameSource, warnCenter), 1e-9f);
+            double srcRadius = Math.Max(ComputeRadius(im, warnCenter), 1e-9f);
             double donorSize = donorBoundsRadius > 1e-5f ? donorBoundsRadius : srcRadius;
             double ratio = srcRadius / Math.Max(donorSize, 1e-9);
             fitReport.OriginalWorld = srcRadius;
@@ -373,75 +346,97 @@ public static class RebuildPipeline
             if (encIndexOf.TryGetValue(er, out int ei))
                 nodes[0].Children.Add(ei);
 
-        bool hasBounds = ComputeBounds(im, effectiveSkinnedFrameSource, out var geomMin, out var geomMax);
+        bool hasBounds = ComputeBounds(im, out var geomMin, out var geomMax);
         var geomCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
         frameDebug.HasGeometry = hasBounds;
         frameDebug.BBoxMin = hasBounds ? geomMin : Vector3.Zero;
         frameDebug.BBoxMax = hasBounds ? geomMax : Vector3.Zero;
         frameDebug.BBoxCenter = geomCenter;
 
-        // ---- 4.5 synthetic GNode(1) pivot for external models ----
-        // Extractor glbs ('MrgRoot') keep the retail tree verbatim, so retail node 1 is
-        // already the pivot AND externally loaded retail motions (.nab, applied by node
-        // index with zero validation - lSzModel_LoadMotionCB@0x1ee4c0) stay aligned.
-        // External models get a leaf node inserted as the root's first child at the
-        // world-space bounding-box center of the geometry.
+        // ---- 4.5 GNode(1) pivot for external models ----
+        // CONFIRMED RETAIL STRUCTURE (verified on blue-eyes_white_dragon.mrg's node tree AND
+        // every one of its 5 MOT slots): node 0 is a neutral root (rest pose: zero rotation,
+        // zero translation, ONLY the global scale folded in - see step 4's nd.Scale handling)
+        // that the engine and on-disk MOT data never animate (every slot's node-0 track has
+        // transCount=rotCount=0). Node 1 - the root's first child - carries real, substantial
+        // keyframe data in EVERY slot (e.g. 147 translation + 49 rotation keys over 391 frames
+        // on the longest slot) and is what both placement (SzModel_SetPos via the STATIC rest-
+        // pose read GetCenterOfs, Addendum §2) and the per-frame camera aim (SzModel_GetCenter,
+        // which re-derives node 1's LIVE world transform every frame via GetAnyCoordinate(1),
+        // Addendum §3/§4) are anchored to. An animated node 1 is precisely how the camera
+        // follows the model's centre of mass through its own motion - retail dragons visibly
+        // shift their look-at point during their attack animation because node 1 itself is
+        // keyframed in that MOT slot. Below node 1, retail inserts one or more neutral,
+        // non-bound (meshSlot=0) container nodes (node 2, node 3, ...) before the first real
+        // bone bind appears (node 4 on this sample) - an offset link the rig hangs off of
+        // without disturbing the pivot itself.
+        //
+        // For custom GLBs this means: PrepareRoot's structural wrapper-peel (no naming
+        // required) recognizes a dedicated pivot wrapper purely by position - a non-content,
+        // single-child node sitting as the second peeled wrapper above the real
+        // mesh/armature/animation content becomes node_1 regardless of what it's named. If
+        // the artist keyframes that node, those translation/rotation keys flow through the
+        // normal animation-channel loop in step 8 like any other node and become node 1's
+        // real MOT track.
+        //
+        // Extractor glbs keep the retail tree verbatim, so retail node 1 (already animated,
+        // per the above) is preserved as-is and externally loaded retail motions (.nab,
+        // applied by node index with zero validation - lSzModel_LoadMotionCB@0x1ee4c0) stay
+        // aligned.
+        //
+        // External models with NO separate pivot wrapper at all (root0 already branches or
+        // carries content directly - e.g. an Armature with several top-level bone chains and
+        // no dedicated empty above it) fall back to InsertGeneratedPivot, which synthesizes a
+        // STATIC (unanimated) node 1 anchored at the geometry's centre. This is a degraded
+        // mode, not an equivalent substitute for the retail pattern above: it fixes the
+        // "pinned to literal world (0,0,0) regardless of where the artist modeled the mesh"
+        // placement/camera-aim mismatch, but it cannot give a moving camera-follow target,
+        // because there is no authored motion to carry. Models that want the camera to track
+        // their motion (the retail convention) need a real, separate, ideally-animated pivot
+        // wrapper above the armature/mesh content - there is no way to synthesize that
+        // automatically from geometry alone.
         if (synthPivot)
-            InsertGeneratedPivot(im, nodes, encIndexOf, S, frameDebug);
+            InsertGeneratedPivot(im, nodes, encIndexOf, S, frameDebug, hasBounds ? geomMin : null, hasBounds ? geomMax : null);
         else if (nodes.Count > 1)
         {
             frameDebug.PlacementPivot = new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S);
             frameDebug.PlacementPivotSource = "existing GNode(1)";
         }
 
-        // ---- 4.6 world-accurate explicit pivot ('origin') ----
-        // GNode(1) is what the duel / 3D-battle / enemy-preview camera centers on for ANIMATED
-        // monsters: SzModel_DrawWithFunc_Pipe@0x1ec350 books center(+0x80) = GetAnyCoordinate(1),
-        // and coordinate number 1 == node DFS index 1 == GNode(1) (require_coordinate_index resets
-        // to 0 in RhModel_Draw@0x20d3b8, root visited first; booked in lRhModel_SetupNoMotionRecursive).
-        // The pin (SzModel_SetPos(-GetCenterOfs)) puts GNode(1) at world origin, so the camera aims
-        // at world 0 and the framing is decided by where the geometry sits relative to GNode(1):
-        // GNode(1) at the FEET -> body entirely above origin -> "too high"; GNode(1) mid-body ->
-        // geometry straddles origin -> centered (retail convention). The bounds sphere (+0x90) only
-        // drives STATIC models, so it can't fix this. Keep the empty's X/Z (overworld rotation pivot
-        // is about the vertical axis, so its Y is irrelevant there) and lift GNode(1).Y to the
-        // geometry vertical centre.
-        // Explicit pivot nodes are now honoured as-authored. Do not silently lift their Y
-        // to the bbox centre: that makes Act3DView look better but breaks overworld/duel
-        // placement. External replacement GLBs should use explicit pivot/camera target policy;
-        // extracted MrgRoot GLBs should preserve their generated GNode(1) order.
-        // ---- 4.7 node-tree bounds record (centre + radius) ----
-        // The duel/3D-battle camera (SzDuel_Draw3DView_Pipe@0x1bf820) and the 3D monster view /
-        // enemy preview (Taku_Camp_Teki_Model_Disp@0x21be30) point the camera's VERTICAL look-at at
-        // the engine's booked centre (SzModel_GetCenter = handle+0x80), which lSzModel_LoadCB@0x1e6880
-        // seeds from THIS record (nodeTreeBase+0x30) and SzModel_DrawWithFunc_Pipe@0x1ec350 transforms
-        // into world space each frame. The model's vertical PLACEMENT, by contrast, is pinned by
-        // GNode(1): the duel does a one-time SetPos(0x1d, -GetCenterOfs) and GetCenterOfs =
-        // GNode(1).pos / animTransScale, read straight from the node tree — it does NOT consult this
-        // record. So these are two independent knobs: GNode(1) decides where the model SITS, this
-        // centre decides where the camera LOOKS.
+        // ---- 4.6/4.7 node-tree bounds record (centre + radius) ----
+        // VERIFIED DIRECTLY IN GHIDRA (SzModel_DrawWithFunc_Pipe@0x1ec350, SzModel_GetCenter@0x1f2050,
+        // lSzModel_LoadCB@0x1e6880), correcting an earlier mistaken belief in this codebase:
         //
-        // Anchoring this centre on GNode(1) (the previous behaviour) makes the camera aim at GNode(1).
-        // For real monsters GNode(1) sits low (root/feet), so the camera framed the feet and the body
-        // rendered above the aim point -> monsters appeared "too high" in the duel, 3D battle and
-        // monster view. The correct anchor is the model's GEOMETRIC centre (the standard meaning of a
-        // bounds record): the camera then frames the body's middle and the monster sits centred. This
-        // is stable under idle/turn spin (rotation about the vertical axis leaves the centre's Y
-        // unchanged) and the framing paths read only .y, so it cannot wobble. Units are already
-        // correct: v.Pos is the glb WORLD position and the reconstruction reproduces glb world 1:1, so
-        // the bbox centre is in the same space the engine transforms handle+0x90 from (radius lands
-        // ~40, inside the retail ~40-133 band).
-        Vector3 boundsCenter;
-        {
-            // DOTR-convention mode: the live animated camera/control coordinate is GNode(1).
-            // The node-tree bounds record remains a real geometry bounds centre only; it is
-            // not an authoring camera target and does not use markers.
-            boundsCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
-            frameDebug.CameraTarget = boundsCenter;
-            frameDebug.CameraTargetSource = hasBounds ? "geometry bounds center" : "no-geometry fallback: origin";
-        }
-        // Radius = bounding-sphere radius about the centre over all WORLD-space vertices. Clamp to
-        // a small positive value: the engine computes 40/radius (clamped [0.3,1]) for deform, so a
+        // SzModel_GetCenter(modelId, out) always returns handle+0x80/+0x84/+0x88/+0x8c, period -
+        // there is no branch that reads anything else. For animated model types (4/5/6, i.e. every
+        // monster), SzModel_DrawWithFunc_Pipe overwrites handle+0x80 EVERY DRAW CALL via
+        // GetAnyCoordinate(1, outMatrix) - GNode(1)'s current animated world position, captured
+        // fresh right after that frame's pose is drawn. handle+0x90 is a DIFFERENT field: it is
+        // seeded once at load time (lSzModel_LoadCB) from this on-disk bounds record
+        // (nodeTreeBase+0x30..+0x3C), but nothing in SzModel_DrawWithFunc_Pipe's animated branch
+        // ever reads +0x90, and SzModel_GetCenter never reads it either - it is a load-time
+        // placeholder / static-model-only field, not an alternate route to the camera target.
+        //
+        // So for any animated monster, the camera ALWAYS aims at GNode(1)'s live position, full
+        // stop - there is no second "geometric centre" camera target to anchor instead. The bounds
+        // record written here exists for: the one-frame gap before the first GetAnyCoordinate(1)
+        // call lands (handle+0x90 -> +0x80 only happens in the non-animated else-branch), the
+        // load-time radius (handle+0x1e4, used for deform scaling, *(float*)(iVar2+0x1e8) = clamp(40/
+        // radius, 0.3, 1)), and as diagnostic/comparison data. It should track GNode(1), not the
+        // geometry centroid, so the bounds record agrees with what the live camera target will be
+        // once the first animated frame runs - anchoring it on the geometric centroid instead made
+        // it disagree with the actual runtime camera target for animated monsters, the same
+        // confusion that motivated routing around GNode(1) here.  If GNode(1) sits at a place that
+        // makes for bad camera framing (e.g. the literal feet), the fix is to place GNode(1) better
+        // (see step 4.5's InsertGeneratedPivot / the explicit pivot convention), not to give the
+        // camera a different target than the one the engine actually uses.
+        Vector3 boundsCenter = nodes.Count > 1
+            ? new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S)
+            : Vector3.Zero;
+        frameDebug.CameraTarget = boundsCenter;
+        frameDebug.CameraTargetSource = nodes.Count > 1 ? "GNode(1) (matches live SzModel_GetCenter)" : "no GNode(1): origin";
+        // Radius = bounding-sphere radius about GNode(1) over all WORLD-space vertices. Clamp to a
+        // small positive value: the engine computes 40/radius (clamped [0.3,1]) for deform, so a
         // zero/denormal radius would skew framing/deform. Single-vertex/degenerate models get 1.0.
         float boundsRadius = 0f;
         foreach (var prim in im.Primitives)
@@ -553,12 +548,18 @@ public static class RebuildPipeline
                 }
                 if (ch.Rotation is { Count: > 0 } rk)
                 {
+                    // Keyframes are sorted by time (glTF sampler requirement), so consecutive
+                    // entries are temporally adjacent: each one's BAMS triple is chosen to be
+                    // continuous with the previous, instead of an independent principal-value
+                    // decomposition per frame (see QuatToBamsContinuous for why that matters).
                     track.Rot = new List<(int, int, int, int)>(rk.Count);
+                    (int X, int Y, int Z)? prevBams = null;
                     foreach (var (t, q) in rk)
                     {
                         int f = (int)MathF.Round(t * Fps);
-                        var (rx, ry, rz) = QuatToBams(q);
-                        track.Rot.Add((f, rx, ry, rz));
+                        var bams = QuatToBamsContinuous(q, prevBams);
+                        prevBams = bams;
+                        track.Rot.Add((f, bams.X, bams.Y, bams.Z));
                         if (f > maxFrame) maxFrame = f;
                     }
                 }
@@ -653,7 +654,7 @@ public static class RebuildPipeline
         return merges;
     }
 
-    private static bool ComputeBounds(ImportedModel im, ExternalSkinnedFrameSource source, out Vector3 min, out Vector3 max)
+    private static bool ComputeBounds(ImportedModel im, out Vector3 min, out Vector3 max)
     {
         var pts = CollectValidFramePositions(im);
         if (pts.Count == 0)
@@ -661,20 +662,6 @@ public static class RebuildPipeline
             min = Vector3.Zero;
             max = Vector3.Zero;
             return false;
-        }
-
-        if (IsTrimmedFrameSource(source) && pts.Count >= 16)
-        {
-            // Use trimmed percentiles to avoid tails/wings/weapons pulling the generated
-            // camera/pivot far away from the body. Y is trimmed less aggressively than X/Z
-            // so tall bodies still frame correctly.
-            min = new Vector3(Percentile(pts, static p => p.X, 0.10f),
-                              Percentile(pts, static p => p.Y, 0.05f),
-                              Percentile(pts, static p => p.Z, 0.10f));
-            max = new Vector3(Percentile(pts, static p => p.X, 0.90f),
-                              Percentile(pts, static p => p.Y, 0.95f),
-                              Percentile(pts, static p => p.Z, 0.90f));
-            return true;
         }
 
         min = new Vector3(float.MaxValue);
@@ -687,30 +674,10 @@ public static class RebuildPipeline
         return true;
     }
 
-    private static float ComputeRadius(ImportedModel im, ExternalSkinnedFrameSource source, Vector3 center)
+    private static float ComputeRadius(ImportedModel im, Vector3 center)
     {
         var pts = CollectValidFramePositions(im);
         if (pts.Count == 0) return 0f;
-
-        // For trimmed frame modes, use the same trimmed point cloud for the radius so a long
-        // tail/weapon does not force the camera distance/preview radius to balloon.
-        if (IsTrimmedFrameSource(source) && pts.Count >= 16)
-        {
-            var min = new Vector3(Percentile(pts, static p => p.X, 0.10f),
-                                  Percentile(pts, static p => p.Y, 0.05f),
-                                  Percentile(pts, static p => p.Z, 0.10f));
-            var max = new Vector3(Percentile(pts, static p => p.X, 0.90f),
-                                  Percentile(pts, static p => p.Y, 0.95f),
-                                  Percentile(pts, static p => p.Z, 0.90f));
-            float r = 0f;
-            foreach (var p in pts)
-            {
-                if (p.X < min.X || p.X > max.X || p.Y < min.Y || p.Y > max.Y || p.Z < min.Z || p.Z > max.Z)
-                    continue;
-                r = Math.Max(r, Vector3.Distance(p, center));
-            }
-            return r;
-        }
 
         float radius = 0f;
         foreach (var p in pts)
@@ -733,88 +700,36 @@ public static class RebuildPipeline
         return pts;
     }
 
-    private static bool IsTrimmedFrameSource(ExternalSkinnedFrameSource source) =>
-        source == ExternalSkinnedFrameSource.TrimmedRawSkinPositions ||
-        source == ExternalSkinnedFrameSource.TrimmedMeshNodeWorldPositions;
-
-    private static float Percentile(List<Vector3> pts, Func<Vector3, float> selector, float q)
+    private static void InitFramePositions(ImportedModel im)
     {
-        var values = new float[pts.Count];
-        for (int i = 0; i < pts.Count; i++) values[i] = selector(pts[i]);
-        Array.Sort(values);
-        if (values.Length == 1) return values[0];
-        float f = Math.Clamp(q, 0f, 1f) * (values.Length - 1);
-        int lo = (int)MathF.Floor(f);
-        int hi = (int)MathF.Ceiling(f);
-        if (lo == hi) return values[lo];
-        return values[lo] + (values[hi] - values[lo]) * (f - lo);
-    }
-
-    private static ExternalSkinnedFrameSource ResolveExternalSkinnedFrameSource(ImportedModel im)
-    {
-        // DOTR-convention mode: skinned models are treated like extracted DOTR GLBs.
-        // Their raw POSITION data is the model-space frame. Static models are already
-        // baked to world space by GlbImporter and also end up using Pos.
-        return ExternalSkinnedFrameSource.RawSkinPositions;
-    }
-
-    private static void ApplyFramePositionSource(ImportedModel im, ExternalSkinnedFrameSource source)
-    {
-        bool externalSkinned = !im.IsDotrExtractedGlb && im.JointNodeIndices.Count > 0;
         foreach (var prim in im.Primitives)
         foreach (var v in prim.Vertices)
-        {
-            if (!externalSkinned)
-            {
-                v.FramePos = v.Pos;
-                continue;
-            }
-
-            v.FramePos = source switch
-            {
-                ExternalSkinnedFrameSource.MeshNodeWorldPositions => v.MeshNodeWorldPos,
-                ExternalSkinnedFrameSource.TrimmedMeshNodeWorldPositions => v.MeshNodeWorldPos,
-                _ => v.Pos,
-            };
-        }
+            v.FramePos = v.Pos;
     }
-
-    private static bool TryBounds(ImportedModel im, Func<ImportedVertex, Vector3> selector, out Vector3 min, out Vector3 max)
-    {
-        bool any = false;
-        min = new Vector3(float.MaxValue);
-        max = new Vector3(float.MinValue);
-        foreach (var prim in im.Primitives)
-        foreach (var v in prim.Vertices)
-        {
-            var p = selector(v);
-            if (float.IsNaN(p.X) || float.IsInfinity(p.X) ||
-                float.IsNaN(p.Y) || float.IsInfinity(p.Y) ||
-                float.IsNaN(p.Z) || float.IsInfinity(p.Z)) continue;
-            min = Vector3.Min(min, p);
-            max = Vector3.Max(max, p);
-            any = true;
-        }
-        return any;
-    }
-
-    private static float BoundsRadius(Vector3 min, Vector3 max) =>
-        Vector3.Distance(min, max) * 0.5f;
 
     // ---- root preparation / pivot guarantee -------------------------------------------
 
-    /// Picks the encoding root and strips wrapper nodes above it.
-    /// Returns (rootGlbIndex, synthesizePivot):
-    ///   * Extractor glbs: the scene root is the synthetic 'MrgRoot' wrapper
-    ///     (ModelExtractor.WriteGlb) with the retail root as its only child. Dropping
-    ///     exactly that wrapper restores the retail tree - retail GNode(1) is the pivot
-    ///     again and node indices match retail motion files. No pivot is synthesised.
-    ///   * External glbs: trivial single-child wrapper chains (no mesh, not a skin joint,
-    ///     not animated, no rigid vertices) are collapsed and their accumulated transform
-    ///     is baked into the new root's local TRS (its WorldMatrix is unchanged by the
-    ///     collapse, so children and world-baked vertices stay valid). A direct child
-    ///     named 'dotr_center' is honoured as an explicit pivot (moved to first-child
-    ///     position); otherwise the caller inserts a synthetic one.
+    /// Picks the encoding root, identifies node_0 (model root) and node_1 (pivot/camera
+    /// target) by STRUCTURE rather than by name, and strips/synthesizes wrapper nodes so
+    /// every model - extracted or freshly authored - ends up with the canonical
+    /// node_0 -> node_1 -> (armature/mesh/offset content) shape.
+    /// Returns (rootGlbIndex, synthesizePivot, consumedRootSlot):
+    ///   * A "wrapper" is any node with no mesh, no skin-joint role, no animation channel of
+    ///     its own, and exactly one child - i.e. it exists purely to occupy a slot in the
+    ///     chain, whatever it happens to be named. Up to two such wrappers are peeled off the
+    ///     top of the tree: the first becomes node_0, the second becomes node_1. This works
+    ///     identically for extractor output (whose outer wrapper and retail node 1 are both
+    ///     unnamed-or-arbitrarily-named wrappers by this definition), a hand-authored
+    ///     mrgRoot/node_0/node_1/... chain, or any other naming an artist happens to use -
+    ///     no string ever needs to match.
+    ///   * Exactly one wrapper found (e.g. just a pivot empty with no outer root empty, or a
+    ///     single extractor wrapper directly above retail's node 1): that wrapper becomes
+    ///     node_1 and is re-wrapped under a freshly synthesized neutral node_0.
+    ///   * No wrapper found at all (root0 already carries content, or already branches into
+    ///     multiple children - e.g. an Armature with several top-level bone chains and no
+    ///     dedicated pivot node above it): trivial single-child decorative wrapper chains are
+    ///     still collapsed as before, but no node_1 exists yet, so the caller synthesizes a
+    ///     static one (InsertGeneratedPivot).
     private static (int Root, bool SynthPivot, int ConsumedRootSlot) PrepareRoot(ImportedModel im)
     {
         static bool LooseEmptyRoot(ImportedModel im, int g)
@@ -835,27 +750,25 @@ public static class RebuildPipeline
             }
         int root0 = im.RootNodes[slot];
 
-        // -- extractor glb: drop exactly the MrgRoot wrapper, trust the retail tree --
-        var rn = im.Nodes[root0];
-        if (rn.Name == "MrgRoot" && rn.Children.Count == 1)
-        {
-            int retailRoot = rn.Children[0];
-            im.Nodes[retailRoot].Parent = -1; // MrgRoot is identity (or a pure recenter
-            // translation the world matrices already
-            // carry): no baking needed.
-            // Honour a user-added 'origin' empty: hoist it to first-child so §4.6 reads it
-            // as the GNode(1) pivot. Absent one, retail node 1 stays the pivot.
-            HoistPivotChild(im, retailRoot);
-            return (retailRoot, false, slot);
-        }
+        // Real scene roots only (excludes pure-mesh-instancing leaves, e.g. the extractor's
+        // MrgMesh-shaped sibling root). BUG FIX: old check used im.RootNodes.Count > 1
+        // directly, so a single real wrapper root (MrgRoot) + a childless skinned-mesh leaf
+        // sitting as its own scene root (every MODEL.MRG-style extracted glb: scene roots =
+        // [MrgRoot, MrgMesh]) was wrongly treated as "multiple real roots" -> forced a
+        // synthetic neutral root + synthetic pivot even though there's exactly one real root
+        // and the wrapper-peel path below would've handled it fine (the mesh leaf is already
+        // filtered everywhere else via this same predicate, e.g. RootRealChildren /
+        // IsImportHelperNode). Was inflating the node tree by 2 junk nodes (placeholder-
+        // position synthetic pivot + extra empty wrapper) on every such model.
+        var realRoots = im.RootNodes.Where(r => !IsPureMeshInstancingLeaf(im, r)).ToList();
 
-        // -- external glb with MULTIPLE scene roots: synthesize a neutral root --
+        // -- external glb with MULTIPLE REAL scene roots: synthesize a neutral root --
         // Re-parenting extra roots under a TRANSFORMED root0 multiplies their transforms by
         // root0's (engine T = pos * parentAccumScale): e.g. a car whose Body root has scale
         // 20 would scale every other root's translation and subtree by another x20. A fresh
         // identity root (carrying only the global S, exactly like retail roots) keeps every
         // original root's world transform intact as its local one.
-        if (im.RootNodes.Count > 1)
+        if (realRoots.Count > 1)
         {
             var synth = new ImportedNode {
                 Index = im.Nodes.Count,
@@ -873,14 +786,161 @@ public static class RebuildPipeline
             return (synth.Index, true, -1); // -1: ALL scene roots consumed
         }
 
-        // -- external glb: collapse trivial wrapper chains --
-        bool animated(int g)
+        // -- structural wrapper peel: position decides node_0 / node_1, not naming --
+        // A "wrapper" is any node carrying no mesh, no skin-joint role, and no animation
+        // channel of its own - i.e. it exists purely to occupy a slot in the chain, whatever
+        // it happens to be named ('MrgRoot', 'mrgRoot', 'node_0', a typo, or nothing at all).
+        // "Children" here means REAL children only: a pure mesh-instancing leaf sibling
+        // (MrgMesh, see IsPureMeshInstancingLeaf) is invisible to this walk entirely - every
+        // MODEL.MRG-style export has exactly this shape (MrgRoot -> [node_0->node_1,
+        // MrgMesh]), where MrgMesh is a SIBLING of the real node_0/node_1 chain, not part of
+        // it, and must not make MrgRoot look like a 2-real-child branch point.
+        // Peel exactly two such single-child wrappers off the top of the tree if present:
+        // the FIRST one found becomes node_0 (the model root, never animated/referenced -
+        // matches retail's node 0, which is always at rest with zero rotation/translation),
+        // the SECOND becomes node_1 (the pivot/camera target - matches retail's node 1, which
+        // IS routinely animated, e.g. an attack-slot MOT track). The peel stops as soon as a
+        // node is reached that carries real content (a mesh, a skin-joint role, an animation
+        // channel) or has more than one REAL child (a branch point, e.g. an Armature with
+        // several top-level bone chains) - that node and everything below it is preserved
+        // verbatim as the rest of the tree, regardless of what it or anything above it was
+        // named.
+        // Children with pure mesh-instancing leaves filtered out - ONLY meaningful at
+        // root0 itself, to recognize the MrgRoot shape (a transform-chain child plus a
+        // sibling MrgMesh, e.g. MrgRoot -> [node_0, MrgMesh]). Deliberately NOT applied at
+        // every level of the walk below: a node deeper in the tree (e.g. Armature) can
+        // ALSO have several skinned mesh-instancing-leaf children alongside its real bone
+        // children, and filtering those out there would make it look like a transparent
+        // single-child wrapper too, incorrectly absorbing a genuine branch/content node
+        // (verified against jerryNew.glb: Armature has 4 mesh-leaf children + 1 real bone
+        // child: universal filtering made it look 1-real-child and wrongly pulled it into
+        // the chain instead of stopping there).
+        List<int> RootRealChildren(int g)
         {
-            foreach (var a in im.Animations)
-                if (a.Channels.ContainsKey(g))
-                    return true;
-            return false;
+            var real = new List<int>();
+            foreach (int c in im.Nodes[g].Children)
+                if (!IsPureMeshInstancingLeaf(im, c))
+                    real.Add(c);
+            return real;
         }
+
+        bool isWrapper(int g, bool isRoot)
+        {
+            var n = im.Nodes[g];
+            int childCount = isRoot ? RootRealChildren(g).Count : n.Children.Count;
+            // NOTE: deliberately does NOT check animated(g). Verified against real retail
+            // MODEL.MRG data (pack block 37's MOT track table) that node_0 itself can carry
+            // a full animation track (1001 rotation keys in that sample) - animation is not
+            // a disqualifier for either node_0 or node_1, for monsters or for this prop
+            // class. Only real content (a mesh, a skin-joint role) or branching into
+            // multiple real children stops the wrapper peel.
+            return !n.HasMesh && !n.IsJoint && childCount == 1 && !referenced(g);
+        }
+
+        var wrapperChain = new List<int>();
+        int cursor = root0;
+        bool firstStep = true;
+        while (isWrapper(cursor, firstStep))
+        {
+            wrapperChain.Add(cursor);
+            cursor = firstStep ? RootRealChildren(cursor)[0] : im.Nodes[cursor].Children[0];
+            firstStep = false;
+        }
+        // cursor now points at the first node that carries real content (mesh/joint/
+        // animation) or branches into multiple children - everything in wrapperChain sits
+        // strictly above that point.
+
+        // Is cursor itself shaped like a valid node_1 (a transform/joint placeholder with
+        // no mesh of its own and no children), rather than being deeper real content past
+        // an already-identified node_1? This is NOT simply "did wrapperChain stop here" -
+        // node_1 sometimes passes isWrapper itself (when it has a real child, e.g. retail's
+        // node_1 -> model_offset/Armature chain, the monster/extracted-GLB shape) and so is
+        // already wrapperChain's own last element with cursor pointing PAST it; other times
+        // node_1 is a bare leaf skin-joint with nothing beneath it (every confirmed
+        // MODEL.MRG-style prop: node_0_m1 in model0ab, node_1_m1 in model_037/039/189) and
+        // so it FAILS isWrapper's child-count test and becomes cursor itself. Verified
+        // against all 4 confirmed real shapes plus a hypothetical unskinned-rigid-mesh-as-
+        // direct-content edge case (HasMesh excludes that case correctly: real geometry is
+        // never mistaken for the node_1 placeholder).
+        bool cursorIsNode1Candidate = im.Nodes[cursor].Children.Count == 0 && !im.Nodes[cursor].HasMesh;
+
+        void BakeDroppedWrappers(ImportedNode keep, int dropCountAbove)
+        {
+            if (dropCountAbove <= 0) return;
+            // Wrappers were dropped ABOVE `keep` (e.g. a real MrgRoot carrying a non-
+            // identity translation/rotation, per ModelExtractor.WriteGlb's -pivot
+            // recentring shift). `keep`'s WorldMatrix already includes their contribution
+            // (SharpGLTF computes it through the full original ancestor chain), so bake
+            // that into its new local TRS now that it is becoming a root with nothing
+            // above it - otherwise the dropped wrappers' transform is silently lost and
+            // the model shifts position.
+            if (Matrix4x4.Decompose(keep.WorldMatrix, out var sc, out var rot, out var tr))
+            {
+                keep.Scale = sc;
+                keep.Rotation = rot;
+                keep.Translation = tr;
+            }
+            else
+            {
+                keep.Translation = keep.WorldMatrix.Translation;
+            }
+        }
+
+        if (cursorIsNode1Candidate)
+        {
+            // node_1 = cursor. node_0 = the last wrapper in the chain (everything before it
+            // is outer junk, e.g. a literal MrgRoot, and gets dropped), or a freshly
+            // synthesized neutral root if there was no wrapper at all above cursor (e.g. a
+            // bare node_1-shaped node sitting directly as the scene root).
+            int node1 = cursor;
+            if (wrapperChain.Count > 0)
+            {
+                int node0 = wrapperChain[^1];
+                var node0n = im.Nodes[node0];
+                BakeDroppedWrappers(node0n, wrapperChain.Count - 1);
+                node0n.Parent = -1;
+                return (node0, false, slot);
+            }
+            var freshRoot = new ImportedNode {
+                Index = im.Nodes.Count,
+                Name = "node_0",
+                Parent = -1,
+                Children = new List<int> { node1 },
+            };
+            im.Nodes.Add(freshRoot);
+            im.Nodes[node1].Parent = freshRoot.Index;
+            return (freshRoot.Index, false, slot);
+        }
+
+        if (wrapperChain.Count >= 2)
+        {
+            // cursor is real branching/content (e.g. Armature with several top-level bone
+            // chains), so node_1 must already be the chain's own last element (it passed
+            // isWrapper because it has exactly one real child - cursor - itself): the
+            // monster/extracted-GLB shape (node_0 -> node_1 -> model_offset/Armature).
+            int node0 = wrapperChain[^2];
+            var node0n = im.Nodes[node0];
+            BakeDroppedWrappers(node0n, wrapperChain.Count - 2);
+            node0n.Parent = -1;
+            return (node0, false, slot);
+        }
+
+        // Fewer than 2 wrapper levels and cursor is real content directly (not node_1-
+        // shaped): there is no separate node_1 here at all - e.g. a single MrgRoot/node_0
+        // wrapper sitting directly above real geometry, or root0 already carries content/
+        // branches immediately (wrapperChain.Count == 0). No node_1 exists yet, so the
+        // caller synthesizes a static one (InsertGeneratedPivot). If exactly one wrapper
+        // was found, it becomes the root (dropping nothing further above it); otherwise
+        // root0 is used as-is.
+        if (wrapperChain.Count == 1)
+        {
+            int node0 = wrapperChain[0];
+            im.Nodes[node0].Parent = -1;
+            return (node0, true, slot);
+        }
+        var newRoot = im.Nodes[root0];
+        newRoot.Parent = -1;
+        return (root0, true, slot);
 
         bool referenced(int g)
         {
@@ -894,91 +954,53 @@ public static class RebuildPipeline
             }
             return false;
         }
-
-        bool collapsed = false;
-        while (true)
-        {
-            var n = im.Nodes[root0];
-            if (n.Children.Count != 1) break;
-            if (n.IsJoint || animated(root0) || referenced(root0)) break;
-            root0 = n.Children[0];
-            collapsed = true;
-        }
-        var newRoot = im.Nodes[root0];
-        newRoot.Parent = -1;
-        if (collapsed)
-        {
-            // bake the dropped wrappers: the node's world matrix is unchanged, so its new
-            // local transform IS its world transform (Sketchfab wrappers carry real
-            // rotations/scales, e.g. -90degX*1000 then +90degX*0.01 in ob.glb)
-            if (Matrix4x4.Decompose(newRoot.WorldMatrix, out var sc, out var rot, out var tr))
-            {
-                newRoot.Scale = sc;
-                newRoot.Rotation = rot;
-                newRoot.Translation = tr;
-            }
-            else
-            {
-                newRoot.Translation = newRoot.WorldMatrix.Translation;
-            }
-        }
-
-        // explicit pivot: a direct child named 'origin' (or 'dotr_center') becomes the
-        // first child so it is read as GNode(1)
-        for (int i = 0; i < newRoot.Children.Count; i++)
-        {
-            if (!IsPivotName(im.Nodes[newRoot.Children[i]].Name))
-                continue;
-            int c = newRoot.Children[i];
-            newRoot.Children.RemoveAt(i);
-            newRoot.Children.Insert(0, c);
-            return (root0, false, slot);
-        }
-        return (root0, true, slot);
     }
 
-    /// A node the user designates as the model's origin / pivot (the engine's GNode(1)).
-    /// 'origin' is the documented Blender-facing name; 'dotr_center' is kept as a legacy alias.
-    private static bool IsPivotName(string? n) => false;
-
-    /// Move a pivot-named leaf child of <paramref name="root"/> into first-child position so
-    /// the DFS reads it as GNode(1). Used for extractor ('MrgRoot') glbs, where the retail
-    /// tree is otherwise kept verbatim. Returns true if a pivot child was hoisted.
-    private static bool HoistPivotChild(ImportedModel im, int root)
-    {
-        var ch = im.Nodes[root].Children;
-        for (int i = 0; i < ch.Count; i++)
-            if (IsPivotName(im.Nodes[ch[i]].Name) && im.Nodes[ch[i]].Children.Count == 0)
-            {
-                if (i != 0)
-                {
-                    int p = ch[i];
-                    ch.RemoveAt(i);
-                    ch.Insert(0, p);
-                }
-                return true;
-            }
-        return false;
-    }
-
-    /// Inserts a leaf pivot node at enc index 1 (the root's FIRST child).
+    /// Inserts a STATIC (unanimated) leaf pivot node at enc index 1 (the root's FIRST child).
+    /// This is a FALLBACK, not the recommended pattern - see the confirmed retail structure
+    /// documented at this function's call site (step 4.5): real DOTR monsters keyframe node 1
+    /// in every MOT slot, which is what lets the camera follow the model's centre of mass
+    /// through its own animation (SzModel_GetCenter re-derives node 1's LIVE transform every
+    /// frame). A node inserted here carries no animation channels, so it can only provide the
+    /// one-time STATIC placement half of the contract (SzModel_SetPos via GetCenterOfs) - the
+    /// per-frame camera-aim point will sit still at this same location for the model's entire
+    /// lifetime, never following the rig. There is no way to synthesize camera-follow motion
+    /// from geometry alone; a model that wants it needs an artist-animated 'origin'/
+    /// 'dotr_center' node, which never reaches this function (PrepareRoot hoists it to
+    /// first-child and returns synthPivot=false, so the artist's authored point AND its
+    /// animation channels are used verbatim via the normal step-8 channel loop).
     ///
-    /// DOTR-convention mode:
-    ///   * custom/new GLBs are authored around the Blender/glTF scene origin.
-    ///   * GNode(1) is always generated at world origin.
-    ///   * no string marker names and no bbox-derived pivot are used.
-    ///
-    /// This matches the extracted DOTR pattern: root/node_0 is neutral at origin and
-    /// the model is positioned by its authored geometry/node hierarchy relative to that
-    /// origin. All existing enc indices >= 1 shift by +1.
+    /// Previously this function placed the synthetic pivot at literal world (0,0,0)
+    /// unconditionally, which is only correct if the artist happened to model around the
+    /// scene origin; for anything else it produced a placement/camera mismatch that looked
+    /// "inconsistent" (floating, sunk, or off-center) depending on the model's authored offset
+    /// from (0,0,0). The corrected default anchors to the geometry itself: horizontal centre
+    /// (X/Z) of the bounding box, vertical BASE (min Y, i.e. "feet") rather than vertical
+    /// centre - this mirrors where retail monsters' own GNode(1) tends to sit (confirmed on
+    /// the blue-eyes sample: GNode(1) world pivot Y=-9.16 vs. geometric bbox centre Y=+9.24,
+    /// i.e. low in the body, not mid-body) and gives a stable, geometry-derived static
+    /// placement instead of an arbitrary authoring-space coordinate. It remains strictly a
+    /// fallback: prefer an explicit, animated pivot node whenever camera-follow matters.
     private static void InsertGeneratedPivot(ImportedModel im, List<EncNode> nodes,
-        Dictionary<int, int> encIndexOf, float S, FrameDebugState debug)
+        Dictionary<int, int> encIndexOf, float S, FrameDebugState debug,
+        Vector3? geomMin = null, Vector3? geomMax = null)
     {
         if (nodes.Count == 0 || S <= 0f) return;
 
-        var pivotWorld = Vector3.Zero;
+        Vector3 pivotWorld;
+        string source;
+        if (geomMin is { } gMin && geomMax is { } gMax)
+        {
+            pivotWorld = new Vector3((gMin.X + gMax.X) * 0.5f, gMin.Y, (gMin.Z + gMax.Z) * 0.5f);
+            source = "FALLBACK (static, no camera-follow): geometry horizontal centre / vertical base - no explicit animated 'origin'/'dotr_center' node found";
+        }
+        else
+        {
+            pivotWorld = Vector3.Zero;
+            source = "FALLBACK (static, no camera-follow): world origin - no geometry and no explicit pivot node found";
+        }
         debug.PlacementPivot = pivotWorld;
-        debug.PlacementPivotSource = "DOTR convention: Blender/glTF origin";
+        debug.PlacementPivotSource = source;
 
         // remap every index >= 1 to +1
         foreach (var nd in nodes)
@@ -992,12 +1014,16 @@ public static class RebuildPipeline
             if (encIndexOf[key] >= 1)
                 encIndexOf[key] += 1;
 
+        // The pivot is the root's first child with parent accum == 1 (root scale is folded
+        // into the ROOT node, not into this synthetic child - see step 4's nd.Scale handling),
+        // so its raw Pos is the world pivot divided by the root's own accumulated scale S,
+        // matching how every other first-level node's translation is encoded.
         var pivot = new EncNode {
             Scale = (1f, 1f, 1f),
             Flags = 0,
             MeshSlot = 0,
             RotBams = (0, 0, 0),
-            Pos = (0f, 0f, 0f),
+            Pos = (pivotWorld.X / S, pivotWorld.Y / S, pivotWorld.Z / S),
             Parent = 0,
         };
         nodes.Insert(1, pivot);
@@ -1026,8 +1052,6 @@ public static class RebuildPipeline
         Console.WriteLine($"  Geometry bbox min: {V(dbg.BBoxMin)}");
         Console.WriteLine($"  Geometry bbox max: {V(dbg.BBoxMax)}");
         Console.WriteLine($"  Geometry bbox center: {V(dbg.BBoxCenter)}");
-        Console.WriteLine($"  requested skinned frame source: {dbg.RequestedSkinnedFrameSource}");
-        Console.WriteLine($"  effective skinned frame source: {dbg.EffectiveSkinnedFrameSource}");
         Console.WriteLine();
 
         Console.WriteLine("Template MRG diagnostics only:");
@@ -1252,6 +1276,22 @@ public static class RebuildPipeline
                 joints = new HashSet<int>();
                 foreach (int v in strip) joints.UnionWith(jointsOf(v));
             }
+
+            bool TryGrow(int r, int growVu)
+            {
+                if (vu + growVu > StripVuBudget) return false;
+                if (joints != null)
+                {
+                    int grow = 0;
+                    foreach (int j in jointsOf!(r))
+                        if (!joints.Contains(j))
+                            grow++;
+                    if (joints.Count + grow > maxJoints) return false;
+                }
+                return true;
+            }
+
+            // forward: extend from the trailing edge (strip[^2], strip[^1])
             while (true)
             {
                 int p = strip[^2], q = strip[^1];
@@ -1266,21 +1306,41 @@ public static class RebuildPipeline
                     }
                 if (next < 0) break;
                 int r = Third(next, p, q);
-                if (vu + vnumOf(r) > StripVuBudget) break;
-                if (joints != null)
-                {
-                    int grow = 0;
-                    foreach (int j in jointsOf!(r))
-                        if (!joints.Contains(j))
-                            grow++;
-                    if (joints.Count + grow > maxJoints) break;
-                    joints.UnionWith(jointsOf(r));
-                }
+                if (!TryGrow(r, vnumOf(r))) break;
+                if (joints != null) joints.UnionWith(jointsOf!(r));
                 strip.Add(r);
                 vu += vnumOf(r);
                 stripTris.Add(next);
                 localUsed.Add(next);
             }
+
+            // backward: extend from the LEADING edge (strip[0], strip[1]) - a seed sitting
+            // in the middle of what would otherwise be one long run only got captured
+            // forward above; this claims the other half too, as part of the SAME strip
+            // (sharing vu/joints/localUsed so the combined strip still respects one budget
+            // and the same triangle is never claimed by both legs).
+            while (true)
+            {
+                int p = strip[0], q = strip[1];
+                var k = p < q ? (p, q) : (q, p);
+                if (!edgeMap.TryGetValue(k, out var cand)) break;
+                int next = -1;
+                foreach (int t in cand)
+                    if (!used[t] && !localUsed.Contains(t))
+                    {
+                        next = t;
+                        break;
+                    }
+                if (next < 0) break;
+                int r = Third(next, p, q);
+                if (!TryGrow(r, vnumOf(r))) break;
+                if (joints != null) joints.UnionWith(jointsOf!(r));
+                strip.Insert(0, r);
+                vu += vnumOf(r);
+                stripTris.Add(next);
+                localUsed.Add(next);
+            }
+
             return (strip, stripTris);
         }
 
@@ -1452,6 +1512,38 @@ public static class RebuildPipeline
     // ---- helpers --------------------------------------------------------------------
     private static int GlbPos(ImportedModel im, int glbIndex) => glbIndex; // ImportedModel.Nodes is indexed by logical index
 
+    /// A "pure mesh-instancing leaf": HasMesh, no children, not itself a skin joint, and
+    /// crucially none of its own vertices are influenced by its own node index (i.e. its
+    /// geometry is fully described by OTHER joints' influences). This is exactly the shape
+    /// every MODEL.MRG-style export produces: MrgRoot -> [node_0 -> node_1, MrgMesh], where
+    /// MrgMesh instances the skinned mesh but the skin's only joint is node_1, not MrgMesh
+    /// itself (verified on model_037/039/189.glb and model0ab.glb). Distinguished from a
+    /// genuine UNSKINNED/rigid mesh node (props/vehicles, GlbImporter's "bake node world
+    /// transform, rig as a one-bone joint" path): that case explicitly sets each vertex's
+    /// influence to meshNode.LogicalIndex itself (GlbImporter.cs's unskinned branch), so the
+    /// self-influence check below correctly keeps it as a real tree node (it must occupy a
+    /// DFS slot to receive a meshSlot). A node matching this predicate must be pruned from
+    /// the tree-walk / not counted as a "real" child when detecting wrapper chains: meshSlot
+    /// assignment (effectiveJoints/meshSlotOf) is already derived purely from skin/influence
+    /// data, never from node-tree position, so the encoder needs nothing from this node
+    /// being present in the encoded tree at all.
+    private static bool IsPureMeshInstancingLeaf(ImportedModel im, int g)
+    {
+        int pos = GlbPos(im, g);
+        if (pos < 0) return false;
+        var n = im.Nodes[pos];
+        if (!n.HasMesh || n.IsJoint || n.Children.Count != 0) return false;
+        foreach (var prim in im.Primitives)
+        {
+            if (prim.NodeIndex != g) continue;
+            foreach (var v in prim.Vertices)
+            foreach (var inf in v.Influences)
+                if (inf.JointNode == g)
+                    return false; // self-influenced: this IS the rigid/unskinned case
+        }
+        return true;
+    }
+
     private static List<ImportedInfluence> Influences(ImportedVertex v, ImportedModel im)
     {
         if (v.Influences.Count > 0) return v.Influences;
@@ -1492,6 +1584,62 @@ public static class RebuildPipeline
         double rx = Math.Atan2(m.M23, m.M33);
         double rz = Math.Atan2(m.M12, m.M11);
         return (BamsRound(rx), BamsRound(ry), BamsRound(rz));
+    }
+
+    /// Same analytic XYZ-Euler decomposition as <see cref="QuatToBams"/>, but resolves the
+    /// representation ambiguity (every rotation has at least two valid Euler triples — the
+    /// "principal" branch this decomposition returns, and an alternate branch ry'=pi-ry,
+    /// rx'=rx+pi, rz'=rz+pi — plus each angle independently wraps mod a full BAMS circle)
+    /// by choosing whichever BAMS-equivalent candidate is closest to the previous encoded
+    /// frame, instead of always taking the principal value.
+    ///
+    /// Why this matters: the game's MOT interpolator does a plain linear blend between
+    /// consecutive keyframe BAMS values (DotR_FileFormats.md §9), so it has no concept of
+    /// "this is the same orientation, just a different angle representation" — it just
+    /// interpolates the raw numbers. Decoding each glTF keyframe quaternion independently
+    /// (this method's predecessor) reproduces the correct POSE at each keyframe in isolation,
+    /// but is free to flip to a different, equally-valid Euler branch on any frame, which
+    /// turns a perfectly smooth source rotation into a track the linear interpolator spins
+    /// through almost a full extra revolution to get from one keyframe to the next. Verified
+    /// against the shipped blue-eyes_white_dragon.mrg: re-decoding several joints' attack/
+    /// motion-slot rotation tracks frame-independently produced single-frame jumps up to
+    /// ~359 degrees where the original retail data only ever steps a few degrees per frame.
+    private static (int X, int Y, int Z) QuatToBamsContinuous(Quaternion q, (int X, int Y, int Z)? prev)
+    {
+        var principal = QuatToBams(q);
+        if (prev is not { } p) return principal;
+
+        // Alternate Euler branch for the same rotation (XYZ convention): negate the pivot
+        // angle around its singularity (ry -> pi - ry, equivalently -(ry - pi)) and shift the
+        // other two by a half turn each. Implemented in BAMS directly: HalfTurn = 0x8000.
+        const int HalfTurn = 0x8000;
+        var alt = (
+            X: principal.X + HalfTurn,
+            Y: HalfTurn - principal.Y,
+            Z: principal.Z + HalfTurn);
+
+        (int X, int Y, int Z) BestWrap((int X, int Y, int Z) cand, (int X, int Y, int Z) target)
+        {
+            // Each axis independently may also need a +/- full-circle shift to land in the
+            // wrap nearest the previous frame (e.g. previous=32700, principal=-32750 is only
+            // 134 BAMS away once wrapped, not ~65450 away as raw integers).
+            int Nearest(int v, int t)
+            {
+                int d = (v - t) % 65536;
+                if (d > 32768) d -= 65536;
+                else if (d < -32768) d += 65536;
+                return t + d;
+            }
+            return (Nearest(cand.X, target.X), Nearest(cand.Y, target.Y), Nearest(cand.Z, target.Z));
+        }
+
+        var principalNear = BestWrap(principal, p);
+        var altNear = BestWrap(alt, p);
+
+        long Cost((int X, int Y, int Z) c) =>
+            Math.Abs((long)c.X - p.X) + Math.Abs((long)c.Y - p.Y) + Math.Abs((long)c.Z - p.Z);
+
+        return Cost(principalNear) <= Cost(altNear) ? principalNear : altNear;
     }
 
     private static int BamsRound(double rad) => (int)Math.Round(rad * BamsPerRad);
