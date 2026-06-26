@@ -30,7 +30,7 @@ public class ModelImporterWindow
         }
         if (!hasMonster)
         {
-            //Monster.MRG 
+            
             monsterPath = fl.iso_data_files[5];
         }
 

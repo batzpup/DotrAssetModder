@@ -8,7 +8,7 @@ public class MainWindow
     Windows current_window = Windows.Extractor;
 
     ExtractorWindow extract_window;
-    TextureViewerWindow texture_window;
+    TextureEditorWindow texture_window;
     ModelViewerWindow model_window;
     ModelImporterWindow import_window;
     
@@ -59,6 +59,7 @@ public class MainWindow
                 texture_window.Render();
                 ImGui.EndTabItem();
             }
+ 
             if (ImGui.BeginTabItem("Model Viewer"))
             {
                 model_window.Render();

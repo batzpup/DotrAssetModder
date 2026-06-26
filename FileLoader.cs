@@ -73,6 +73,11 @@ public class FileLoader : IDisposable
         return fileBase + (long)index * ModelBlock;
     }
 
+    // Absolute byte offset of the start of `path` inside the ISO image, or -1 if not found.
+    // Same mechanism as GetStartOfModel; exposed publicly for the texture editor's
+    // "Write MRG back to ISO" path.
+    public long GetStartOfFile(string path) => FindFileBaseOffset(path);
+
     long FindFileBaseOffset(string path)
     {
         lock (FileStreamLock)
