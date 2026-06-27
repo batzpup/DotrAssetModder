@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 
 namespace DotrAssetModder;
+// AI
 
 // === Step 6.3 — Node-tree (skeleton) byte writer =====================================
 // Emits the RH0 node tree: 48-byte (0x30) RH0Node records linked first-child/next-sibling.

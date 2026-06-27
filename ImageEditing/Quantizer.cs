@@ -4,10 +4,10 @@ public sealed class Quantizer
 {
     const int MaxDepth = 7;
 
-    readonly int    maxColors;
+    readonly int maxColors;
     readonly Node[] levels = new Node[MaxDepth + 1];
-    readonly Node   root   = new();
-    int             leafCount;
+    readonly Node root = new();
+    int leafCount;
 
     public Quantizer(int maxColors)
     {
@@ -32,10 +32,10 @@ public sealed class Quantizer
 
     sealed class Node
     {
-        public long    R, G, B, Count;
-        public bool    IsLeaf;
-        public Node?[] Children      = new Node?[8];
-        public Node?   NextReducible;
+        public long R, G, B, Count;
+        public bool IsLeaf;
+        public Node?[] Children = new Node?[8];
+        public Node? NextReducible;
     }
 
     void AddColor(Node node, byte r, byte g, byte b, int depth)
@@ -51,16 +51,16 @@ public sealed class Quantizer
         if (depth == MaxDepth)
         {
             node.IsLeaf = true;
-            node.R     += r;
-            node.G     += g;
-            node.B     += b;
+            node.R += r;
+            node.G += g;
+            node.B += b;
             node.Count++;
             leafCount++;
             return;
         }
 
         int shift = 7 - depth;
-        int idx   = ((r >> shift) & 1) << 2 | ((g >> shift) & 1) << 1 | ((b >> shift) & 1);
+        int idx = ((r >> shift) & 1) << 2 | ((g >> shift) & 1) << 1 | ((b >> shift) & 1);
         if (node.Children[idx] == null)
         {
             var child = new Node();
@@ -68,7 +68,7 @@ public sealed class Quantizer
             if (depth < MaxDepth - 1)
             {
                 child.NextReducible = levels[depth + 1];
-                levels[depth + 1]   = child;
+                levels[depth + 1] = child;
             }
         }
         AddColor(node.Children[idx]!, r, g, b, depth + 1);
@@ -91,9 +91,9 @@ public sealed class Quantizer
             {
                 continue;
             }
-            r     += child.R;
-            g     += child.G;
-            b     += child.B;
+            r += child.R;
+            g += child.G;
+            b += child.B;
             count += child.Count;
             if (child.IsLeaf)
             {
@@ -101,11 +101,11 @@ public sealed class Quantizer
             }
         }
         node.Children = new Node?[8];
-        node.IsLeaf   = true;
-        node.R        = r;
-        node.G        = g;
-        node.B        = b;
-        node.Count    = count;
+        node.IsLeaf = true;
+        node.R = r;
+        node.G = g;
+        node.B = b;
+        node.Count = count;
         leafCount++;
     }
 

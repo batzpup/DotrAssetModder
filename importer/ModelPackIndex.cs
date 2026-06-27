@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 
 namespace DotrAssetModder;
+// Mostly AI
 
 // === MODEL.MRG-style pack indexing & splicing ========================================
 // Unlike monster MRGs (fixed 1 MiB slots, byIndex = index * 0x100000, in-place overwrite

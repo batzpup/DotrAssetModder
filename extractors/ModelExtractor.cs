@@ -10,15 +10,15 @@ using AlphaMode = SharpGLTF.Materials.AlphaMode;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-internal static class ModelExtractor
+static class ModelExtractor
 {
-    public  const uint Rh0Magic = 0x00304852;
+    public const uint Rh0Magic = 0x00304852;
 
     public static float AltAlphaDivisor = 255f;
 
     public static ExtractResult Extract(byte[] data, string outDir, string stem,
-                                         IList<string>? names = null,
-                                         ExtractionProgress? progress = null)
+        IList<string>? names = null,
+        ExtractionProgress? progress = null)
     {
         Directory.CreateDirectory(outDir);
         var slots = SliceArchive(data, stem);
@@ -30,17 +30,20 @@ internal static class ModelExtractor
         int written = 0, failed = 0;
         var failures = new System.Collections.Concurrent.ConcurrentBag<FailureInfo>();
         int maxDop = Math.Max(1, Environment.ProcessorCount - 1);
-        var options = new System.Threading.Tasks.ParallelOptions
-        {
+        var options = new ParallelOptions {
             MaxDegreeOfParallelism = maxDop,
         };
 
-        System.Threading.Tasks.Parallel.For(0, slots.Count, options, i =>
+        Parallel.For(0, slots.Count, options, i =>
         {
             if (progress?.IsCancellationRequested == true) return;
 
             var (off, len) = slots[i];
-            if (len < 0x80) { progress?.Increment(); return; }
+            if (len < 0x80)
+            {
+                progress?.Increment();
+                return;
+            }
             var slice = new byte[len];
             System.Buffer.BlockCopy(data, off, slice, 0, len);
 
@@ -50,11 +53,11 @@ internal static class ModelExtractor
             try
             {
                 ExtractSingle(slice, outDir, slotName);
-                System.Threading.Interlocked.Increment(ref written);
+                Interlocked.Increment(ref written);
             }
             catch (Exception ex)
             {
-                System.Threading.Interlocked.Increment(ref failed);
+                Interlocked.Increment(ref failed);
                 string reason = $"{ex.GetType().Name}: {ex.Message}";
                 failures.Add(new FailureInfo(i, slotName, reason));
                 Console.WriteLine($"[ModelExtractor] FAILED slot {i} ({slotName}): {reason}");
@@ -67,17 +70,16 @@ internal static class ModelExtractor
         });
 
         var failList = failures.OrderBy(f => f.Slot).ToArray();
-        return new ExtractResult(AssetKind.Rh0Model, written, failed, slots.Count)
-        {
+        return new ExtractResult(AssetKind.Rh0Model, written, failed, slots.Count) {
             Failures = failList,
         };
     }
 
-    private static List<(int Off, int Len)> SliceArchive(byte[] data, string stem)
+    static List<(int Off, int Len)> SliceArchive(byte[] data, string stem)
     {
         bool isMonster = string.Equals(Path.GetFileNameWithoutExtension(stem),
-                                        "MONSTER", StringComparison.OrdinalIgnoreCase)
-                       || string.Equals(stem, "MONSTER.MRG", StringComparison.OrdinalIgnoreCase);
+                             "MONSTER", StringComparison.OrdinalIgnoreCase)
+                         || string.Equals(stem, "MONSTER.MRG", StringComparison.OrdinalIgnoreCase);
         if (isMonster)
         {
             const int Stride = 0x100000;
@@ -127,7 +129,11 @@ internal static class ModelExtractor
         var (nodes, mslotMap) = WalkGNodes(data, (int)hdr.NodeTree);
         var (mainWalks, altWalks) = ParseWalks(data, hdr);
         if (altWalks.Count == 0 && hdr.Section1Alt != 0 && hdr.Section1AltSize >= 16)
+        {
             altWalks = ParseAltPagesByScan(data, hdr);
+        }
+
+
         var mainPages = ParsePagesInSection(data, (int)hdr.Section1, (int)hdr.Section1Size, mainWalks);
         var altPages = (hdr.Section1Alt != 0 && altWalks.Count > 0)
             ? ParsePagesInSection(data, (int)hdr.Section1Alt, (int)hdr.Section1AltSize, altWalks)
@@ -163,7 +169,7 @@ internal static class ModelExtractor
             textures.Add(new DecodedTexInfo(1, 1, MagentaPixel));
             texHasAlpha.Add(false);
         }
-        
+
         int slotsByte = (int)(hdr.SectionFlags & 0xFF);
         int activeSlotMask = slotsByte != 0 ? (slotsByte & -slotsByte) : 0xFF;
         var texAnims = new Dictionary<int, TexAnimBake>();
@@ -181,7 +187,9 @@ internal static class ModelExtractor
                 var bake = TexAnim.Bake(tex.Rgba, tex.Width, tex.Height, entries, activeSlotMask);
                 if (bake != null) texAnims[ti] = bake;
             }
-            catch {  }
+            catch
+            {
+            }
         }
 
         var packets = new List<Packet>(mainPages.Count + altPages.Count);
@@ -189,8 +197,7 @@ internal static class ModelExtractor
         {
             int s = (int)hdr.Section2 + (int)page.Sec2Off;
             int e = s + (int)page.PktSize;
-            packets.Add(new Packet
-            {
+            packets.Add(new Packet {
                 WalkOff = page.WalkOff,
                 BoneMap = page.BoneMap,
                 Strips = ParseStripsInRange(data, s, e),
@@ -203,8 +210,7 @@ internal static class ModelExtractor
         {
             int s = (int)hdr.Section2Alt + (int)page.Sec2Off;
             int e = s + (int)page.PktSize;
-            packets.Add(new Packet
-            {
+            packets.Add(new Packet {
                 WalkOff = page.WalkOff,
                 BoneMap = page.BoneMap,
                 Strips = ParseStripsInRange(data, s, e),
@@ -220,10 +226,9 @@ internal static class ModelExtractor
         WriteGlb(outPath, nodes, mslotMap, built, textures, texHasAlpha, animations, hdr.AnimTransScale, texAnims);
     }
 
-    private static readonly byte[] MagentaPixel = { 0xff, 0x00, 0xff, 0xff };
+    static readonly byte[] MagentaPixel = { 0xff, 0x00, 0xff, 0xff };
 
-    private static (List<GNode> Nodes, Dictionary<int, GNode> MslotMap)
-        WalkGNodes(byte[] data, int treeBase)
+    static (List<GNode> Nodes, Dictionary<int, GNode> MslotMap) WalkGNodes(byte[] data, int treeBase)
     {
         var nodes = new List<GNode>();
         var mslotMap = new Dictionary<int, GNode>();
@@ -238,7 +243,7 @@ internal static class ModelExtractor
             int rx = I32(data, off + 0x10);
             int ry = I32(data, off + 0x14);
             int rz = I32(data, off + 0x18);
-       
+
             int childOff = I32(data, off + 0x1C) & 0x0FFFFFFF;
             float px = U32f(data, off + 0x20);
             float py = U32f(data, off + 0x24);
@@ -268,8 +273,7 @@ internal static class ModelExtractor
             var worldSkin = M.Scale(newAccum.X, newAccum.Y, newAccum.Z) * world;
 
             int idx = nodes.Count;
-            var n = new GNode
-            {
+            var n = new GNode {
                 Idx = idx,
                 Pidx = pidx,
                 Flags = flags,
@@ -286,13 +290,14 @@ internal static class ModelExtractor
             if (mslot != 0) mslotMap[mslot] = n;
 
             if (childOff != 0) Visit(treeBase + childOff, idx, world, newAccum);
-            if (sibOff != 0)   Visit(treeBase + sibOff, pidx, parentW, parentAccum);
+            if (sibOff != 0) Visit(treeBase + sibOff, pidx, parentW, parentAccum);
         }
+
         Visit(treeBase, -1, Matrix4x4.Identity, new Vector3(1, 1, 1));
         return (nodes, mslotMap);
     }
 
-    private static (List<int> Main, List<int> Alt) ParseWalks(byte[] data, in Rh0HeaderFull hdr)
+    static (List<int> Main, List<int> Alt) ParseWalks(byte[] data, in Rh0HeaderFull hdr)
     {
         var main = new List<int>();
         var alt = new List<int>();
@@ -349,8 +354,7 @@ internal static class ModelExtractor
             uint term0 = U32(data, secBase + termOff + 0);
             uint term1 = U32(data, secBase + termOff + 4);
 
-            pages.Add(new PageInfo
-            {
+            pages.Add(new PageInfo {
                 WalkOff = walkOff,
                 BoneMap = new Dictionary<int, int>(runningBoneMap),
                 Sec2Off = term1 & 0x0FFFFFFF,
@@ -388,7 +392,8 @@ internal static class ModelExtractor
         if (hdr.MotTable == 0) return anims;
         var slotIds = new List<int>();
         for (int i = 0; i < 8; i++)
-            if ((hdr.SectionFlags & (1u << i)) != 0) slotIds.Add(i);
+            if ((hdr.SectionFlags & (1u << i)) != 0)
+                slotIds.Add(i);
         int motOff = (int)hdr.MotTable;
         const uint MotMagic = 0x1A544F4D;
         foreach (int slotId in slotIds)
@@ -398,7 +403,11 @@ internal static class ModelExtractor
             if (magic != MotMagic) break;
             uint size = U32(data, motOff + 4);
             ushort nc = U16(data, motOff + 0x10);
-            if (nc != nodeCount) { motOff += (int)size; continue; }
+            if (nc != nodeCount)
+            {
+                motOff += (int)size;
+                continue;
+            }
             uint motionOff = U32(data, motOff + 0x14);
             int mo = motOff + (int)motionOff;
             uint mdataOff = U32(data, mo);
@@ -458,8 +467,7 @@ internal static class ModelExtractor
                 }
                 if (track.Trans != null || track.Rot != null) tracks[i] = track;
             }
-            anims.Add(new AnimSlot
-            {
+            anims.Add(new AnimSlot {
                 SlotId = slotId,
                 FrameCount = (int)fc,
                 Tracks = tracks,
@@ -480,13 +488,26 @@ internal static class ModelExtractor
         int cursor = 0;
         foreach (var f in frames)
         {
-            if (f <= k0Frame) { outList.Add((kfs[0].X, kfs[0].Y, kfs[0].Z)); continue; }
-            if (f >= kLastFrame) { outList.Add((kfs[n - 1].X, kfs[n - 1].Y, kfs[n - 1].Z)); continue; }
+            if (f <= k0Frame)
+            {
+                outList.Add((kfs[0].X, kfs[0].Y, kfs[0].Z));
+                continue;
+            }
+            if (f >= kLastFrame)
+            {
+                outList.Add((kfs[n - 1].X, kfs[n - 1].Y, kfs[n - 1].Z));
+                continue;
+            }
             while (cursor + 1 < n && kfs[cursor + 1].Frame <= f) cursor++;
             int f0 = kfs[cursor].Frame, f1 = kfs[cursor + 1].Frame;
-            if (f1 == f0) { outList.Add((kfs[cursor].X, kfs[cursor].Y, kfs[cursor].Z)); continue; }
+            if (f1 == f0)
+            {
+                outList.Add((kfs[cursor].X, kfs[cursor].Y, kfs[cursor].Z));
+                continue;
+            }
             float t = (f - f0) / (float)(f1 - f0);
-            var v0 = kfs[cursor]; var v1 = kfs[cursor + 1];
+            var v0 = kfs[cursor];
+            var v1 = kfs[cursor + 1];
             outList.Add((v0.X + t * (v1.X - v0.X), v0.Y + t * (v1.Y - v0.Y), v0.Z + t * (v1.Z - v0.Z)));
         }
         return outList;
@@ -504,13 +525,26 @@ internal static class ModelExtractor
         int cursor = 0;
         foreach (var f in frames)
         {
-            if (f <= k0Frame) { outList.Add(((float)kfs[0].Rx, (float)kfs[0].Ry, (float)kfs[0].Rz)); continue; }
-            if (f >= kLastFrame) { outList.Add(((float)kfs[n - 1].Rx, (float)kfs[n - 1].Ry, (float)kfs[n - 1].Rz)); continue; }
+            if (f <= k0Frame)
+            {
+                outList.Add(((float)kfs[0].Rx, (float)kfs[0].Ry, (float)kfs[0].Rz));
+                continue;
+            }
+            if (f >= kLastFrame)
+            {
+                outList.Add(((float)kfs[n - 1].Rx, (float)kfs[n - 1].Ry, (float)kfs[n - 1].Rz));
+                continue;
+            }
             while (cursor + 1 < n && kfs[cursor + 1].Frame <= f) cursor++;
             int f0 = kfs[cursor].Frame, f1 = kfs[cursor + 1].Frame;
-            if (f1 == f0) { outList.Add(((float)kfs[cursor].Rx, (float)kfs[cursor].Ry, (float)kfs[cursor].Rz)); continue; }
+            if (f1 == f0)
+            {
+                outList.Add(((float)kfs[cursor].Rx, (float)kfs[cursor].Ry, (float)kfs[cursor].Rz));
+                continue;
+            }
             float t = (f - f0) / (float)(f1 - f0);
-            var v0 = kfs[cursor]; var v1 = kfs[cursor + 1];
+            var v0 = kfs[cursor];
+            var v1 = kfs[cursor + 1];
             outList.Add((
                 v0.Rx + t * (v1.Rx - v0.Rx),
                 v0.Ry + t * (v1.Ry - v0.Ry),
@@ -582,7 +616,11 @@ internal static class ModelExtractor
         if (dispatches.Count == 0) return 0;
         int bestTex = 0, bestOff = -1;
         foreach (var (ti, off) in dispatches)
-            if (off <= walkOff && off > bestOff) { bestOff = off; bestTex = ti; }
+            if (off <= walkOff && off > bestOff)
+            {
+                bestOff = off;
+                bestTex = ti;
+            }
         return bestTex;
     }
 
@@ -619,21 +657,35 @@ internal static class ModelExtractor
             uint cmd = U32(data, off);
             int cb = (int)((cmd >> 24) & 0xFF);
             int num = (int)((cmd >> 16) & 0xFF);
-            string stype; int v3Off; int vertOff;
-            if (cb == 0x6c && num == 1)      { stype = "INDEP";  v3Off = off + 0x14; vertOff = off + 0x18; }
-            else if (cb == 0x68 && num == 1) { stype = "SHARED"; v3Off = off + 0x10; vertOff = off + 0x14; }
+            string stype;
+            int v3Off;
+            int vertOff;
+            if (cb == 0x6c && num == 1)
+            {
+                stype = "INDEP";
+                v3Off = off + 0x14;
+                vertOff = off + 0x18;
+            }
+            else if (cb == 0x68 && num == 1)
+            {
+                stype = "SHARED";
+                v3Off = off + 0x10;
+                vertOff = off + 0x14;
+            }
             else
             {
                 int n2 = FindNextHeader(off + 4);
                 if (n2 < 0 || n2 >= end) break;
-                off = n2; continue;
+                off = n2;
+                continue;
             }
             uint v3Cmd = U32(data, v3Off);
             if (((v3Cmd >> 24) & 0xFF) != 0x69)
             {
                 int n2 = FindNextHeader(off + 4);
                 if (n2 < 0 || n2 >= end) break;
-                off = n2; continue;
+                off = n2;
+                continue;
             }
             int v3Num = (int)((v3Cmd >> 16) & 0xFF);
             int streamEnd = vertOff + v3Num * 6;
@@ -647,8 +699,7 @@ internal static class ModelExtractor
                 {
                     int voff = vertOff + i * 18;
                     if (voff + 18 > streamEnd) break;
-                    strip.Verts.Add(new StripVertex
-                    {
+                    strip.Verts.Add(new StripVertex {
                         Uv = (I16(data, voff), I16(data, voff + 2)),
                         Nrm = (I16(data, voff + 6), I16(data, voff + 8), I16(data, voff + 10)),
                         Pos = (I16(data, voff + 12), I16(data, voff + 14), I16(data, voff + 16)),
@@ -671,7 +722,11 @@ internal static class ModelExtractor
                     bool bad = false;
                     for (int w = 0; w < wc; w++)
                     {
-                        if (voff + 18 > streamEnd) { bad = true; break; }
+                        if (voff + 18 > streamEnd)
+                        {
+                            bad = true;
+                            break;
+                        }
                         int bone = U16(data, voff);
                         short ww = I16(data, voff + 2);
                         short pX = I16(data, voff + 12);
@@ -702,15 +757,14 @@ internal static class ModelExtractor
         List<(int, int)> mainDispatches,
         List<(int, int)> altDispatches)
     {
-        var bm = new BuiltMesh
-        {
+        var bm = new BuiltMesh {
             SortedMslots = mslotMap.Keys.OrderBy(k => k).ToList(),
         };
         for (int i = 0; i < bm.SortedMslots.Count; i++)
             bm.MslotToJoint[bm.SortedMslots[i]] = i;
 
         var primFaces = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B),
-                                       (List<(int A, int B, int C)> Faces, float AlphaW)>();
+            (List<(int A, int B, int C)> Faces, float AlphaW)>();
 
         foreach (var pkt in packets)
         {
@@ -724,7 +778,7 @@ internal static class ModelExtractor
             foreach (var s in pkt.Strips)
             {
                 bool allZeroUv = s.Type == "INDEP" && s.Verts.Count > 0
-                                 && s.Verts.All(v => v.Uv.U == 0 && v.Uv.V == 0);
+                                                   && s.Verts.All(v => v.Uv.U == 0 && v.Uv.V == 0);
                 bool isHitbox = false;
                 if (allZeroUv)
                 {
@@ -732,9 +786,12 @@ internal static class ModelExtractor
                     short maxX = short.MinValue, maxY = short.MinValue, maxZ = short.MinValue;
                     foreach (var v in s.Verts)
                     {
-                        if (v.Pos.X < minX) minX = v.Pos.X; if (v.Pos.X > maxX) maxX = v.Pos.X;
-                        if (v.Pos.Y < minY) minY = v.Pos.Y; if (v.Pos.Y > maxY) maxY = v.Pos.Y;
-                        if (v.Pos.Z < minZ) minZ = v.Pos.Z; if (v.Pos.Z > maxZ) maxZ = v.Pos.Z;
+                        if (v.Pos.X < minX) minX = v.Pos.X;
+                        if (v.Pos.X > maxX) maxX = v.Pos.X;
+                        if (v.Pos.Y < minY) minY = v.Pos.Y;
+                        if (v.Pos.Y > maxY) maxY = v.Pos.Y;
+                        if (v.Pos.Z < minZ) minZ = v.Pos.Z;
+                        if (v.Pos.Z > maxZ) maxZ = v.Pos.Z;
                     }
                     bool extentX = maxX != minX, extentY = maxY != minY, extentZ = maxZ != minZ;
                     isHitbox = extentX && extentY && extentZ;
@@ -777,10 +834,14 @@ internal static class ModelExtractor
                                 if (!mslotMap.TryGetValue(mslot, out var bone)) continue;
                                 var p = M.Apply(bone.RestWorldSkin, wt.Pos.X, wt.Pos.Y, wt.Pos.Z);
                                 float ww = wt.W;
-                                wx += p.X * ww; wy += p.Y * ww; wz += p.Z * ww;
+                                wx += p.X * ww;
+                                wy += p.Y * ww;
+                                wz += p.Z * ww;
                                 var bn = Vector3.TransformNormal(
                                     new Vector3(wt.Nrm.X, wt.Nrm.Y, wt.Nrm.Z), bone.RestWorldSkin);
-                                nx += bn.X * ww; ny += bn.Y * ww; nz += bn.Z * ww;
+                                nx += bn.X * ww;
+                                ny += bn.Y * ww;
+                                nz += bn.Z * ww;
                                 wsum += ww;
                                 int jidx = bm.MslotToJoint.TryGetValue(mslot, out var ji) ? ji : -1;
                                 if (jidx >= 0) jlist.Add((jidx, ww));
@@ -788,7 +849,9 @@ internal static class ModelExtractor
                         }
                         if (wsum != 0)
                         {
-                            wx /= wsum; wy /= wsum; wz /= wsum;
+                            wx /= wsum;
+                            wy /= wsum;
+                            wz /= wsum;
                             for (int k = 0; k < jlist.Count; k++)
                                 jlist[k] = (jlist[k].Joint, jlist[k].W / wsum);
                         }
@@ -826,12 +889,11 @@ internal static class ModelExtractor
         }
 
         foreach (var k in primFaces.Keys
-                  .OrderBy(x => x.Tex).ThenBy(x => x.IsAlt).ThenBy(x => x.Alpha)
-                  .ThenBy(x => x.R).ThenBy(x => x.G).ThenBy(x => x.B))
+                     .OrderBy(x => x.Tex).ThenBy(x => x.IsAlt).ThenBy(x => x.Alpha)
+                     .ThenBy(x => x.R).ThenBy(x => x.G).ThenBy(x => x.B))
         {
             var entry = primFaces[k];
-            bm.Primitives.Add(new Primitive
-            {
+            bm.Primitives.Add(new Primitive {
                 TexIdx = k.Tex,
                 IsAlt = k.IsAlt == 1,
                 AlphaKey = k.Alpha,
@@ -889,6 +951,7 @@ internal static class ModelExtractor
         mrgRoot.AddNode(nodeBuilders[0]);
 
         var materials = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B), MaterialBuilder>();
+
         MaterialBuilder GetMaterial(int texIdx, bool isAlt, int alphaKey, float alphaW, (int R, int G, int B) q1Key)
         {
             if (texIdx < 0 || texIdx >= textures.Count) texIdx = 0;
@@ -957,8 +1020,12 @@ internal static class ModelExtractor
                 var nb = nodeBuilders[gnodeIdx];
 
                 var frameSet = new SortedSet<int>();
-                if (track.Trans != null) foreach (var kf in track.Trans) frameSet.Add(kf.Frame);
-                if (track.Rot != null)   foreach (var kf in track.Rot)   frameSet.Add(kf.Frame);
+                if (track.Trans != null)
+                    foreach (var kf in track.Trans)
+                        frameSet.Add(kf.Frame);
+                if (track.Rot != null)
+                    foreach (var kf in track.Rot)
+                        frameSet.Add(kf.Frame);
                 if (frameSet.Count == 0) continue;
                 var frames = frameSet.ToList();
 
@@ -966,8 +1033,18 @@ internal static class ModelExtractor
                 {
                     var tAcc = n.TransAccum;
                     float sxA, syA, szA;
-                    if (gnodeIdx == 0) { sxA = tAcc.X; syA = tAcc.Y; szA = tAcc.Z; }
-                    else { sxA = animTransScale * tAcc.X; syA = animTransScale * tAcc.Y; szA = animTransScale * tAcc.Z; }
+                    if (gnodeIdx == 0)
+                    {
+                        sxA = tAcc.X;
+                        syA = tAcc.Y;
+                        szA = tAcc.Z;
+                    }
+                    else
+                    {
+                        sxA = animTransScale * tAcc.X;
+                        syA = animTransScale * tAcc.Y;
+                        szA = animTransScale * tAcc.Z;
+                    }
                     var defaultT = (n.RestPos.X, n.RestPos.Y, n.RestPos.Z);
                     var vals = InterpTransTrack(track.Trans, frames, defaultT);
                     var curve = nb.UseTranslation(animName);
@@ -1031,8 +1108,8 @@ internal static class ModelExtractor
                 if (f > 0) frameJson.Append(',');
                 float t = f < bake.FrameTimes.Count ? bake.FrameTimes[f] : 0f;
                 frameJson.Append("{\"image\":").Append(imgIndices[f])
-                         .Append(",\"t\":").Append(t.ToString(System.Globalization.CultureInfo.InvariantCulture))
-                         .Append('}');
+                    .Append(",\"t\":").Append(t.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                    .Append('}');
             }
             frameJson.Append(']');
 
@@ -1056,15 +1133,25 @@ internal static class ModelExtractor
         if (name == null || !name.StartsWith(prefix)) return false;
         int i = prefix.Length, val = 0;
         if (i >= name.Length || !char.IsDigit(name[i])) return false;
-        while (i < name.Length && char.IsDigit(name[i])) { val = val * 10 + (name[i] - '0'); i++; }
+        while (i < name.Length && char.IsDigit(name[i]))
+        {
+            val = val * 10 + (name[i] - '0');
+            i++;
+        }
         return val == texIdx;
     }
 
     private static void ReorderGlbAnimations(string glbPath)
     {
         byte[] glb;
-        try { glb = File.ReadAllBytes(glbPath); }
-        catch { return; }
+        try
+        {
+            glb = File.ReadAllBytes(glbPath);
+        }
+        catch
+        {
+            return;
+        }
         if (glb.Length < 20) return;
         if (BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(0, 4)) != 0x46546C67) return;
         uint jsonLen = BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(12, 4));
@@ -1089,6 +1176,7 @@ internal static class ModelExtractor
                 int.TryParse(name.AsSpan(5), out int s)) return s;
             return int.MaxValue;
         }
+
         foreach (var a in items.OrderBy(SlotKey))
             anims.Add(a);
 
@@ -1180,16 +1268,22 @@ internal readonly struct Rh0HeaderFull
     {
         Magic = U32(data, 0);
         if (Magic != 0x00304852) throw new InvalidDataException($"Not RH0 magic=0x{Magic:x8}");
-        SectionFlags    = U32(data, 0x04);
-        MotTable        = U32(data, 0x0C);
-        NodeTree        = U32(data, 0x10);
-        Section1        = U32(data, 0x18); Section1Size    = U32(data, 0x1C);
-        Section2        = U32(data, 0x20); Section2Size    = U32(data, 0x24);
-        Section1Alt     = U32(data, 0x28); Section1AltSize = U32(data, 0x2C);
-        Section2Alt     = U32(data, 0x30); Section2AltSize = U32(data, 0x34);
-        TexTable        = U32(data, 0x38); TexCount        = U32(data, 0x3C);
-        RelocWalk       = U32(data, 0x50); RelocWalkSize   = U32(data, 0x54);
-        AnimTransScale  = BitConverter.Int32BitsToSingle(unchecked((int)U32(data, 0x64)));
+        SectionFlags = U32(data, 0x04);
+        MotTable = U32(data, 0x0C);
+        NodeTree = U32(data, 0x10);
+        Section1 = U32(data, 0x18);
+        Section1Size = U32(data, 0x1C);
+        Section2 = U32(data, 0x20);
+        Section2Size = U32(data, 0x24);
+        Section1Alt = U32(data, 0x28);
+        Section1AltSize = U32(data, 0x2C);
+        Section2Alt = U32(data, 0x30);
+        Section2AltSize = U32(data, 0x34);
+        TexTable = U32(data, 0x38);
+        TexCount = U32(data, 0x3C);
+        RelocWalk = U32(data, 0x50);
+        RelocWalkSize = U32(data, 0x54);
+        AnimTransScale = BitConverter.Int32BitsToSingle(unchecked((int)U32(data, 0x64)));
     }
 }
 
@@ -1239,7 +1333,7 @@ internal sealed class StripVertex
 {
     public (short U, short V) Uv;
     public (short X, short Y, short Z) Pos;
-    public (short X, short Y, short Z) Nrm;   // stored vertex normal (s16, 1.0 ~= 32767)
+    public (short X, short Y, short Z) Nrm; // stored vertex normal (s16, 1.0 ~= 32767)
     public List<StripWeight>? Weights;
 }
 
@@ -1248,15 +1342,21 @@ internal readonly struct StripWeight
     public readonly int Bone;
     public readonly short W;
     public readonly (short X, short Y, short Z) Pos;
-    public readonly (short X, short Y, short Z) Nrm;   // bind-space normal for this influence
+    public readonly (short X, short Y, short Z) Nrm; // bind-space normal for this influence
+
     public StripWeight(int bone, short w, (short X, short Y, short Z) pos, (short X, short Y, short Z) nrm)
-    { Bone = bone; W = w; Pos = pos; Nrm = nrm; }
+    {
+        Bone = bone;
+        W = w;
+        Pos = pos;
+        Nrm = nrm;
+    }
 }
 
 internal sealed class BuiltMesh
 {
     public List<Vector3> Vertices = new();
-    public List<Vector3> Normals = new();   // output-space vertex normals (winding orientation only)
+    public List<Vector3> Normals = new(); // output-space vertex normals (winding orientation only)
     public List<Vector2> Uvs = new();
     public List<List<(int Joint, float W)>> VertJoints = new();
     public List<Primitive> Primitives = new();
@@ -1292,7 +1392,13 @@ internal readonly struct DecodedTexInfo
     public readonly int Width;
     public readonly int Height;
     public readonly byte[] Rgba;
-    public DecodedTexInfo(int w, int h, byte[] rgba) { Width = w; Height = h; Rgba = rgba; }
+
+    public DecodedTexInfo(int w, int h, byte[] rgba)
+    {
+        Width = w;
+        Height = h;
+        Rgba = rgba;
+    }
 }
 
 internal static class M

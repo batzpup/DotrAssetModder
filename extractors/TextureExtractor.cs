@@ -4,7 +4,7 @@ using System.IO.Compression;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-internal static class TextureExtractor
+static class TextureExtractor
 {
     public static ExtractResult Extract(byte[] data, string outDir,
         string stem, IList<string>? names,
@@ -198,16 +198,16 @@ internal static class GsSwizzle
         });
 }
 
-internal static class Rh2Decoder
+static class Rh2Decoder
 {
     public readonly record struct DecodedTexture(int Width, int Height, byte[] Rgba, bool HasAlpha)
     {
         public bool IsEmpty => Width == 0 || Height == 0 || Rgba.Length == 0;
     }
 
-    private const int Pad = 0x60;
+    const int Pad = 0x60;
 
-    private static ReadOnlySpan<byte> EndSig => new byte[]
+    static ReadOnlySpan<byte> EndSig => new byte[]
         { 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 
     public enum AlphaTreat
@@ -248,14 +248,14 @@ internal static class Rh2Decoder
         return tex;
     }
 
-    private static DecodedTexture DecodeCore(ReadOnlySpan<byte> data, int off)
+    static DecodedTexture DecodeCore(ReadOnlySpan<byte> data, int off)
     {
         if (off + 0x60 > data.Length)
             throw new ArgumentException($"RH2 header out of range at 0x{off:x}");
 
         uint totalSize = U32(data, off + 8);
-        ushort psm = U16(data, off + 0x50);     // image GS pixel format: 0x13=PSMT8, 0x14=PSMT4
-        ushort clutPsm = U16(data, off + 0x52);  // CLUT GS pixel format (see clut32 below)
+        ushort psm = U16(data, off + 0x50); // image GS pixel format: 0x13=PSMT8, 0x14=PSMT4
+        ushort clutPsm = U16(data, off + 0x52); // CLUT GS pixel format (see clut32 below)
         ushort w = U16(data, off + 0x54);
         ushort h = U16(data, off + 0x56);
         ushort nSecs = U16(data, off + 0x58);
@@ -445,15 +445,17 @@ internal static class Rh2Decoder
     }
 }
 
-internal static class PngEncoder
+static class PngEncoder
 {
-    private static ReadOnlySpan<byte> Signature => new byte[]
-        { 0x89, (byte)'P', (byte)'N', (byte)'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static ReadOnlySpan<byte> Signature => new byte[] { 0x89, (byte)'P', (byte)'N', (byte)'G', 0x0D, 0x0A, 0x1A, 0x0A };
 
     public static byte[] Encode(int width, int height, byte[] rgba)
     {
         if (rgba.Length < width * height * 4)
+        {
             throw new ArgumentException("rgba buffer too small for given dimensions");
+        }
+
 
         int stride = width * 4;
         var raw = new byte[(stride + 1) * height];
@@ -481,10 +483,7 @@ internal static class PngEncoder
         ihdr[11] = 0;
         ihdr[12] = 0;
 
-        int outSize = Signature.Length
-                      + 12 + ihdr.Length
-                      + 12 + idat.Length
-                      + 12;
+        int outSize = Signature.Length + 12 + ihdr.Length + 12 + idat.Length + 12;
         var outArr = new byte[outSize];
         int pos = 0;
         Signature.CopyTo(outArr.AsSpan(pos));
@@ -495,8 +494,7 @@ internal static class PngEncoder
         return outArr;
     }
 
-    private static void WriteChunk(byte[] dst, ref int pos,
-        ReadOnlySpan<byte> tag, ReadOnlySpan<byte> body)
+    static void WriteChunk(byte[] dst, ref int pos, ReadOnlySpan<byte> tag, ReadOnlySpan<byte> body)
     {
         BinaryPrimitives.WriteUInt32BigEndian(dst.AsSpan(pos, 4), (uint)body.Length);
         pos += 4;
@@ -513,7 +511,7 @@ internal static class PngEncoder
         pos += 4;
     }
 
-    private static readonly Lazy<uint[]> _crcTable = new(() =>
+    static readonly Lazy<uint[]> crcTable = new(() =>
     {
         var t = new uint[256];
         for (uint n = 0; n < 256; n++)
@@ -526,11 +524,13 @@ internal static class PngEncoder
         return t;
     });
 
-    private static uint Crc32Update(uint crc, ReadOnlySpan<byte> data)
+    static uint Crc32Update(uint crc, ReadOnlySpan<byte> data)
     {
-        var tbl = _crcTable.Value;
+        var tbl = crcTable.Value;
         for (int i = 0; i < data.Length; i++)
+        {
             crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+        }
         return crc;
     }
 }

@@ -2,6 +2,7 @@
 using System.Numerics;
 
 namespace DotrAssetModder;
+// Mostly AI
 
 // === Step 6.5 — MOT (skeletal motion) writer =========================================
 // Serialises one MOT block per animation slot. Layout (block-relative pointers; the game

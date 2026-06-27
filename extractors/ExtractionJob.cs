@@ -3,13 +3,13 @@ namespace DotrAssetModder;
 
 public sealed class ExtractionProgress
 {
-    private int _total;
-    private int _done;
-    private volatile int _cancel;
+    int total;
+    int done;
+    volatile int cancel;
 
-    public int Total => Volatile.Read(ref _total);
-    public int Done => Volatile.Read(ref _done);
-    public bool IsCancellationRequested => _cancel != 0;
+    public int Total => Volatile.Read(ref total);
+    public int Done => Volatile.Read(ref done);
+    public bool IsCancellationRequested => cancel != 0;
 
     public float Fraction
     {
@@ -20,9 +20,9 @@ public sealed class ExtractionProgress
         }
     }
 
-    public void SetTotal(int total) => Volatile.Write(ref _total, total);
-    public void Increment() => Interlocked.Increment(ref _done);
-    public void RequestCancel() => _cancel = 1;
+    public void SetTotal(int total) => Volatile.Write(ref this.total, total);
+    public void Increment() => Interlocked.Increment(ref done);
+    public void RequestCancel() => cancel = 1;
 }
 
 public sealed class ExtractionJob

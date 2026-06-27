@@ -3,58 +3,59 @@ using SkiaSharp;
 
 namespace DotrAssetModder;
 
-public enum TextureMrgKind { Rh2, Icon }
+public enum TextureMrgKind
+{
+    Rh2,
+    Icon
+}
 
 public sealed class TextureSlot
 {
-    public byte[]    Bytes;
+    public byte[] Bytes;
     public Texture2D Thumb;
-    public int       Width;
-    public int       Height;
+    public int Width;
+    public int Height;
     public TextureMrgKind Kind;
-    public int       IconIndex;
+    public int IconIndex;
 
     public TextureSlot(byte[] bytes, Texture2D thumb, int width, int height, TextureMrgKind kind, int iconIndex = -1)
     {
-        Bytes     = bytes;
-        Thumb     = thumb;
-        Width     = width;
-        Height    = height;
-        Kind      = kind;
+        Bytes = bytes;
+        Thumb = thumb;
+        Width = width;
+        Height = height;
+        Kind = kind;
         IconIndex = iconIndex;
     }
 }
 
 public static class TextureSlotManager
 {
-    static readonly string[] Rh2MrgNames =
-    {
+    static readonly string[] Rh2MrgNames = {
         "PICTURE.MRG", "PICMINI.MRG", "PICPACK.MRG",
-        "TEXANM.MRG",  "TEXEFF.MRG",  "TEXETC.MRG", "TEXEVE.MRG", "TEXSYS.MRG",
-        "MODEL.MRG",   "MONSTER.MRG",
+        "TEXANM.MRG", "TEXEFF.MRG", "TEXETC.MRG", "TEXEVE.MRG", "TEXSYS.MRG",
+        "MODEL.MRG", "MONSTER.MRG",
     };
 
     public const string IconMrgName = "ICON.MRG";
-    public const string PictureMrg  = "PICTURE.MRG";
-    public const string PicMiniMrg  = "PICMINI.MRG";
+    public const string PictureMrg = "PICTURE.MRG";
+    public const string PicMiniMrg = "PICMINI.MRG";
 
     public static IReadOnlyList<string> KnownRh2Names => Rh2MrgNames;
 
     public static bool IsoHasFile(string name)
     {
-        return FileLoader.Instance.iso_data_files?.Any(
-            f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase)) == true;
+        return FileLoader.Instance.iso_data_files?.Any(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase)) == true;
     }
 
     public static string IsoPath(string name)
     {
-        return FileLoader.Instance.iso_data_files.First(
-            f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase));
+        return FileLoader.Instance.iso_data_files.First(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase));
     }
 
     public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes)
     {
-        var slots   = new List<TextureSlot>();
+        var slots = new List<TextureSlot>();
         var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
         foreach (uint off in offsets)
         {
@@ -63,10 +64,10 @@ public static class TextureSlotManager
                 var dec = Rh2Decoder.Decode(mrgBytes, (int)off, Rh2Decoder.AlphaTreat.ForceOpaque);
                 if (dec.IsEmpty)
                     continue;
-                var bmp   = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
+                var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
                 var thumb = BitmapToTexture(bmp);
                 bmp.Dispose();
-                int next      = offsets.Count > slots.Count + 1 ? (int)offsets[slots.Count + 1] : mrgBytes.Length;
+                int next = offsets.Count > slots.Count + 1 ? (int)offsets[slots.Count + 1] : mrgBytes.Length;
                 var slotBytes = mrgBytes.AsSpan((int)off, next - (int)off).ToArray();
                 slots.Add(new TextureSlot(slotBytes, thumb, dec.Width, dec.Height, TextureMrgKind.Rh2));
             }
@@ -93,8 +94,8 @@ public static class TextureSlotManager
             try
             {
                 var slotBytes = mrgBytes.AsSpan(off, len).ToArray();
-                var bmp       = PS2Icon.ExtractIconTexture(slotBytes);
-                var thumb     = BitmapToTexture(bmp);
+                var bmp = PS2Icon.ExtractIconTexture(slotBytes);
+                var thumb = BitmapToTexture(bmp);
                 int w = bmp.Width, h = bmp.Height;
                 bmp.Dispose();
                 slots.Add(new TextureSlot(slotBytes, thumb, w, h, TextureMrgKind.Icon, i));
@@ -143,14 +144,14 @@ public static class TextureSlotManager
             var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
             if (index < offsets.Count)
             {
-                int off     = (int)offsets[index];
+                int off = (int)offsets[index];
                 int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
                 Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
             }
         }
         else if (slot.Kind == TextureMrgKind.Icon)
         {
-            int off     = PS2Icon.TextureOffsets[slot.IconIndex];
+            int off = PS2Icon.TextureOffsets[slot.IconIndex];
             int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
             Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
         }
@@ -197,7 +198,7 @@ public static class TextureSlotManager
 
     public static List<SKColor> BuildPaletteFromGameTexture()
     {
-        var pal  = GameImageManager.CurrentTexture.Palette;
+        var pal = GameImageManager.CurrentTexture.Palette;
         var list = new List<SKColor>(256);
         for (int i = 0; i < 256; i++)
         {
@@ -212,8 +213,8 @@ public static class TextureSlotManager
         var q = new Quantizer(256);
         for (int i = 0; i < pixelCount; i++)
             q.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
-        var pal    = q.GetPalette();
-        var cache  = new Dictionary<int, (byte R, byte G, byte B)>();
+        var pal = q.GetPalette();
+        var cache = new Dictionary<int, (byte R, byte G, byte B)>();
         var output = new byte[rgba.Length];
         for (int i = 0; i < pixelCount; i++)
         {
@@ -224,7 +225,7 @@ public static class TextureSlotManager
                 nc = FindNearest(pal, r, g, b);
                 cache[key] = nc;
             }
-            output[i * 4]     = nc.R;
+            output[i * 4] = nc.R;
             output[i * 4 + 1] = nc.G;
             output[i * 4 + 2] = nc.B;
             output[i * 4 + 3] = a;
@@ -234,16 +235,16 @@ public static class TextureSlotManager
 
     static (byte R, byte G, byte B) FindNearest(List<(byte R, byte G, byte B)> pal, byte r, byte g, byte b)
     {
-        var  best  = pal[0];
+        var best = pal[0];
         long bestD = long.MaxValue;
         foreach (var (pr, pg, pb) in pal)
         {
             long dr = r - pr, dg = g - pg, db = b - pb;
-            long d  = dr * dr + dg * dg + db * db;
+            long d = dr * dr + dg * dg + db * db;
             if (d < bestD)
             {
                 bestD = d;
-                best  = (pr, pg, pb);
+                best = (pr, pg, pb);
             }
         }
         return best;
@@ -262,7 +263,7 @@ public static class TextureSlotManager
 
     public static byte[] BitmapToRgba(SKBitmap bmp)
     {
-        var src   = bmp.ColorType == SKColorType.Rgba8888 ? bmp : bmp.Copy(SKColorType.Rgba8888);
+        var src = bmp.ColorType == SKColorType.Rgba8888 ? bmp : bmp.Copy(SKColorType.Rgba8888);
         var bytes = src.Bytes.ToArray();
         if (!ReferenceEquals(src, bmp))
             src.Dispose();

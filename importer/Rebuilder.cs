@@ -2,6 +2,7 @@
 
 namespace DotrAssetModder;
 
+// 
 // === Step 6 — Rebuilder facade =======================================================
 // One-call entry point for the GLB -> .mrg reimporter. Uses the original .mrg as the
 // template (RH2 texture packets, ANM entries, header preamble + aux regions are lifted
@@ -156,7 +157,7 @@ public static class Rebuilder
             F32(nodeTree + 0x30), F32(nodeTree + 0x34), F32(nodeTree + 0x38));
         float radius = F32(nodeTree + 0x3C);
 
-        int gnode1 = I32(nodeTree + 0x1C); // root's first child, offsets are node-tree-relative
+        int gnode1 = I32(nodeTree + 0x1C); 
         if (gnode1 <= 0 || nodeTree + gnode1 + 0x2C > originalMrg.Length) return null;
         var pivotRaw = new System.Numerics.Vector3(
             F32(nodeTree + gnode1 + 0x20),
@@ -164,8 +165,11 @@ public static class Rebuilder
             F32(nodeTree + gnode1 + 0x28));
         var pivot = pivotRaw / ats;
 
-        if (!IsFinite(bounds) || !IsFinite(pivot) || !(radius > 1e-5f) ||
-            float.IsNaN(radius) || float.IsInfinity(radius)) return null;
+        if (!IsFinite(bounds) || !IsFinite(pivot) || !(radius > 1e-5f) || float.IsNaN(radius) || float.IsInfinity(radius))
+        {
+            return null;
+        }
+            
 
         return new RebuildPipeline.TemplateFrame {
             PivotWorld = pivot,
@@ -177,7 +181,7 @@ public static class Rebuilder
             PivotRaw = pivotRaw,
         };
 
-        static bool IsFinite(System.Numerics.Vector3 v) =>
+        static bool IsFinite(Vector3 v) =>
             !float.IsNaN(v.X) && !float.IsInfinity(v.X) &&
             !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
             !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);

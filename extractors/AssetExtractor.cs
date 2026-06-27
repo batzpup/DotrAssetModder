@@ -6,6 +6,7 @@ public enum AssetKind
     Unknown,
     Rh0Model,
     Rh2Textures,
+    Ps2Icon,
 }
 
 public sealed record FailureInfo(int Slot, string Name, string Reason);
@@ -22,21 +23,21 @@ public sealed record ExtractResult(
 public class AssetExtractor
 {
     public ExtractResult Extract(byte[] data, string outDir, string stem,
-                                 IList<string>? names = null,
-                                 ExtractionProgress? progress = null)
+        IList<string>? names = null,
+        ExtractionProgress? progress = null)
     {
         Directory.CreateDirectory(outDir);
         var kind = DetectKind(data);
-        return kind switch
-        {
-            AssetKind.Rh0Model    => ModelExtractor.Extract(data, outDir, stem, names, progress),
+        return kind switch {
+            AssetKind.Rh0Model => ModelExtractor.Extract(data, outDir, stem, names, progress),
             AssetKind.Rh2Textures => TextureExtractor.Extract(data, outDir, stem, names, progress),
+            AssetKind.Ps2Icon => IconExtractor.Extract(data, outDir, stem),
             _ => new ExtractResult(AssetKind.Unknown, 0, 0, 0),
         };
     }
 
     public ExtractResult Extract(string mrgPath, string outDir,
-                                 IList<string>? names = null)
+        IList<string>? names = null)
     {
         if (!File.Exists(mrgPath))
             throw new FileNotFoundException("mrg not found", mrgPath);
@@ -53,6 +54,9 @@ public class AssetExtractor
         uint magic = BinaryPrimitives.ReadUInt32LittleEndian(data);
         if (magic == 0x00304852) return AssetKind.Rh0Model; // RH0\0
         if (data.IndexOf(Rh2Magic) >= 0) return AssetKind.Rh2Textures;
+        // PS2 save icon: contains ICN magic 0x010000 as a uint32
+        ReadOnlySpan<byte> icnMagic = stackalloc byte[] { 0x00, 0x00, 0x01, 0x00 };
+        if (data.IndexOf(icnMagic) >= 0) return AssetKind.Ps2Icon;
         return AssetKind.Unknown;
     }
 
@@ -76,9 +80,9 @@ public class AssetExtractor
 
 internal static class Bin
 {
-    public static uint   U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o, 4));
-    public static int    I32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt32LittleEndian(d.Slice(o, 4));
+    public static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o, 4));
+    public static int I32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt32LittleEndian(d.Slice(o, 4));
     public static ushort U16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt16LittleEndian(d.Slice(o, 2));
-    public static short  I16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt16LittleEndian(d.Slice(o, 2));
-    public static float  U32f(ReadOnlySpan<byte> d, int o) => BitConverter.Int32BitsToSingle(I32(d, o));
+    public static short I16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt16LittleEndian(d.Slice(o, 2));
+    public static float U32f(ReadOnlySpan<byte> d, int o) => BitConverter.Int32BitsToSingle(I32(d, o));
 }

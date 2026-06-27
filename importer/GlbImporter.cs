@@ -7,6 +7,8 @@ using Image = Raylib_cs.Image;
 using Material = SharpGLTF.Schema2.Material;
 
 namespace DotrAssetModder;
+// Mostly AI
+
 
 // === Step 6 — GLB parser =============================================================
 // Loads a .glb (via SharpGLTF 1.0.6) and flattens it into a clean intermediate the

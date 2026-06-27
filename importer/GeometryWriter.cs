@@ -1,6 +1,7 @@
 ﻿using System.Buffers.Binary;
 
 namespace DotrAssetModder;
+// Mostly AI
 
 // === Step 6.2 — Geometry encoder, Layer A =============================================
 // Writes Section2 (VIF geometry packets), Section1 (page records), RelocWalk and the
