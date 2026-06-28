@@ -59,16 +59,25 @@ public class ModelViewerWindow
         sceneTexture = Raylib.LoadRenderTexture(viewportWidth, viewportHeight);
     }
 
-    void LoadModel()
+    void ButtonLoadModel()
     {
+
         DialogResult dialogResult = Dialog.FileOpen("glb,gltf");
         if (!dialogResult.IsOk)
+        {
             return;
+        }
+        LoadModel(dialogResult.Path);
 
+
+    }
+
+    public void LoadModel(string path)
+    {
         AnimatedGltfModel newModel;
         try
         {
-            newModel = AnimatedGltfModel.Load(dialogResult.Path);
+            newModel = AnimatedGltfModel.Load(path);
         }
         catch (Exception e)
         {
@@ -235,7 +244,7 @@ public class ModelViewerWindow
     {
         if (ImGui.Button("Load Model"))
         {
-            LoadModel();
+            ButtonLoadModel();
         }
 
         ImGui.SameLine();

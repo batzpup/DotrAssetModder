@@ -67,9 +67,7 @@ public class ModelImporterWindow
             var result = Dialog.FileOpen("glb,gltf", Path.GetDirectoryName(Program.config.lastModelImportPath));
             if (result.IsOk)
             {
-                modelPath = result.Path;
-                Program.config.lastModelImportPath = modelPath;
-                LoadPreview(modelPath);
+                SetupModel(result.Path);
             }
         }
 
@@ -128,6 +126,14 @@ public class ModelImporterWindow
         }
     }
 
+    public void SetupModel(string path)
+    {
+
+        modelPath = path;
+        Program.config.lastModelImportPath = modelPath;
+        LoadPreview(modelPath);
+    }
+
     void LoadPreview(string path)
     {
         try
@@ -157,9 +163,6 @@ public class ModelImporterWindow
 
     void DrawPreview()
     {
-    
-
-        
         if (previewModel.AnimationCount > 0)
         {
             if (ImGui.Button(animPlaying ? "Pause" : "Play"))
