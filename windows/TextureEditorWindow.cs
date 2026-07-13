@@ -871,7 +871,7 @@ public class TextureEditorWindow : IDisposable
             return;
         }
 
-        var decodedTex = Rh2Decoder.Decode(picBytes, (int)offsets[pictureIndex], Rh2Decoder.AlphaTreat.ForceOpaque);
+        var decodedTex = Rh2Decoder.Decode(picBytes, (int)offsets[pictureIndex]);
         if (decodedTex.IsEmpty)
         {
             return;

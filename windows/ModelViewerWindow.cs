@@ -1,6 +1,7 @@
 ﻿using ImGuiNET;
 using Raylib_cs;
 using rlImGui_cs;
+using System.Linq;
 using System.Numerics;
 using DotrAssetModder;
 using NativeFileDialogSharp;
@@ -12,6 +13,12 @@ public class ModelViewerWindow
     AnimatedGltfModel model;
     bool modelLoaded = false;
     string loadError = null;
+
+
+    string modelFolderPath = null;
+    string[] modelFiles = Array.Empty<string>();
+    int currentModelIndex = -1;
+    int modelIdInputBuffer = 1;
 
 
     const float FPS = 30f;
@@ -61,15 +68,66 @@ public class ModelViewerWindow
 
     void ButtonLoadModel()
     {
-
         DialogResult dialogResult = Dialog.FileOpen("glb,gltf");
         if (!dialogResult.IsOk)
         {
             return;
         }
+
+        int idx = Array.IndexOf(modelFiles, dialogResult.Path);
+        currentModelIndex = idx;
         LoadModel(dialogResult.Path);
+    }
 
+    void ButtonLoadFolder()
+    {
+        DialogResult dialogResult = Dialog.FolderPicker(Program.config.lastModelFolderPath);
+        if (!dialogResult.IsOk)
+        {
+            return;
+        }
+        LoadFolder(dialogResult.Path);
+    }
 
+    public void LoadFolder(string folderPath)
+    {
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(folderPath, "*.*")
+                .Where(f => f.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)
+                            || f.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch (Exception e)
+        {
+            loadError = e.Message;
+            return;
+        }
+
+        modelFolderPath = folderPath;
+        modelFiles = files;
+        Program.config.lastModelFolderPath = folderPath;
+
+        if (modelFiles.Length == 0)
+        {
+            currentModelIndex = -1;
+            loadError = "No .glb/.gltf files found in folder.";
+            return;
+        }
+
+        currentModelIndex = 0;
+        LoadModel(modelFiles[0]);
+    }
+
+    void GoToModelIndex(int index)
+    {
+        if (modelFiles.Length == 0) return;
+        index = Math.Clamp(index, 0, modelFiles.Length - 1);
+        if (index == currentModelIndex && modelLoaded) return;
+        currentModelIndex = index;
+        LoadModel(modelFiles[index]);
     }
 
     public void LoadModel(string path)
@@ -108,6 +166,7 @@ public class ModelViewerWindow
         model.SetAnimationFrame(initAnim, 0f);
         needsAnimUpdate = false;
         needsStaticRefresh = false;
+        resetPressed = true;
     }
 
     Vector3 OrbitForward()
@@ -206,12 +265,11 @@ public class ModelViewerWindow
             return;
         }
 
-        // Advance the texture-animation clock (DOTR_texAnim frame cycling). It runs in
-        // lockstep with skeletal speed and is frozen above in static pose; for models with
-        // no skeleton it still plays so texture-only animations are visible. Without this
-        // tick TexAnimTime stays 0 and every animated texture is pinned to frame 0.
         if (animPlaying || model.AnimationCount == 0)
+        {
             model.AdvanceTextureAnim(Raylib.GetFrameTime() * animSpeed);
+        }
+
 
         if (model.AnimationCount > 0 && animPlaying)
         {
@@ -246,13 +304,40 @@ public class ModelViewerWindow
         {
             ButtonLoadModel();
         }
-
         ImGui.SameLine();
+        if (ImGui.Button("Load Folder"))
+        {
+            ButtonLoadFolder();
+        }
+
         if (!modelLoaded)
+        {
+            ImGui.SameLine();
             ImGui.TextDisabled("No model loaded");
+        }
 
         if (loadError != null)
             ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Load failed: " + loadError);
+
+        if (modelFiles.Length > 0)
+        {
+            ImGui.Separator();
+            ImGui.SetNextItemWidth(80);
+            ImGui.InputInt("Model ID", ref modelIdInputBuffer);
+            {
+                if (ImGui.IsItemDeactivatedAfterEdit())
+                {
+                    GoToModelIndex(modelIdInputBuffer - 1);
+                }
+
+                if (!ImGui.IsItemActive())
+                {
+                    modelIdInputBuffer = currentModelIndex + 1;
+                }
+            }
+            ImGui.SameLine();
+            ImGui.Text($"({currentModelIndex + 1} / {modelFiles.Length})  {Path.GetFileName(modelFiles[Math.Max(currentModelIndex, 0)])}");
+        }
 
         if (ImGui.Button("Reset View"))
         {
@@ -269,7 +354,13 @@ public class ModelViewerWindow
         ImGui.Checkbox("Show Grid", ref showgrid);
         ImGui.SameLine();
         ImGui.SliderInt("Fly Speed", ref flySpeed, 40, 500);
-        ImGui.Text("WASD to move, space and left Ctrl to go up and down\nleft click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
+        ImGui.Text("Hover for controls");
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("WASD to move, space and left Ctrl to go up and down\nleft click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
+        }
+
+
 
 
         bool hasSkel = modelLoaded && model.AnimationCount > 0;

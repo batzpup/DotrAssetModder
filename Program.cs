@@ -45,6 +45,7 @@ class Program
         public string lastWordlistPath { get; set; } 
         public string lastModelImportPath { get; set; } 
         public string lastExtractPath { get; set; }
+        public string lastModelFolderPath { get; set; }
 
         static string PathName =>
             Path.Combine(AppContext.BaseDirectory, configName);

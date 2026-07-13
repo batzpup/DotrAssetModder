@@ -61,7 +61,7 @@ public static class TextureSlotManager
         {
             try
             {
-                var dec = Rh2Decoder.Decode(mrgBytes, (int)off, Rh2Decoder.AlphaTreat.ForceOpaque);
+                var dec = Rh2Decoder.Decode(mrgBytes, (int)off, Rh2Decoder.AlphaTreat.Keep);
                 if (dec.IsEmpty)
                     continue;
                 var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
@@ -115,7 +115,12 @@ public static class TextureSlotManager
             PS2Icon.CurrentTextureIndex = slot.IconIndex;
             return PS2Icon.ExtractIconTexture(slot.Bytes);
         }
-        var dec = Rh2Decoder.Decode(slot.Bytes, 0, Rh2Decoder.AlphaTreat.ForceOpaque);
+        // Some textures (e.g. TEXEFF glow/particle sprites) carry their entire visible
+        // shape in the alpha channel, with a flat neutral-grey RGB underneath meant to be
+        // alpha-blended over the scene. Forcing alpha to 255 here discarded that alpha
+        // channel - the only channel with real content - leaving nothing but the flat grey
+        // RGB, which is why some textures rendered as plain grey boxes in the viewer.
+        var dec = Rh2Decoder.Decode(slot.Bytes, 0, Rh2Decoder.AlphaTreat.Keep);
         return RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
     }
 
