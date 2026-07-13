@@ -10,6 +10,7 @@ using AlphaMode = SharpGLTF.Materials.AlphaMode;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
+//partially AI
 static class ModelExtractor
 {
     public const uint Rh0Magic = 0x00304852;
@@ -527,12 +528,12 @@ static class ModelExtractor
         {
             if (f <= k0Frame)
             {
-                outList.Add(((float)kfs[0].Rx, (float)kfs[0].Ry, (float)kfs[0].Rz));
+                outList.Add((kfs[0].Rx, kfs[0].Ry, kfs[0].Rz));
                 continue;
             }
             if (f >= kLastFrame)
             {
-                outList.Add(((float)kfs[n - 1].Rx, (float)kfs[n - 1].Ry, (float)kfs[n - 1].Rz));
+                outList.Add((kfs[n - 1].Rx, (float)kfs[n - 1].Ry, (float)kfs[n - 1].Rz));
                 continue;
             }
             while (cursor + 1 < n && kfs[cursor + 1].Frame <= f) cursor++;
@@ -915,11 +916,24 @@ static class ModelExtractor
         float animTransScale,
         Dictionary<int, TexAnimBake> texAnims)
     {
+        // Ref-bone (particle-effect anchor) index = a node's depth-first visit index, which
+        // is exactly GNode.Idx (WalkGNodes visits child-before-sibling, root = 0). The engine
+        // can only anchor an effect to a node whose DFS index is < refBoneNum, where
+        // refBoneNum = nodeTreeSize >> 6 (lSzModel_LoadCB@0x1e8bf0) and NodeTreeWriter emits
+        // nodeTreeSize = nodeCount*0x30 + 0x10. Naming each node with its ref index (and a
+        // _refOOR tag when the index is out of the usable range) lets you see in Blender which
+        // nodes effects can lock onto. Names are descriptive only — the importer matches nodes
+        // by tree position, not by name (it special-cases just "MrgRoot"), so this is
+        // round-trip-safe.
+        int nodeTreeSize = nodes.Count * 0x30 + 0x10;
+        int refBoneNum = nodeTreeSize >> 6;
+
         var nodeBuilders = new NodeBuilder[nodes.Count];
         for (int i = 0; i < nodes.Count; i++)
         {
             var n = nodes[i];
-            var nb = new NodeBuilder($"node_{n.Idx}_f{n.Flags:X4}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
+            string refTag = n.Idx < refBoneNum ? $"_ref{n.Idx}" : "_refOOR";
+            var nb = new NodeBuilder($"node_{n.Idx}{refTag}_f{n.Flags:X4}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
             var quat = M.EulerToQuatXyz(
                 n.RestRotBams.X * M.BamsRad,
                 n.RestRotBams.Y * M.BamsRad,

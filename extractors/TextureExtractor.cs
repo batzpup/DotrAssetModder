@@ -4,6 +4,7 @@ using System.IO.Compression;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
+//Based on GMS' Picture extractor
 static class TextureExtractor
 {
     public static ExtractResult Extract(byte[] data, string outDir,

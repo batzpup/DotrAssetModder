@@ -5,6 +5,7 @@ using SharpGLTF.Schema2;
 using SharpGLTF.Runtime;
 using SharpGLTF.Materials;
 using AlphaMode = SharpGLTF.Schema2.AlphaMode; // MaterialBuilder, KnownChannel, KnownProperty (package: SharpGLTF.Toolkit)
+//AI Generated
 
 // ---------------------------------------------------------------------------
 // Type origins. Raylib_cs and SharpGLTF.Schema2 BOTH declare `Mesh`/`Material`,
@@ -30,6 +31,8 @@ using RlMesh       = Raylib_cs.Mesh;
 using RlMaterial   = Raylib_cs.Material;
 using RlImage      = Raylib_cs.Image;   // SharpGLTF.Schema2 also declares Image
 using GltfMaterial = SharpGLTF.Schema2.Material;
+
+
 
 /// <summary>
 /// Loads a glTF/glb with SharpGLTF and renders it with Raylib.

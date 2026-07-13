@@ -2,6 +2,8 @@
 
 namespace DotrAssetModder;
 
+//Mostly AI
+
 // === Step 6.6 — RH0 assembler ========================================================
 // Combines the rebuilt sub-blocks into a single 1 MiB RH0 by TEMPLATE-INJECT: the
 // original .mrg is the base, its header preamble (0x00..nodeTree) and aux2 are
@@ -518,6 +520,15 @@ public static class Rh0Assembler
         W32(outBuf, 0x60, 0);
         BinaryPrimitives.WriteSingleLittleEndian(outBuf.AsSpan(0x64), rebuilt.AnimTransScale);
 
+        // ---- Fix 2: validate the header[0x0C] region chain is reachable ----
+        // OverlayB (sectionFlags bit 0x400) and the effect/camera-motion regions are bound by
+        // lSzModel_BindModelByAddr@0x1f0500 walking the chain rooted at header[0x0C]. If MOT
+        // replacement shifted the chain so a region stop lands on the wrong offset, OverlayB
+        // points at garbage and SzModel_BattleSeq spawns its particle effect at world origin.
+        // Re-walk the just-written block with the same logic the engine uses and fail the
+        // build (with a precise message) instead of shipping a model that spawns at (0,0,0).
+        ValidateRegionChain(outBuf, cursor, motByte);
+
         if (trimToContent)
         {
             // cursor holds the true end of all placed content (every Place() call advances
@@ -585,6 +596,67 @@ public static class Rh0Assembler
             return long.MaxValue;
         }
         return Math.Min(cur, data.Length);
+    }
+
+    /// Fix 2 — post-assembly sanity check on the header[0x0C] trailing-region chain.
+    /// Walks the freshly-written block the same way the engine's binder does
+    /// (lSzModel_BindModelByAddr@0x1f0500 / ComputeBlockEnd) and throws if anything the
+    /// loader would dereference is out of range. <paramref name="contentEnd"/> is the
+    /// assembler's cursor (true one-past-last placed byte); <paramref name="motByte"/> is the
+    /// sectionFlags low byte we wrote (bits 0-7 = embedded MOT slots).
+    ///
+    /// Checks, in order:
+    ///   * header[0x0C] (chain root) sits inside placed content,
+    ///   * each embedded MOT slot bit set in bits 0-7 has a real MOT magic at the walked
+    ///     position (catches a sectionFlags byte that desynced from the emitted MOT blocks),
+    ///   * the full walk via ComputeBlockEnd succeeds (return != -1: no region size ran off
+    ///     the end), and the computed end does not exceed the block.
+    /// A bit-21 open-ended tail (ComputeBlockEnd returns long.MaxValue) is accepted: it is
+    /// trimmed against the block length exactly as CapturePostMotChain does, so it cannot
+    /// over-run.
+    private static void ValidateRegionChain(byte[] block, int contentEnd, int motByte)
+    {
+        uint flags = U32(block, 0x04);
+        long chainRoot = U32(block, 0x0C);
+
+        if (chainRoot < HeaderPreambleEnd || chainRoot > contentEnd)
+            throw new InvalidOperationException(
+                $"RH0 region chain root (header[0x0C]={chainRoot:X}) is outside placed content " +
+                $"(0x{HeaderPreambleEnd:X}..0x{contentEnd:X}); OverlayB/effect binding would " +
+                "dereference garbage and spawn battle effects at world origin.");
+
+        // Walk the embedded MOT slots (bits 0-7) and confirm each declared slot really has a
+        // MOT block where the loader will look. motByte and the emitted blocks must agree.
+        long cur = chainRoot;
+        for (int slot = 0; slot < 8; slot++)
+        {
+            if ((flags & (1u << slot)) == 0) continue;
+            if (cur + 8 > block.Length)
+                throw new InvalidOperationException(
+                    $"RH0 MOT slot {slot} chain entry runs past the block end (cur=0x{cur:X}).");
+            if (U32(block, (int)cur) != MotWriter.Magic)
+                throw new InvalidOperationException(
+                    $"RH0 sectionFlags bit {slot} is set but no MOT magic is present at the " +
+                    $"chain position 0x{cur:X}. The sectionFlags low byte (0x{motByte & 0xFF:X2}) " +
+                    "is out of sync with the emitted MOT blocks; SzModel_SetAnimIntr would " +
+                    "null-fault and stall the 3D battle.");
+            cur += U32(block, (int)cur + 4);
+        }
+
+        // Full chain walk (MOTs + bits 8..21 regions) via the shared engine-equivalent logic.
+        long end = ComputeBlockEnd(block, 0, out long postMotStart);
+        if (end == -1)
+            throw new InvalidOperationException(
+                "RH0 region chain walk failed: a region size field points past the block end. " +
+                "The header[0x0C] chain is malformed and the engine's binder would read out of " +
+                "bounds (black screen / corrupt effects).");
+        if (postMotStart < 0 || postMotStart > block.Length)
+            throw new InvalidOperationException(
+                $"RH0 post-MOT chain start (0x{postMotStart:X}) is out of range.");
+        if (end != long.MaxValue && end > block.Length)
+            throw new InvalidOperationException(
+                $"RH0 region chain computed end (0x{end:X}) exceeds the block size " +
+                $"(0x{block.Length:X}).");
     }
 
     private static byte[] CapturePostMotChain(byte[] orig)

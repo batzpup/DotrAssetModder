@@ -78,7 +78,7 @@ public class AssetExtractor
     }
 }
 
-internal static class Bin
+static class Bin
 {
     public static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o, 4));
     public static int I32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt32LittleEndian(d.Slice(o, 4));

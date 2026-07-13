@@ -26,6 +26,23 @@ namespace DotrAssetModder;
 //
 // Translation keys hold RAW values; the game multiplies by animTransScale (node 0 uses 1.0)
 // then by the parent's accumulated scale. The glb->raw conversion lives in RebuildPipeline.
+//
+// === BATTLE-SLOT GUARANTEE (Fix 1, verified in Ghidra) ===============================
+// The 3D battle state machine drives animation transitions via SzModel_SetAnimIntr@0x1f1550:
+//   * SzModel_BattleSeq@0x1f0cd0  -> SetAnimIntr(modelId, 2)  (attacker: ATTACK anim)
+//   * SzModel_BattleSeq2@0x1f0e50 -> SetAnimIntr(modelId, 5)  (defender: TAKE-HIT/DEATH)
+// SetAnimIntr early-outs with return 0 when M3DMOT_AnimationDataPointers[slot] == NULL
+// (i.e. the slot bit is clear in RH0 sectionFlags bits 0-7, so lSzModel_BindModelByAddr
+// @0x1f0500 never set a pointer for it). When that happens the battle never transitions
+// out of idle; SzDuel_Act then waits forever for SzModel_GetAnim@0x1f13f0 == 0 and for
+// SzEffect_IsUse2 == 0 -> black screen / infinite wait, and the eventual skip/timeout
+// resolves combat from a stale SzDuel_GetPlayMotion result, so the imported monster loses
+// with no damage. A GLB that only ships slot 0 (idle) hits exactly this.
+//
+// To keep the state machine alive we GUARANTEE slots 2 and 5 are emitted: if the imported
+// motions don't include them, we clone a present slot (idle/slot 0 preferred, else the
+// lowest-id slot) into the missing slot. A cloned idle looks wrong during an attack but is
+// a fully valid, terminating animation, so the battle plays out and resolves correctly.
 // =====================================================================================
 
 public sealed class EncMotTrack
@@ -48,11 +65,15 @@ public static class MotWriter
     private const int TrackTableOff = 0x2C;   // relative to block; track table follows the desc
     private const int EntSize = 16;           // no-scale entries (type & 0x3f == 3)
 
+    /// Slots the 3D battle sequence hard-requires (attack, take-hit). Missing ones are
+    /// synthesised by cloning an existing slot so SzModel_SetAnimIntr never null-faults.
+    private static readonly int[] BattleRequiredSlots = { 2, 5 };
+
     /// Serialise the motions (any order; emitted in ascending SlotId) into back-to-back MOT
     /// blocks, and report the RH0 sectionFlags low byte (set bit per slot present).
     public static (byte[] Blocks, int SectionFlagsByte) Write(int nodeCount, IReadOnlyList<EncMotion> motions)
     {
-        var ordered = motions.OrderBy(m => m.SlotId).ToList();
+        var ordered = EnsureBattleSlots(motions);
         var outAll = new List<byte>();
         int flags = 0;
         foreach (var m in ordered)
@@ -61,6 +82,48 @@ public static class MotWriter
             outAll.AddRange(WriteBlock(nodeCount, m));
         }
         return (outAll.ToArray(), flags & 0xFF);
+    }
+
+    /// Returns the motions ordered by SlotId, with battle-required slots (2 and 5) added by
+    /// cloning an existing slot if absent. Never mutates the caller's objects. If there are
+    /// no motions at all, nothing is synthesised (a model with zero animation can't be a
+    /// valid battle monster and there is nothing to clone from).
+    private static List<EncMotion> EnsureBattleSlots(IReadOnlyList<EncMotion> motions)
+    {
+        var ordered = motions.OrderBy(m => m.SlotId).ToList();
+        if (ordered.Count == 0) return ordered;
+
+        var present = new HashSet<int>(ordered.Select(m => m.SlotId));
+
+        // Source preference: slot 0 (idle) if present, else the lowest-id slot we have.
+        EncMotion donor = ordered.FirstOrDefault(m => m.SlotId == 0) ?? ordered[0];
+
+        foreach (int slot in BattleRequiredSlots)
+        {
+            if (present.Contains(slot)) continue;
+            ordered.Add(CloneMotion(donor, slot));
+            present.Add(slot);
+        }
+
+        ordered.Sort((a, b) => a.SlotId.CompareTo(b.SlotId));
+        return ordered;
+    }
+
+    /// Deep-copies a motion's track data under a new slot id. Track lists are copied so the
+    /// clone and its source never share mutable state.
+    private static EncMotion CloneMotion(EncMotion src, int newSlotId)
+    {
+        var dst = new EncMotion { SlotId = newSlotId, FrameCount = src.FrameCount };
+        foreach (var (node, tr) in src.Tracks)
+        {
+            var copy = new EncMotTrack();
+            if (tr.Trans is { Count: > 0 })
+                copy.Trans = new List<(int, Vector3)>(tr.Trans);
+            if (tr.Rot is { Count: > 0 })
+                copy.Rot = new List<(int, int, int, int)>(tr.Rot);
+            dst.Tracks[node] = copy;
+        }
+        return dst;
     }
 
     private static byte[] WriteBlock(int nodeCount, EncMotion m)
