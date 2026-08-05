@@ -21,7 +21,7 @@ This is in Alpha, please report bugs, recommendations, features you would like t
 
 ## Features
 
-### Extract all the games 3D models and 2D textures in GLTF and PNG's respectively
+### Extract all the games 3D models and 2D textures as GLTF and PNG's respectively
 
 ### Import New 3D monster models into the game
 
