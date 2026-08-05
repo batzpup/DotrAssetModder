@@ -31,7 +31,25 @@ This is in Alpha, please report bugs, recommendations, features you would like t
 
 
 ## How To Use
-- 
+### Importing 3D models
+The most import aspect to importing new 3D models is having the hierarchy correct.
+For the tool to work properly you must:
+- Have RootNode that only contain one child node which determines the world position placement of the model
+- The World Position node must only have one child which determines the models pivot point for rotation and where the camera will look at when focusing on the model
+   - Recommend having the world pos and root at 0,0 and then adjust the pivot point.
+- RootNode->WorldPos->ModelPivot/Camera -> any number of children
+if this is not done models will appear too high or too low, the will rotate around a spot infront or behind them, camera will not look at their center.
+
+Example:
+<img width="1991" height="1328" alt="image" src="https://github.com/user-attachments/assets/e4fedf86-7cee-4830-a6d6-93baed0ad84a" />
+
+### Texture notes
+Keep textures sizes down, you cannot import a model greater than 1mb after compression from the importer.
+The max texture sizes may not be bigger than 512x512 and for textures on models 256 is the recommended max size
+Texture dimensions are required to be powers of 2
+
+### Animated Textures
+To Explain
 
 ## TODO
 Extract And Import the following:
