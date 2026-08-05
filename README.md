@@ -3,8 +3,10 @@ Used for modding and preservation purposes
 Should work on cross platform and for all versions of the game.
 requires .NET 8
 
-## NOTE
-This has moderate to extensive use of AI primarily for the importing and exporting of the 3D Models, I do apologise, but many things around this project are out of my skillset, very time consuming and some of the formats are Konami specific formats with no documentation or uses elsewhere. I do not currently have the time, energy and passion to learn all the required skills that would normally be needed for this project without AI. But I know many people would like to have this functionality to unlock one of the last few hurdles in modding this game.
+## NOTES
+
+### AI Notice and disclosure:
+This has moderate to extensive use of AI primarily for the importing and exporting of the 3D Models, I do apologise, but many things around this project are out of my skillset, very time consuming and some of the formats are Konami specific formats with no documentation or uses elsewhere. I do not currently have the time, energy and passion to learn all the required skills that would normally be needed for this project without AI. But I know many people would like to have this functionality to unlock one of the last few hurdles in modding this game. If you do not wish to use this project because of the AI usage I completely understand.
 I have tried to label classes functions and code written by AI, and to the extent of what of it is AI code where i could. 
 
 ### This is in Alpha, please report bugs, recommendations, features you would like to see
