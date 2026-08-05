@@ -1,7 +1,6 @@
-A tool for exporter and importing assets for ps2 game Yu-Gi-Oh Duelist of the Roses.
-Used for modding and preservation purposes
-Should work on cross platform and for all versions of the game.
-requires .NET 8
+##  A tool for exporting and importing assets for ps2 game Yu-Gi-Oh Duelist of the Roses. 
+ Used for modding and preservation purposes  
+ Should work on cross platform and for all versions of the game.   
 
 ## NOTES
 
