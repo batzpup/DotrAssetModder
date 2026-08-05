@@ -15,7 +15,12 @@ static class ModelExtractor
 {
     public const uint Rh0Magic = 0x00304852;
 
-    public static float AltAlphaDivisor = 255f;
+    public const float Ps2FullAlpha = 128f;
+
+    // Retail default GS state written by GeometryWriter and used by ordinary model pages.
+    // ALPHA_1: (Cs - Cd) * As + Cd, FIX=0x80. TEST_1: alpha test disabled, Z test GEQUAL.
+    const ulong DefaultGsAlpha = 0x0000008000000044UL;
+    const ulong DefaultGsTest = 0x000000000007000CUL;
 
     public static ExtractResult Extract(byte[] data, string outDir, string stem,
         IList<string>? names = null,
@@ -204,7 +209,9 @@ static class ModelExtractor
                 Strips = ParseStripsInRange(data, s, e),
                 ColorQ1 = page.ColorQ1,
                 IsAlt = false,
-                AlphaW = 128.0f,
+                AlphaW = page.AlphaW,
+                GsAlpha = page.GsAlpha,
+                GsTest = page.GsTest,
             });
         }
         foreach (var page in altPages)
@@ -218,6 +225,8 @@ static class ModelExtractor
                 ColorQ1 = page.ColorQ1,
                 IsAlt = true,
                 AlphaW = page.AlphaW,
+                GsAlpha = page.GsAlpha,
+                GsTest = page.GsTest,
             });
         }
 
@@ -323,6 +332,8 @@ static class ModelExtractor
         var runningBoneMap = new Dictionary<int, int>();
         (float R, float G, float B) curQ1 = (255, 255, 255);
         float curAlphaW = 128f;
+        ulong curGsAlpha = DefaultGsAlpha;
+        ulong curGsTest = DefaultGsTest;
         int curPos = 0;
         for (int wi = 0; wi < walkOffsets.Count; wi++)
         {
@@ -344,8 +355,35 @@ static class ModelExtractor
                         curQ1 = (q1r, q1g, q1b);
                     if (q1a >= 0 && q1a <= 255) curAlphaW = q1a;
                     scanP += 0x40;
+                    continue;
                 }
-                else scanP += 4;
+
+                // The material setup is a packed GIF A+D list. The first qword is
+                // the 64-bit GS value and the second qword's low byte is the GS
+                // register (0x42/43 = ALPHA, 0x47/48 = TEST). Preserve the state
+                // that is active when this page is dispatched instead of inferring
+                // blending from the alternate section or texture animation.
+                if ((scanP & 0xF) == 0 && scanP + 16 <= scanEnd)
+                {
+                    uint gsReg = U32(data, secBase + scanP + 8);
+                    uint gsRegHi = U32(data, secBase + scanP + 12);
+                    if (gsRegHi == 0 && (gsReg == 0x42 || gsReg == 0x43))
+                    {
+                        curGsAlpha = BinaryPrimitives.ReadUInt64LittleEndian(
+                            data.AsSpan(secBase + scanP, 8));
+                        scanP += 16;
+                        continue;
+                    }
+                    if (gsRegHi == 0 && (gsReg == 0x47 || gsReg == 0x48))
+                    {
+                        curGsTest = BinaryPrimitives.ReadUInt64LittleEndian(
+                            data.AsSpan(secBase + scanP, 8));
+                        scanP += 16;
+                        continue;
+                    }
+                }
+
+                scanP += 4;
             }
             curPos = termOff + 0x10;
 
@@ -362,6 +400,8 @@ static class ModelExtractor
                 PktSize = (term0 & 0xFFFF) << 4,
                 ColorQ1 = curQ1,
                 AlphaW = curAlphaW,
+                GsAlpha = curGsAlpha,
+                GsTest = curGsTest,
             });
         }
         return pages;
@@ -764,7 +804,7 @@ static class ModelExtractor
         for (int i = 0; i < bm.SortedMslots.Count; i++)
             bm.MslotToJoint[bm.SortedMslots[i]] = i;
 
-        var primFaces = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B),
+        var primFaces = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B, ulong GsAlpha, ulong GsTest),
             (List<(int A, int B, int C)> Faces, float AlphaW)>();
 
         foreach (var pkt in packets)
@@ -774,7 +814,7 @@ static class ModelExtractor
             int q1r = (int)Math.Round(pkt.ColorQ1.R);
             int q1g = (int)Math.Round(pkt.ColorQ1.G);
             int q1b = (int)Math.Round(pkt.ColorQ1.B);
-            int alphaKey = pkt.IsAlt ? (int)Math.Round(pkt.AlphaW) : 128;
+            int alphaKey = (int)Math.Round(pkt.AlphaW);
 
             foreach (var s in pkt.Strips)
             {
@@ -864,7 +904,7 @@ static class ModelExtractor
                 }
 
                 int nv = s.Verts.Count;
-                var key = (texIdx, pkt.IsAlt ? 1 : 0, alphaKey, q1r, q1g, q1b);
+                var key = (texIdx, pkt.IsAlt ? 1 : 0, alphaKey, q1r, q1g, q1b, pkt.GsAlpha, pkt.GsTest);
                 if (!primFaces.TryGetValue(key, out var entry))
                 {
                     entry = (new List<(int, int, int)>(), pkt.AlphaW);
@@ -891,7 +931,8 @@ static class ModelExtractor
 
         foreach (var k in primFaces.Keys
                      .OrderBy(x => x.Tex).ThenBy(x => x.IsAlt).ThenBy(x => x.Alpha)
-                     .ThenBy(x => x.R).ThenBy(x => x.G).ThenBy(x => x.B))
+                     .ThenBy(x => x.R).ThenBy(x => x.G).ThenBy(x => x.B)
+                     .ThenBy(x => x.GsAlpha).ThenBy(x => x.GsTest))
         {
             var entry = primFaces[k];
             bm.Primitives.Add(new Primitive {
@@ -900,6 +941,8 @@ static class ModelExtractor
                 AlphaKey = k.Alpha,
                 AlphaW = entry.AlphaW,
                 ColorQ1Key = (k.R, k.G, k.B),
+                GsAlpha = k.GsAlpha,
+                GsTest = k.GsTest,
                 Faces = entry.Faces,
             });
         }
@@ -964,17 +1007,21 @@ static class ModelExtractor
             Vector3.One, System.Numerics.Quaternion.Identity, -pivot);
         mrgRoot.AddNode(nodeBuilders[0]);
 
-        var materials = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B), MaterialBuilder>();
+        var materials = new Dictionary<(int Tex, int IsAlt, int Alpha, int R, int G, int B, ulong GsAlpha, ulong GsTest), MaterialBuilder>();
+        var blendStates = new Dictionary<string, DotrBlendState>(StringComparer.Ordinal);
 
-        MaterialBuilder GetMaterial(int texIdx, bool isAlt, int alphaKey, float alphaW, (int R, int G, int B) q1Key)
+        MaterialBuilder GetMaterial(int texIdx, bool isAlt, int alphaKey, float alphaW,
+            (int R, int G, int B) q1Key, ulong gsAlpha, ulong gsTest)
         {
             if (texIdx < 0 || texIdx >= textures.Count) texIdx = 0;
-            var key = (texIdx, isAlt ? 1 : 0, alphaKey, q1Key.R, q1Key.G, q1Key.B);
+            var key = (texIdx, isAlt ? 1 : 0, alphaKey, q1Key.R, q1Key.G, q1Key.B, gsAlpha, gsTest);
             if (materials.TryGetValue(key, out var existing)) return existing;
             var tex = textures[texIdx];
             var png = PngEncoder.Encode(tex.Width, tex.Height, tex.Rgba);
             var image = new MemoryImage(png);
-            var mat = new MaterialBuilder($"mat_tex{texIdx}" + (isAlt ? "_alt" : ""))
+            string matName = $"mat_tex{texIdx}_a{alphaKey}_gs{(byte)gsAlpha:X2}_t{(uint)(gsTest & 0xFFFFF):X5}"
+                             + (isAlt ? "_alt" : "");
+            var mat = new MaterialBuilder(matName)
                 .WithDoubleSide(true)
                 .WithMetallicRoughnessShader()
                 .WithMetallicRoughness(0f, 1f);
@@ -987,20 +1034,63 @@ static class ModelExtractor
             float g = q1Key.G / 255f;
             float b = q1Key.B / 255f;
             float a = 1f;
-            if (isAlt)
+
+            bool textureHasAlpha = texIdx < texHasAlpha.Count && texHasAlpha[texIdx];
+            bool textureHasPartialAlpha = textureHasAlpha && HasPartialTextureAlpha(tex.Rgba);
+
+            // PS2 colour alpha uses 0x80 as a factor of 1.0. This factor is
+            // multiplied by texture alpha by the GS texture function before the
+            // ALPHA equation consumes As.
+            a = Math.Clamp(alphaW / Ps2FullAlpha, 0f, 1f);
+
+            string blendMode = ClassifyBlendMode(gsAlpha, gsTest, a, isAlt,
+                textureHasAlpha, textureHasPartialAlpha);
+            float alphaCutoff = GetAlphaCutoff(gsTest);
+
+            switch (blendMode)
             {
-                a = Math.Clamp(alphaW / ModelExtractor.AltAlphaDivisor, 0f, 1f);
-                mat.WithAlpha(AlphaMode.BLEND);
+                case "additive":
+                case "alpha":
+                    mat.WithAlpha(AlphaMode.BLEND);
+                    break;
+                case "mask":
+                    mat.WithAlpha(AlphaMode.MASK, alphaCutoff);
+                    break;
+                default:
+                    // Always state OPAQUE explicitly. Every embedded texture is RGBA,
+                    // and relying on library/image inference can incorrectly place a
+                    // fully opaque model in the transparent no-depth-write pass.
+                    mat.WithAlpha(AlphaMode.OPAQUE);
+                    a = 1f;
+                    break;
             }
-            else if (texIdx < texHasAlpha.Count && texHasAlpha[texIdx])
+
+            // The +0x20 colour normally behaves like a material-lighting factor, but
+            // some retail models use (0,0,0) as a sentinel for the default/unmodulated
+            // texture colour. Multiplying the glTF base colour by literal black makes
+            // those textures disappear; booKoo's book page is the known example.
+            // Preserve the original value in DOTR metadata, but render it as neutral.
+            bool isZeroColourSentinel =
+                q1Key.R == 0 && q1Key.G == 0 && q1Key.B == 0;
+
+            // Omit the exact retail-neutral grey, and the zero sentinel, for a fully
+            // opaque material. An omitted glTF base-colour factor is white, which leaves
+            // the decoded texture unchanged. Transparent/additive materials still need
+            // their alpha factor, so use white RGB for a zero sentinel in those modes.
+            bool omitBaseColour = blendMode == "opaque" &&
+                                  ((!isAlt && q1Key.R == 178 && q1Key.G == 178 && q1Key.B == 178) ||
+                                   isZeroColourSentinel);
+            if (!omitBaseColour)
             {
-                mat.WithAlpha(AlphaMode.MASK, 0.5f);
+                float outR = isZeroColourSentinel ? 1f : r;
+                float outG = isZeroColourSentinel ? 1f : g;
+                float outB = isZeroColourSentinel ? 1f : b;
+                mat.WithBaseColor(new Vector4(outR, outG, outB, a));
             }
-            // Omit only the exact retail-neutral grey: the importer maps an unspecified
-            // (White) factor back onto (178,178,178), so neutral round-trips exactly and
-            // every other colour is exported with full magnitude.
-            bool isNeutral = !isAlt && q1Key.R == 178 && q1Key.G == 178 && q1Key.B == 178;
-            if (!isNeutral) mat.WithBaseColor(new Vector4(r, g, b, a));
+
+            blendStates[matName] = new DotrBlendState(
+                blendMode, alphaCutoff, a, gsAlpha, gsTest,
+                q1Key.R, q1Key.G, q1Key.B);
             materials[key] = mat;
             return mat;
         }
@@ -1013,7 +1103,8 @@ static class ModelExtractor
         foreach (var prim in built.Primitives)
         {
             if (prim.IsAlt && prim.AlphaW == 0f) continue;
-            var mat = GetMaterial(prim.TexIdx, prim.IsAlt, prim.AlphaKey, prim.AlphaW, prim.ColorQ1Key);
+            var mat = GetMaterial(prim.TexIdx, prim.IsAlt, prim.AlphaKey, prim.AlphaW,
+                prim.ColorQ1Key, prim.GsAlpha, prim.GsTest);
             var pb = meshBuilder.UsePrimitive(mat);
             foreach (var (a, b, c) in prim.Faces)
             {
@@ -1088,11 +1179,91 @@ static class ModelExtractor
         var scene = new SceneBuilder("MrgScene");
         scene.AddNode(mrgRoot);
         if (meshBuilder.Primitives.Any(p => p.Vertices.Count > 0))
+        {
             scene.AddSkinnedMesh(meshBuilder, Matrix4x4.Identity, joints);
+        }
+
         var model = scene.ToGltf2();
+        InjectBlendMetadata(model, blendStates);
         if (texAnims.Count > 0) InjectTextureAnimations(model, texAnims);
         model.SaveGLB(outPath);
         ReorderGlbAnimations(outPath);
+    }
+
+    private static string ClassifyBlendMode(ulong gsAlpha, ulong gsTest, float materialAlpha, bool isAlt,
+        bool textureHasAlpha, bool textureHasPartialAlpha)
+    {
+        int aSel = (int)(gsAlpha & 0x3);
+        int bSel = (int)((gsAlpha >> 2) & 0x3);
+        int cSel = (int)((gsAlpha >> 4) & 0x3);
+        int dSel = (int)((gsAlpha >> 6) & 0x3);
+        int fix = (int)((gsAlpha >> 32) & 0xFF);
+
+        bool alphaTest = (gsTest & 1UL) != 0;
+
+        // Alpha-tested pages are cutouts first, even when their GS ALPHA register
+        // resembles an additive equation. This is the Bagworm flipbook case.
+        if (alphaTest && textureHasAlpha) return "mask";
+
+        // GS: Cv = (A - B) * C / 128 + D.
+        bool sourceAlphaAdditive = aSel == 0 && bSel == 2 && cSel == 0 && dSel == 1;
+        bool fixedAdditive = aSel == 0 && bSel == 2 && cSel == 2 && dSel == 1 && fix > 0;
+
+        // Do not make an entire page additive merely because it carries 0x48.
+        // Deep Sea Shark has opaque body geometry sharing that state; the genuinely
+        // blended pieces also provide a non-opaque material/texture alpha source.
+        bool hasBlendFactor = materialAlpha < 0.999f || textureHasPartialAlpha;
+        if (isAlt && hasBlendFactor && (sourceAlphaAdditive || fixedAdditive))
+            return "additive";
+
+        // Main-section monster textures often contain incidental palette alpha that
+        // the game does not use for blending. With no alpha test and full material
+        // alpha they must remain opaque (Djinn Watcher of Wind).
+        if (!isAlt && materialAlpha >= 0.999f) return "opaque";
+
+        if (textureHasAlpha && !textureHasPartialAlpha) return "mask";
+        if (materialAlpha < 0.999f || textureHasPartialAlpha) return "alpha";
+        return "opaque";
+    }
+
+    private static float GetAlphaCutoff(ulong gsTest)
+    {
+        if ((gsTest & 1UL) == 0) return 0.5f;
+        int alphaRef = (int)((gsTest >> 4) & 0xFF);
+        return Math.Clamp(alphaRef / Ps2FullAlpha, 0f, 1f);
+    }
+
+    private static void InjectBlendMetadata(ModelRoot model,
+        IReadOnlyDictionary<string, DotrBlendState> blendStates)
+    {
+        foreach (var mat in model.LogicalMaterials)
+        {
+            if (mat.Name == null || !blendStates.TryGetValue(mat.Name, out var state)) continue;
+
+            var extras = mat.Extras as System.Text.Json.Nodes.JsonObject
+                         ?? new System.Text.Json.Nodes.JsonObject();
+            extras["DOTR_blend"] = new System.Text.Json.Nodes.JsonObject {
+                ["mode"] = state.Mode,
+                ["alphaCutoff"] = state.AlphaCutoff,
+                ["materialAlpha"] = state.MaterialAlpha,
+                ["gsAlpha"] = $"0x{state.GsAlpha:X16}",
+                ["gsTest"] = $"0x{state.GsTest:X16}",
+                ["materialColorR"] = state.MaterialColorR,
+                ["materialColorG"] = state.MaterialColorG,
+                ["materialColorB"] = state.MaterialColorB,
+            };
+            mat.Extras = extras;
+        }
+    }
+
+    private static bool HasPartialTextureAlpha(byte[] rgba)
+    {
+        for (int i = 3; i < rgba.Length; i += 4)
+        {
+            byte a = rgba[i];
+            if (a > 0 && a < 255) return true;
+        }
+        return false;
     }
 
     // Bakes the texture-animation frames into the glTF as extra images and tags
@@ -1132,12 +1303,20 @@ static class ModelExtractor
             foreach (var mat in model.LogicalMaterials)
             {
                 if (!MaterialUsesTexture(mat.Name, texIdx)) continue;
-                string js = "{\"DOTR_texAnim\":{\"duration\":" + dur +
-                            ",\"frames\":" + frameJson + "}}";
-                mat.Extras = System.Text.Json.Nodes.JsonNode.Parse(js);
+
+                string animJson = "{\"duration\":" + dur +
+                                  ",\"frames\":" + frameJson + "}";
+
+                var extras = mat.Extras as System.Text.Json.Nodes.JsonObject
+                             ?? new System.Text.Json.Nodes.JsonObject();
+                extras["DOTR_texAnim"] = System.Text.Json.Nodes.JsonNode.Parse(animJson);
+                mat.Extras = extras;
             }
         }
     }
+
+    private static bool MaterialIsAlt(string? name) =>
+        name?.EndsWith("_alt", StringComparison.OrdinalIgnoreCase) == true;
 
     // Materials are named "mat_tex{idx}" optionally with "_alt"/suffixes; match
     // on the leading integer so tex1 doesn't also catch tex10.
@@ -1264,7 +1443,7 @@ static class ModelExtractor
     }
 }
 
-internal readonly struct Rh0HeaderFull
+readonly struct Rh0HeaderFull
 {
     public readonly uint Magic;
     public readonly uint SectionFlags;
@@ -1301,7 +1480,7 @@ internal readonly struct Rh0HeaderFull
     }
 }
 
-internal sealed class GNode
+sealed class GNode
 {
     public int Idx;
     public int Pidx;
@@ -1316,7 +1495,17 @@ internal sealed class GNode
     public List<int> Children = new();
 }
 
-internal sealed class PageInfo
+readonly record struct DotrBlendState(
+    string Mode,
+    float AlphaCutoff,
+    float MaterialAlpha,
+    ulong GsAlpha,
+    ulong GsTest,
+    int MaterialColorR,
+    int MaterialColorG,
+    int MaterialColorB);
+
+sealed class PageInfo
 {
     public int WalkOff;
     public Dictionary<int, int> BoneMap = new();
@@ -1324,9 +1513,11 @@ internal sealed class PageInfo
     public uint PktSize;
     public (float R, float G, float B) ColorQ1;
     public float AlphaW;
+    public ulong GsAlpha;
+    public ulong GsTest;
 }
 
-internal sealed class Packet
+sealed class Packet
 {
     public int WalkOff;
     public Dictionary<int, int> BoneMap = new();
@@ -1334,16 +1525,18 @@ internal sealed class Packet
     public (float R, float G, float B) ColorQ1;
     public bool IsAlt;
     public float AlphaW;
+    public ulong GsAlpha;
+    public ulong GsTest;
 }
 
-internal sealed class Strip
+sealed class Strip
 {
     public string Type = "SHARED";
     public int VuAddr;
     public List<StripVertex> Verts = new();
 }
 
-internal sealed class StripVertex
+sealed class StripVertex
 {
     public (short U, short V) Uv;
     public (short X, short Y, short Z) Pos;
@@ -1351,7 +1544,7 @@ internal sealed class StripVertex
     public List<StripWeight>? Weights;
 }
 
-internal readonly struct StripWeight
+readonly struct StripWeight
 {
     public readonly int Bone;
     public readonly short W;
@@ -1367,7 +1560,7 @@ internal readonly struct StripWeight
     }
 }
 
-internal sealed class BuiltMesh
+sealed class BuiltMesh
 {
     public List<Vector3> Vertices = new();
     public List<Vector3> Normals = new(); // output-space vertex normals (winding orientation only)
@@ -1378,30 +1571,32 @@ internal sealed class BuiltMesh
     public Dictionary<int, int> MslotToJoint = new();
 }
 
-internal sealed class Primitive
+sealed class Primitive
 {
     public int TexIdx;
     public (int R, int G, int B) ColorQ1Key;
     public bool IsAlt;
     public int AlphaKey;
     public float AlphaW;
+    public ulong GsAlpha;
+    public ulong GsTest;
     public List<(int A, int B, int C)> Faces = new();
 }
 
-internal sealed class AnimSlot
+sealed class AnimSlot
 {
     public int SlotId;
     public int FrameCount;
     public Dictionary<int, AnimTrack> Tracks = new();
 }
 
-internal sealed class AnimTrack
+sealed class AnimTrack
 {
     public List<(int Frame, float X, float Y, float Z)>? Trans;
     public List<(int Frame, int Rx, int Ry, int Rz)>? Rot;
 }
 
-internal readonly struct DecodedTexInfo
+readonly struct DecodedTexInfo
 {
     public readonly int Width;
     public readonly int Height;
@@ -1415,7 +1610,7 @@ internal readonly struct DecodedTexInfo
     }
 }
 
-internal static class M
+static class M
 {
     public const double BamsRad = Math.PI / 32768.0;
     public static Matrix4x4 Translation(float x, float y, float z) => Matrix4x4.CreateTranslation(x, y, z);

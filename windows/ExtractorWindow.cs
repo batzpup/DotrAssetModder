@@ -1,25 +1,35 @@
-﻿using ImGuiNET;
+﻿using System.Diagnostics;
+using System.Numerics;
+using DiscUtils.Iso9660;
+using ImGuiNET;
 using NativeFileDialogSharp;
 namespace DotrAssetModder;
 
 public class ExtractorWindow
 {
     string pathTemplate = "Current path: ";
-    string destinationPath = string.Empty;
-    string wordlistPath = string.Empty;
+    string dataDestinationPath = string.Empty;
+    string dataWordlistPath = string.Empty;
     int currentDataFileIndex = 0;
 
+    CurrentExtractor CurrentExtractor;
+    int currentFolderIndex;
     ExtractionJob? activeJob;
     ExtractResult result;
     string? jobError;
+
     bool openResultsNext;
     bool openUnsupportedNext;
+
+    MusicExtractorWindow musicExtractor = new MusicExtractorWindow();
+    MovieExtractorWindow movieExtractor = new MovieExtractorWindow();
 
     public void Render()
     {
         ImGui.PushFont(glRD.MainFont);
         ImGui.Text(pathTemplate + FileLoader.Instance.CurrentIsoPath);
         ImGui.SameLine();
+
         if (ImGui.Button("Load ISO"))
         {
             DialogResult result;
@@ -36,143 +46,115 @@ public class ExtractorWindow
         }
         if (FileLoader.Instance.IsIsoLoaded)
         {
-            ImGui.Text("Data Files");
-            ImGui.Combo("##data", ref currentDataFileIndex, FileLoader.Instance.iso_data_files, FileLoader.Instance.iso_data_files.Length);
-
-            ImGui.Text("Destination path " + destinationPath);
-            ImGui.SameLine();
-            if (ImGui.Button("Destination Folder"))
+            ImGui.Text("Folder To Extract from");
+            if (ImGui.Combo("##Folder", ref currentFolderIndex, FileLoader.Instance.folderNames, FileLoader.Instance.folderNames.Length))
             {
-                DialogResult dialogResult = Dialog.FolderPicker(Program.config.lastExtractPath);
-                if (dialogResult.IsOk)
+                CurrentExtractor = (CurrentExtractor)currentFolderIndex;
+            }
+
+            ImGui.Text("Current extractor: " + CurrentExtractor);
+            ImGui.Separator();
+            switch (CurrentExtractor)
+            {
+                case CurrentExtractor.Data:
+                    RenderDataExtractor();
+                    break;
+                case CurrentExtractor.Movie:
+                    movieExtractor.Render();
+                    break;
+                case CurrentExtractor.Sound:
+                    musicExtractor.Render();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+            if (CurrentExtractor != CurrentExtractor.Sound)
+            {
+                musicExtractor.StopMusic();
+            }
+            if (ImGui.BeginPopupModal("No Destination", ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                ImGui.Text("Please select a destination folder");
+
+                if (ImGui.Button("Close"))
                 {
-                    destinationPath = dialogResult.Path;
-                    Program.config.lastExtractPath = destinationPath;
+                    ImGui.CloseCurrentPopup();
+                }
+
+                ImGui.EndPopup();
+            }
+            if (ImGui.BeginPopupModal("UnsupportedFile", ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                ImGui.Text("Currently unsupported file type");
+
+                if (ImGui.Button("Close"))
+                {
+                    ImGui.CloseCurrentPopup();
+                }
+
+                ImGui.EndPopup();
+            }
+            if (ImGui.BeginPopupModal("Results", ImGuiWindowFlags.AlwaysAutoResize))
+            {
+                if (jobError != null)
+                {
+                    ImGui.Text("Extraction failed:");
+                    ImGui.TextWrapped(jobError);
                 }
                 else
                 {
-                    ImGui.OpenPopup("Error");
-                }
-            }
-            ImGui.Text("Wordlist: " + wordlistPath);
-            ImGui.SameLine();
-            if (ImGui.Button("Load Wordlist"))
-            {
-                DialogResult dialogResult = Dialog.FileOpen("txt", Path.GetDirectoryName(Program.config.lastWordlistPath));
-                
-                if (dialogResult.IsOk)
-                {
-                    wordlistPath = dialogResult.Path;
-                    Program.config.lastWordlistPath = wordlistPath;
-                }
-                else
-                {
-                    ImGui.OpenPopup("Error");
-                }
-            }
-
-            bool busy = activeJob != null;
-            if (busy) ImGui.BeginDisabled();
-            if (ImGui.Button("Extract"))
-            {
-                if (destinationPath != string.Empty && Directory.Exists(destinationPath))
-                {
-                    StartExtraction();
-                    ImGui.OpenPopup("Extracting");
-                }
-            }
-            if (busy) ImGui.EndDisabled();
-        }
-
-        DrawProgressModal();
-
-        if (openResultsNext)
-        {
-            openResultsNext = false;
-            ImGui.OpenPopup("Results");
-        }
-        if (openUnsupportedNext)
-        {
-            openUnsupportedNext = false;
-            ImGui.OpenPopup("UnsupportedFile");
-        }
-
-        if (ImGui.BeginPopupModal("Error", ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            ImGui.Text("Please select a valid file/folder");
-
-            if (ImGui.Button("Close"))
-            {
-                ImGui.CloseCurrentPopup();
-            }
-
-            ImGui.EndPopup();
-        }
-        if (ImGui.BeginPopupModal("UnsupportedFile", ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            ImGui.Text("Currently unsupported file type");
-
-            if (ImGui.Button("Close"))
-            {
-                ImGui.CloseCurrentPopup();
-            }
-
-            ImGui.EndPopup();
-        }
-        if (ImGui.BeginPopupModal("Results", ImGuiWindowFlags.AlwaysAutoResize))
-        {
-            if (jobError != null)
-            {
-                ImGui.Text("Extraction failed:");
-                ImGui.TextWrapped(jobError);
-            }
-            else
-            {
-                ImGui.Text($"Results: {result.Total} {result.Kind.ToString()} files found \nSucceed: {result.Written}\nFailed: {result.Failed}");
-                if (result.Failures.Count > 0)
-                {
-                    ImGui.Separator();
-                    ImGui.Text("Failures:");
-                    if (ImGui.BeginChild("failures", new System.Numerics.Vector2(420, 160)))
+                    ImGui.Text($"Results: {result.Total} {result.Kind.ToString()} files found \nSucceed: {result.Written}\nFailed: {result.Failed}");
+                    if (result.Failures.Count > 0)
                     {
-                        foreach (var f in result.Failures)
-                            ImGui.TextWrapped($"slot {f.Slot} ({f.Name}): {f.Reason}");
+                        ImGui.Separator();
+                        ImGui.Text("Failures:");
+                        if (ImGui.BeginChild("failures", new System.Numerics.Vector2(420, 160)))
+                        {
+                            foreach (var f in result.Failures)
+                                ImGui.TextWrapped($"slot {f.Slot} ({f.Name}): {f.Reason}");
+                        }
+                        ImGui.EndChild();
                     }
-                    ImGui.EndChild();
                 }
-            }
 
-            if (ImGui.Button("Close"))
-            {
-                ImGui.CloseCurrentPopup();
-            }
+                if (ImGui.Button("Close"))
+                {
+                    ImGui.CloseCurrentPopup();
+                }
 
-            ImGui.EndPopup();
+                ImGui.EndPopup();
+            }
         }
         ImGui.PopFont();
     }
 
-    void StartExtraction()
+    void StartDataExtraction(string[] fileList, int index)
     {
         jobError = null;
-        string currentFile = FileLoader.Instance.iso_data_files[currentDataFileIndex];
+        string currentFile = fileList[index];
         byte[] fileBytes = FileLoader.Instance.GetFileBytesFromDisk(currentFile);
         string stem = Path.GetFileNameWithoutExtension(currentFile);
         IList<string>? names = LoadWordlist();
-        activeJob = ExtractionJob.Start(fileBytes, destinationPath, stem, names);
+        activeJob = ExtractionJob.Start(fileBytes, dataDestinationPath, stem, names);
     }
 
     IList<string>? LoadWordlist()
     {
-        if (string.IsNullOrEmpty(wordlistPath) || !File.Exists(wordlistPath))
+        if (string.IsNullOrEmpty(dataWordlistPath) || !File.Exists(dataWordlistPath))
+        {
             return null;
+        }
+
         try
         {
-            var lines = File.ReadAllLines(wordlistPath);
-            var cleaned = new List<string>(lines.Length);
-            foreach (var raw in lines)
-                cleaned.Add(raw.Trim());
-            return cleaned;
+            var lines = File.ReadAllLines(dataWordlistPath);
+            var trimmed = new List<string>(lines.Length);
+            foreach (var line in lines)
+            {
+                trimmed.Add(line.Trim());
+            }
+
+            return trimmed;
         }
         catch
         {
@@ -199,11 +181,15 @@ public class ExtractorWindow
             ImGui.ProgressBar(frac, new System.Numerics.Vector2(300, 0));
 
             if (prog.IsCancellationRequested)
+            {
                 ImGui.TextDisabled("Cancelling...");
-
+            }
+            
             if (ImGui.Button("Cancel"))
+            {
                 activeJob.RequestCancel();
-
+            }
+            
             if (activeJob.IsCompleted)
             {
                 if (activeJob.IsFaulted)
@@ -226,4 +212,97 @@ public class ExtractorWindow
             ImGui.EndPopup();
         }
     }
+
+
+    void RenderDataExtractor()
+    {
+        ImGui.Combo("##data", ref currentDataFileIndex, FileLoader.Instance.iso_data_files_supported, FileLoader.Instance.iso_data_files_supported.Length);
+
+        if (ImGui.Button("Destination Folder"))
+        {
+            DialogResult dialogResult = Dialog.FolderPicker(Program.config.lastDataExtractPath);
+            if (dialogResult.IsOk)
+            {
+                dataDestinationPath = dialogResult.Path;
+                Program.config.lastDataExtractPath = dataDestinationPath;
+            }
+            else
+            {
+                ImGui.OpenPopup("Error");
+            }
+        }
+        ImGui.SameLine();
+        ImGui.Text(dataDestinationPath);
+
+        if (ImGui.Button("Load Wordlist"))
+        {
+            DialogResult dialogResult = Dialog.FileOpen("txt", Path.GetDirectoryName(Program.config.lastWordlistPath));
+
+            if (dialogResult.IsOk)
+            {
+                dataWordlistPath = dialogResult.Path;
+                Program.config.lastWordlistPath = dataWordlistPath;
+            }
+            else
+            {
+                ImGui.OpenPopup("Error");
+            }
+
+
+        }
+        ImGui.SameLine();
+        ImGui.Text(dataWordlistPath);
+
+        bool busy = activeJob != null;
+        if (busy) ImGui.BeginDisabled();
+        if (ImGui.Button("Extract"))
+        {
+            if (dataDestinationPath != string.Empty && Directory.Exists(dataDestinationPath))
+            {
+                StartDataExtraction(FileLoader.Instance.iso_data_files_supported, currentDataFileIndex);
+                ImGui.OpenPopup("Extracting");
+            }
+            else
+            {
+                ImGui.OpenPopup("No Destination");
+            }
+
+        }
+        if (busy) ImGui.EndDisabled();
+
+
+        DrawProgressModal();
+        if (openResultsNext)
+        {
+            openResultsNext = false;
+            ImGui.OpenPopup("Results");
+        }
+
+        if (openUnsupportedNext)
+        {
+            openUnsupportedNext = false;
+            ImGui.OpenPopup("UnsupportedFile");
+        }
+
+        if (ImGui.BeginPopupModal("Error", ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            ImGui.Text("Please select a valid file/folder");
+
+            if (ImGui.Button("Close"))
+            {
+                ImGui.CloseCurrentPopup();
+            }
+
+            ImGui.EndPopup();
+        }
+
+
+    }
+}
+
+enum CurrentExtractor
+{
+    Data,
+    Movie,
+    Sound
 }

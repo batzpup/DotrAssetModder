@@ -88,7 +88,7 @@ public class TextureEditorWindow : IDisposable
         string comboLabel = string.IsNullOrEmpty(selectedMrgName) ? "Pick MRG..." : selectedMrgName;
         if (ImGui.BeginCombo("##mrg", comboLabel))
         {
-            foreach (var name in TextureSlotManager.KnownRh2Names)
+            foreach (var name in TextureSlotManager.Rh2MrgNames)
             {
                 if (!TextureSlotManager.IsoHasFile(name))
                 {
@@ -145,7 +145,7 @@ public class TextureEditorWindow : IDisposable
                 ImGui.SameLine();
             }
             ImGui.PushID(i);
-            ImGui.Image((IntPtr)slots[i].Thumb.Id, new Vector2(thumb, thumb));
+            ImGui.Image((IntPtr)slots[i].Thumbnail.Id, new Vector2(thumb, thumb));
             if (ImGui.IsItemHovered())
             {
                 ImGui.SetTooltip($"Slot {i}  {slots[i].Width}x{slots[i].Height}");
@@ -950,9 +950,9 @@ public class TextureEditorWindow : IDisposable
         TextureSlotManager.PatchMrg(mrgBytes, slots, currentIndex, newSlotBytes);
 
         var newThumb = TextureSlotManager.BitmapToTexture(canvas.Bitmap);
-        Raylib.UnloadTexture(slots[currentIndex].Thumb);
+        Raylib.UnloadTexture(slots[currentIndex].Thumbnail);
         slots[currentIndex].Bytes = newSlotBytes;
-        slots[currentIndex].Thumb = newThumb;
+        slots[currentIndex].Thumbnail = newThumb;
 
         try
         {

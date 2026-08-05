@@ -15,10 +15,8 @@ public class ModelViewerWindow
     string loadError = null;
 
 
-    string modelFolderPath = null;
     string[] modelFiles = Array.Empty<string>();
-    int currentModelIndex = -1;
-    int modelIdInputBuffer = 1;
+    int currentModelIndex = 0;
 
 
     const float FPS = 30f;
@@ -106,7 +104,6 @@ public class ModelViewerWindow
             return;
         }
 
-        modelFolderPath = folderPath;
         modelFiles = files;
         Program.config.lastModelFolderPath = folderPath;
 
@@ -125,8 +122,6 @@ public class ModelViewerWindow
     {
         if (modelFiles.Length == 0) return;
         index = Math.Clamp(index, 0, modelFiles.Length - 1);
-        if (index == currentModelIndex && modelLoaded) return;
-        currentModelIndex = index;
         LoadModel(modelFiles[index]);
     }
 
@@ -317,26 +312,31 @@ public class ModelViewerWindow
         }
 
         if (loadError != null)
+        {
             ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Load failed: " + loadError);
+        }
+
+
 
         if (modelFiles.Length > 0)
         {
             ImGui.Separator();
             ImGui.SetNextItemWidth(80);
-            ImGui.InputInt("Model ID", ref modelIdInputBuffer);
+            if (ImGui.InputInt($"{currentModelIndex}/{modelFiles.Length - 1} {Path.GetFileName(modelFiles[Math.Max(currentModelIndex, 0)])}", ref currentModelIndex))
             {
-                if (ImGui.IsItemDeactivatedAfterEdit())
+                if (currentModelIndex > modelFiles.Length - 1)
                 {
-                    GoToModelIndex(modelIdInputBuffer - 1);
+                    currentModelIndex = 0;
                 }
+                if (currentModelIndex < 0)
+                {
+                    currentModelIndex = modelFiles.Length - 1;
+                }
+                GoToModelIndex(currentModelIndex);
 
-                if (!ImGui.IsItemActive())
-                {
-                    modelIdInputBuffer = currentModelIndex + 1;
-                }
             }
-            ImGui.SameLine();
-            ImGui.Text($"({currentModelIndex + 1} / {modelFiles.Length})  {Path.GetFileName(modelFiles[Math.Max(currentModelIndex, 0)])}");
+
+
         }
 
         if (ImGui.Button("Reset View"))
@@ -360,15 +360,10 @@ public class ModelViewerWindow
             ImGui.SetTooltip("WASD to move, space and left Ctrl to go up and down\nleft click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
         }
 
-
-
-
         bool hasSkel = modelLoaded && model.AnimationCount > 0;
-
         if (hasSkel)
         {
             ImGui.Separator();
-
 
             if (ImGui.Checkbox("Static pose (no animation)", ref staticPose))
             {
@@ -379,7 +374,10 @@ public class ModelViewerWindow
             {
                 ImGui.SameLine();
                 if (ImGui.Button(animPlaying ? "Pause" : "Play"))
+                {
                     animPlaying = !animPlaying;
+                }
+
                 ImGui.SameLine();
                 if (ImGui.Button("Stop"))
                 {
@@ -401,9 +399,6 @@ public class ModelViewerWindow
                     animPlaying = true;
                     needsAnimUpdate = true;
                 }
-
-
-
 
                 float dur = model.Duration(currentAnim);
                 int lastFrame = (int)MathF.Round(dur * FPS);
@@ -451,7 +446,9 @@ public class ModelViewerWindow
         if (ImGui.IsWindowHovered() || resetPressed)
         {
             if (resetPressed)
+            {
                 resetPressed = false;
+            }
             UpdateCamera();
         }
 
@@ -464,10 +461,15 @@ public class ModelViewerWindow
         Raylib.BeginMode3D(camera);
         Rlgl.SetClipPlanes(clipNear, clipFar);
         if (showgrid)
-            Raylib.DrawGrid(200, 10f);
+        {
+            Raylib.DrawGrid(200, 10f);   
+        }
+         
 
         if (modelLoaded)
+        {
             model.Draw();
+        }
 
         Raylib.EndMode3D();
         Raylib.EndTextureMode();

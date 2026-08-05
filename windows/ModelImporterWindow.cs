@@ -52,14 +52,14 @@ public class ModelImporterWindow
     {
         var fl = FileLoader.Instance;
 
-        if (!fl.IsIsoLoaded || fl.iso_data_files == null)
+        if (!fl.IsIsoLoaded || fl.iso_data_files_all == null)
         {
             ImGui.TextDisabled("Load an ISO first.");
             return;
         }
         if (!hasMonster)
         {
-            monsterPath = fl.iso_data_files[5];
+            monsterPath = fl.iso_data_files_all[5];
         }
 
         if (ImGui.Button("Load GLB"))

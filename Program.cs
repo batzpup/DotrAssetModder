@@ -42,10 +42,11 @@ class Program
     {
         public const string configName = "config.json";
         public string lastIsoPath { get; set; }
-        public string lastWordlistPath { get; set; } 
-        public string lastModelImportPath { get; set; } 
-        public string lastExtractPath { get; set; }
+        public string lastWordlistPath { get; set; }
+        public string lastModelImportPath { get; set; }
+        public string lastDataExtractPath { get; set; }
         public string lastModelFolderPath { get; set; }
+        public string lastMovieExtractPath { get; set; }
 
         static string PathName =>
             Path.Combine(AppContext.BaseDirectory, configName);

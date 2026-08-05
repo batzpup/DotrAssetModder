@@ -12,6 +12,7 @@ public class MainWindow
     TextureEditorWindow texture_window;
     ModelViewerWindow model_window;
     ModelImporterWindow import_window;
+    MusicExtractorWindow music_window;
 
 
     public enum Windows
@@ -20,6 +21,7 @@ public class MainWindow
         TextureView,
         ModelView,
         ModelImporter,
+        Music
     }
 
     public MainWindow()
@@ -65,6 +67,7 @@ public class MainWindow
 
             }
         }
+        
         ImGui.PushFont(glRD.MainFont);
         ImGui.SetNextWindowSize(glRD.cur_win_dims);
         ImGui.SetNextWindowPos(Vector2.Zero);
@@ -105,11 +108,14 @@ public class MainWindow
                 import_window.Render();
                 ImGui.EndTabItem();
             }
+         
             ImGui.EndTabBar();
         }
+        
 
         ImGui.PopStyleColor(2);
         ImGui.PopFont();
         ImGui.End();
+        
     }
 }

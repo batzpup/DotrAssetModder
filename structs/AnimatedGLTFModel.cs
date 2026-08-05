@@ -62,8 +62,10 @@ public sealed class AnimatedGltfModel : IDisposable
         public Color Tint = Color.White;
         public bool HasTexture;
         public Texture2D Texture;
-        public bool Additive;       // black-background glow sprite -> additive blend
-        public bool AlphaBlend;     // glTF alphaMode BLEND -> alpha blend
+        public bool Additive;       // DOTR GS (Cs - 0) * As + Cd
+        public bool AlphaBlend;     // ordinary source-alpha transparency
+        public bool AlphaMask;      // PS2 alpha-test/cutout material
+        public float AlphaCutoff = 0.5f;
         public bool Uploaded;
 
         // Texture animation (DOTR_texAnim extras): cycled base-color frames.
@@ -79,8 +81,26 @@ public sealed class AnimatedGltfModel : IDisposable
     readonly List<Renderable> _all = new();
 
     RlMaterial _drawMaterial;
+    Raylib_cs.Shader _defaultShader;
+    Raylib_cs.Shader _alphaMaskShader;
     Texture2D _whiteTex;
     bool _hasDrawMaterial;
+    bool _hasAlphaMaskShader;
+
+    private const string AlphaMaskFragmentShader = @"#version 330
+        in vec2 fragTexCoord;
+        in vec4 fragColor;
+        out vec4 finalColor;
+
+        uniform sampler2D texture0;
+        uniform vec4 colDiffuse;
+
+        void main()
+        {
+            vec4 color = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
+            if (color.a < 0.5) discard;
+            finalColor = vec4(color.rgb, 1.0);
+        }";
 
     Vector3[] _scratch = Array.Empty<Vector3>(); // reused world-position buffer
     Vector3 _center;
@@ -171,6 +191,9 @@ public sealed class AnimatedGltfModel : IDisposable
         }
 
         _drawMaterial = Raylib.LoadMaterialDefault();
+        _defaultShader = _drawMaterial.Shader;
+        _alphaMaskShader = Raylib.LoadShaderFromMemory(null, AlphaMaskFragmentShader);
+        _hasAlphaMaskShader = _alphaMaskShader.Id != 0;
         _hasDrawMaterial = true;
         unsafe { _whiteTex = _drawMaterial.Maps[(int)MaterialMapIndex.Albedo].Texture; }
     }
@@ -255,10 +278,28 @@ public sealed class AnimatedGltfModel : IDisposable
         return r;
     }
 
-    void BuildMaterial(GltfMaterial mat, Renderable r)
+    void BuildMaterial(GltfMaterial? mat, Renderable r)
     {
-        // Default blend from glTF; may be promoted to additive if the texture is a glow-on-black sprite.
-        r.AlphaBlend = mat != null && mat.Alpha == AlphaMode.BLEND;
+        // New extractor output carries the actual per-page PS2 GS state. Explicit
+        // "opaque" is important too: every embedded image is RGBA, so neither image
+        // format nor glTF-library inference should move an opaque monster into the
+        // transparent no-depth-write pass.
+        bool hasDotrBlend = TryReadDotrBlendInfo(mat, out string? dotrBlend, out float alphaCutoff);
+        r.AlphaCutoff = alphaCutoff;
+
+        if (hasDotrBlend)
+        {
+            r.Additive = string.Equals(dotrBlend, "additive", StringComparison.OrdinalIgnoreCase);
+            r.AlphaBlend = string.Equals(dotrBlend, "alpha", StringComparison.OrdinalIgnoreCase);
+            r.AlphaMask = string.Equals(dotrBlend, "mask", StringComparison.OrdinalIgnoreCase);
+        }
+        else
+        {
+            // Backward compatibility for older/non-DOTR glTF files.
+            r.Additive = false;
+            r.AlphaBlend = mat != null && mat.Alpha == AlphaMode.BLEND;
+            r.AlphaMask = mat != null && mat.Alpha == AlphaMode.MASK;
+        }
 
         Vector4 color = Vector4.One;
         if (mat != null)
@@ -272,6 +313,11 @@ public sealed class AnimatedGltfModel : IDisposable
             }
             catch { }
         }
+        // Explicit opaque state must ignore any accidental/default alpha carried by
+        // a generic glTF material conversion. Additive/alpha/mask materials retain it.
+        if (hasDotrBlend && string.Equals(dotrBlend, "opaque", StringComparison.OrdinalIgnoreCase))
+            color.W = 1f;
+
         r.Tint = new Color(
             (byte)(Math.Clamp(color.X, 0f, 1f) * 255f),
             (byte)(Math.Clamp(color.Y, 0f, 1f) * 255f),
@@ -293,10 +339,6 @@ public sealed class AnimatedGltfModel : IDisposable
                     RlImage cpu = Raylib.LoadImage(tmp);
                     if (cpu.Width > 0 && cpu.Height > 0)
                     {
-                        // Glow sprites (orange-on-black eyes, auras) are composited additively
-                        // in the original game; the export marks them OPAQUE/BLEND, but the black
-                        // background must contribute nothing. Detect and switch to additive.
-                        if (IsMostlyBlack(cpu)) { r.Additive = true; r.AlphaBlend = false; }
                         r.Texture = Raylib.LoadTextureFromImage(cpu);
                         r.HasTexture = r.Texture.Id != 0;
                         Raylib.UnloadImage(cpu);
@@ -310,10 +352,40 @@ public sealed class AnimatedGltfModel : IDisposable
         LoadTextureAnimation(mat, r);
     }
 
+    static bool TryReadDotrBlendInfo(GltfMaterial? mat, out string? mode, out float alphaCutoff)
+    {
+        mode = null;
+        alphaCutoff = 0.5f;
+        try
+        {
+            if (mat?.Extras is not JsonObject extras) return false;
+
+            if (extras["DOTR_blend"] is JsonObject blend)
+            {
+                mode = blend["mode"]?.GetValue<string>();
+                alphaCutoff = blend["alphaCutoff"]?.GetValue<float>() ?? 0.5f;
+                alphaCutoff = Math.Clamp(alphaCutoff, 0f, 1f);
+                if (!string.IsNullOrWhiteSpace(mode)) return true;
+            }
+
+            // Compatibility with the previous extractor revision, which stored
+            // an additive hint inside DOTR_texAnim instead of full GS metadata.
+            if (extras["DOTR_texAnim"] is JsonObject texAnim)
+            {
+                mode = texAnim["blend"]?.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(mode)) return true;
+            }
+        }
+        catch { }
+        mode = null;
+        alphaCutoff = 0.5f;
+        return false;
+    }
+
     // Reads the DOTR_texAnim extras block written by the extractor and turns each
     // referenced glTF image into a Raylib texture. At draw time the matching frame
     // for the current wall-clock time is bound instead of the static base texture.
-    void LoadTextureAnimation(GltfMaterial mat, Renderable r)
+    void LoadTextureAnimation(GltfMaterial? mat, Renderable r)
     {
         try
         {
@@ -365,24 +437,6 @@ public sealed class AnimatedGltfModel : IDisposable
             }
         }
         catch { }
-    }
-
-    static unsafe bool IsMostlyBlack(RlImage img)
-    {
-        Color* px = Raylib.LoadImageColors(img);
-        if (px == null) return false;
-        int n = img.Width * img.Height;
-        if (n <= 0) { Raylib.UnloadImageColors(px); return false; }
-        int step = Math.Max(1, n / 4096);
-        int dark = 0, samples = 0;
-        for (int i = 0; i < n; i += step)
-        {
-            Color c = px[i];
-            if (c.R + c.G + c.B < 48) dark++; // ~near-black
-            samples++;
-        }
-        Raylib.UnloadImageColors(px);
-        return samples > 0 && dark * 100 / samples >= 45;
     }
 
     // Walks the SceneInstance in order, pairing each drawable with its prebuilt renderables.
@@ -488,15 +542,40 @@ public sealed class AnimatedGltfModel : IDisposable
 
         Rlgl.DisableBackfaceCulling();
 
-        // Pass 1: opaque geometry (writes depth).
+        // Pass 1: explicitly opaque geometry only (writes depth).
         foreach (var r in _all)
         {
-            if (r.Additive || r.AlphaBlend) continue;
+            if (r.Additive || r.AlphaBlend || r.AlphaMask) continue;
             DrawOne(r);
         }
 
-        // Pass 2: transparent layers (glow sprites, alpha decals) on top, no depth write
-        // so they don't occlude each other; additive black backgrounds vanish.
+        // Pass 2: alpha-tested cutouts. The shader discards transparent texels,
+        // while visible texels write depth normally. This is required for flipbook
+        // sprites such as Electromagnetic Bagworm: geometry behind the visible part
+        // must not show through, but geometry behind discarded background pixels can.
+        if (_hasAlphaMaskShader)
+        {
+            _drawMaterial.Shader = _alphaMaskShader;
+            foreach (var r in _all)
+            {
+                if (!r.AlphaMask) continue;
+                DrawOne(r);
+            }
+            _drawMaterial.Shader = _defaultShader;
+        }
+        else
+        {
+            // Fallback for systems where the mask shader failed to load.
+            foreach (var r in _all)
+            {
+                if (!r.AlphaMask) continue;
+                Raylib.BeginBlendMode(BlendMode.Alpha);
+                DrawOne(r);
+                Raylib.EndBlendMode();
+            }
+        }
+
+        // Pass 3: true translucent and additive geometry does not write depth.
         Rlgl.DisableDepthMask();
         foreach (var r in _all)
         {
@@ -558,6 +637,11 @@ public sealed class AnimatedGltfModel : IDisposable
                     Raylib.UnloadTexture(r.Texture);
                 }
             }
+        }
+        if (_hasAlphaMaskShader)
+        {
+            Raylib.UnloadShader(_alphaMaskShader);
+            _hasAlphaMaskShader = false;
         }
         _all.Clear();
         _byDrawable.Clear();

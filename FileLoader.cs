@@ -3,14 +3,20 @@ namespace DotrAssetModder;
 
 public class FileLoader : IDisposable
 {
-    public static FileLoader instance; 
+    public static FileLoader instance;
 
     public string CurrentIsoPath = string.Empty;
     static readonly object FileStreamLock = new object();
-    static FileStream fileStream;
-    public string[] iso_data_files;
+    public FileStream fileStream;
     public bool IsIsoLoaded = false;
 
+
+    public string[] folderNames = ["DATA", "MOVIE", "SOUND"];
+    public string[] iso_data_files_all;
+    public string[] iso_data_files_supported;
+    string[] unsupportedDataDefaults = ["BMODULE.MRG;1", "CMODULE.MRG;1", "MMODULE.MRG;1", "STAGECAM.MRG;1"];
+
+    public string[] MovieNames; 
     public void OpenIso(string filePath)
     {
         CurrentIsoPath = filePath;
@@ -26,7 +32,21 @@ public class FileLoader : IDisposable
             );
 
             CDReader iso = new CDReader(fileStream, true);
-            iso_data_files = iso.GetFiles("DATA");
+            
+            
+            iso_data_files_all = iso.GetFiles("DATA");
+            List<string> supportedFiles = new List<string>();
+            foreach (var file in iso_data_files_all)
+            {
+                if (!unsupportedDataDefaults.Contains(file.Substring(5)))
+                {
+                    supportedFiles.Add(file);
+                }
+            }
+            iso_data_files_supported = supportedFiles.ToArray();
+            supportedFiles.Clear();
+            
+            MovieNames = iso.GetFiles("MOVIE");
         }
         IsIsoLoaded = true;
     }
@@ -36,7 +56,10 @@ public class FileLoader : IDisposable
         lock (FileStreamLock)
         {
             if (fileStream is null)
+            {
                 throw new InvalidOperationException("No ISO loaded");
+            }
+
             var iso = new CDReader(fileStream, true);
             using Stream file = iso.OpenFile(path, FileMode.Open);
             var buffer = new byte[file.Length];
@@ -46,8 +69,8 @@ public class FileLoader : IDisposable
     }
 
     // ---- model import support ----------------------------------------------------------
-    const uint Rh0Magic = 0x00304852;            // "RH0\0"
-    const int  ModelBlock = 0x100000;            // 1 MiB per RH0 block
+    const uint Rh0Magic = 0x00304852; // "RH0\0"
+    const int ModelBlock = 0x100000; // 1 MiB per RH0 block
     static readonly Dictionary<string, long> _baseCache = new();
 
     // Number of 1 MiB RH0 model blocks in a DATA .MRG (for the import index slider).
@@ -58,7 +81,8 @@ public class FileLoader : IDisposable
             return (data.Length >= 4 && BitConverter.ToUInt32(data, 0) == Rh0Magic) ? 1 : 0;
         int count = 0;
         for (long o = 0; o + 4 <= data.Length; o += ModelBlock)
-            if (BitConverter.ToUInt32(data, (int)o) == Rh0Magic) count++;
+            if (BitConverter.ToUInt32(data, (int)o) == Rh0Magic)
+                count++;
         return count;
     }
 
@@ -81,13 +105,14 @@ public class FileLoader : IDisposable
     long FindFileBaseOffset(string path)
     {
         lock (FileStreamLock)
-            if (_baseCache.TryGetValue(path, out long hit)) return hit;
+            if (_baseCache.TryGetValue(path, out long hit))
+                return hit;
 
-        byte[] content = GetFileBytesFromDisk(path);   // takes the lock itself
+        byte[] content = GetFileBytesFromDisk(path); // takes the lock itself
 
         lock (FileStreamLock)
         {
-            long found = SearchRawImage(content);       // lock held
+            long found = SearchRawImage(content); // lock held
             if (found >= 0) _baseCache[path] = found;
             return found;
         }
@@ -123,7 +148,12 @@ public class FileLoader : IDisposable
                     fileStream.Seek(cand, SeekOrigin.Begin);
                     fileStream.ReadExactly(vbuf, 0, verifyLen);
                     bool ok = true;
-                    for (int k = 0; k < verifyLen; k++) if (vbuf[k] != content[k]) { ok = false; break; }
+                    for (int k = 0; k < verifyLen; k++)
+                        if (vbuf[k] != content[k])
+                        {
+                            ok = false;
+                            break;
+                        }
                     if (ok) return cand;
                 }
             }
@@ -163,7 +193,7 @@ public class FileLoader : IDisposable
         {
             fileStream?.Dispose();
             fileStream = null;
-            iso_data_files = null;
+            iso_data_files_all = null;
             IsIsoLoaded = false;
             CurrentIsoPath = string.Empty;
         }

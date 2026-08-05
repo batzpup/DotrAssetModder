@@ -12,16 +12,16 @@ public enum TextureMrgKind
 public sealed class TextureSlot
 {
     public byte[] Bytes;
-    public Texture2D Thumb;
+    public Texture2D Thumbnail;
     public int Width;
     public int Height;
     public TextureMrgKind Kind;
     public int IconIndex;
 
-    public TextureSlot(byte[] bytes, Texture2D thumb, int width, int height, TextureMrgKind kind, int iconIndex = -1)
+    public TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1)
     {
         Bytes = bytes;
-        Thumb = thumb;
+        Thumbnail = thumbnail;
         Width = width;
         Height = height;
         Kind = kind;
@@ -31,7 +31,7 @@ public sealed class TextureSlot
 
 public static class TextureSlotManager
 {
-    static readonly string[] Rh2MrgNames = {
+    public static readonly string[] Rh2MrgNames = {
         "PICTURE.MRG", "PICMINI.MRG", "PICPACK.MRG",
         "TEXANM.MRG", "TEXEFF.MRG", "TEXETC.MRG", "TEXEVE.MRG", "TEXSYS.MRG",
         "MODEL.MRG", "MONSTER.MRG",
@@ -41,16 +41,16 @@ public static class TextureSlotManager
     public const string PictureMrg = "PICTURE.MRG";
     public const string PicMiniMrg = "PICMINI.MRG";
 
-    public static IReadOnlyList<string> KnownRh2Names => Rh2MrgNames;
+    
 
     public static bool IsoHasFile(string name)
     {
-        return FileLoader.Instance.iso_data_files?.Any(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase)) == true;
+        return FileLoader.Instance.iso_data_files_all?.Any(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase)) == true;
     }
 
     public static string IsoPath(string name)
     {
-        return FileLoader.Instance.iso_data_files.First(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase));
+        return FileLoader.Instance.iso_data_files_all.First(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase));
     }
 
     public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes)
@@ -65,11 +65,11 @@ public static class TextureSlotManager
                 if (dec.IsEmpty)
                     continue;
                 var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
-                var thumb = BitmapToTexture(bmp);
+                var thumbnail = BitmapToTexture(bmp);
                 bmp.Dispose();
                 int next = offsets.Count > slots.Count + 1 ? (int)offsets[slots.Count + 1] : mrgBytes.Length;
                 var slotBytes = mrgBytes.AsSpan((int)off, next - (int)off).ToArray();
-                slots.Add(new TextureSlot(slotBytes, thumb, dec.Width, dec.Height, TextureMrgKind.Rh2));
+                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2));
             }
             catch (Exception ex)
             {
@@ -90,15 +90,18 @@ public static class TextureSlotManager
                 ? PS2Icon.TextureOffsets[i + 1] - off
                 : mrgBytes.Length - off;
             if (off + len > mrgBytes.Length)
-                break;
+            {
+                break;   
+            }
+             
             try
             {
                 var slotBytes = mrgBytes.AsSpan(off, len).ToArray();
                 var bmp = PS2Icon.ExtractIconTexture(slotBytes);
-                var thumb = BitmapToTexture(bmp);
+                var thumbnail = BitmapToTexture(bmp);
                 int w = bmp.Width, h = bmp.Height;
                 bmp.Dispose();
-                slots.Add(new TextureSlot(slotBytes, thumb, w, h, TextureMrgKind.Icon, i));
+                slots.Add(new TextureSlot(slotBytes, thumbnail, w, h, TextureMrgKind.Icon, i));
             }
             catch (Exception ex)
             {
@@ -127,7 +130,9 @@ public static class TextureSlotManager
     public static byte[] EncodeSlot(TextureSlot slot, SKBitmap bitmap)
     {
         if (slot.Kind == TextureMrgKind.Icon)
+        {
             return PS2Icon.SaveIconToByte(slot.Bytes, bitmap);
+        }
         byte[] rgba = BitmapToRgba(bitmap);
         return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height);
     }
@@ -135,7 +140,10 @@ public static class TextureSlotManager
     public static byte[] EncodeSlotOctree(TextureSlot slot, SKBitmap bitmap)
     {
         if (slot.Kind == TextureMrgKind.Icon)
+        {
             return PS2Icon.SaveIconToByte(slot.Bytes, bitmap);
+        }
+
         byte[] rgba = BitmapToRgba(bitmap);
         rgba = OctreePreQuantise(rgba, bitmap.Width * bitmap.Height);
         return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height);
@@ -164,7 +172,7 @@ public static class TextureSlotManager
 
     public static Texture2D RefreshThumb(TextureSlot slot, SKBitmap fromBitmap)
     {
-        Raylib.UnloadTexture(slot.Thumb);
+        Raylib.UnloadTexture(slot.Thumbnail);
         return BitmapToTexture(fromBitmap);
     }
 
@@ -192,12 +200,17 @@ public static class TextureSlotManager
         {
             var q = new Quantizer(256);
             for (int i = 0; i < pixelCount; i++)
+            {
                 q.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+            }
             list = q.GetPalette().Select(t => new SKColor(t.R, t.G, t.B, 255)).ToList();
         }
 
         while (list.Count < 256)
+        {
             list.Add(SKColors.Black);
+        }
+
         return list;
     }
 
@@ -217,7 +230,10 @@ public static class TextureSlotManager
     {
         var q = new Quantizer(256);
         for (int i = 0; i < pixelCount; i++)
+        {
             q.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+        }
+
         var pal = q.GetPalette();
         var cache = new Dictionary<int, (byte R, byte G, byte B)>();
         var output = new byte[rgba.Length];
@@ -260,8 +276,7 @@ public static class TextureSlotManager
         var bmp = new SKBitmap(new SKImageInfo(w, h, SKColorType.Rgba8888, SKAlphaType.Unpremul));
         unsafe
         {
-            fixed (byte* src = rgba)
-                Buffer.MemoryCopy(src, (void*)bmp.GetPixels(), bmp.ByteCount, Math.Min(rgba.Length, bmp.ByteCount));
+            fixed (byte* src = rgba) Buffer.MemoryCopy(src, (void*)bmp.GetPixels(), bmp.ByteCount, Math.Min(rgba.Length, bmp.ByteCount));
         }
         return bmp;
     }
@@ -271,7 +286,9 @@ public static class TextureSlotManager
         var src = bmp.ColorType == SKColorType.Rgba8888 ? bmp : bmp.Copy(SKColorType.Rgba8888);
         var bytes = src.Bytes.ToArray();
         if (!ReferenceEquals(src, bmp))
+        {
             src.Dispose();
+        }
         return bytes;
     }
 
@@ -284,11 +301,14 @@ public static class TextureSlotManager
         Raylib.UpdateTexture(tex, (void*)src.GetPixels());
         Raylib.SetTextureFilter(tex, TextureFilter.Point);
         if (!ReferenceEquals(src, bmp))
+        {
             src.Dispose();
+        }
+
         return tex;
     }
 
-    public static Texture2D MakePlaceholderThumb()
+    public static Texture2D MakePlaceholderThumbNail()
     {
         var img = Raylib.GenImageColor(16, 16, Color.Purple);
         var tex = Raylib.LoadTextureFromImage(img);
@@ -299,7 +319,10 @@ public static class TextureSlotManager
     public static void FreeSlots(List<TextureSlot> slots)
     {
         foreach (var s in slots)
-            Raylib.UnloadTexture(s.Thumb);
+        {
+            Raylib.UnloadTexture(s.Thumbnail);
+        }
+
         slots.Clear();
     }
 }
