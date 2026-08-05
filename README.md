@@ -39,7 +39,7 @@ For the tool to work properly you must:
    - Recommend having the world pos and root at 0,0 and then adjust the pivot point.
 - RootNode->WorldPos->ModelPivot/Camera -> any number of children
 if this is not done models will appear too high or too low, the will rotate around a spot infront or behind them, camera will not look at their center.
-
+* Use extracted 3D models as a size reference
 Example:
 <img width="1991" height="1328" alt="image" src="https://github.com/user-attachments/assets/e4fedf86-7cee-4830-a6d6-93baed0ad84a" />
 
