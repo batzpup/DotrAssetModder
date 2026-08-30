@@ -72,6 +72,12 @@ public static class Rebuilder
         /// the importer's own template loader - assumes). MODEL.MRG-style variable-pack
         /// replacement should set this true, since there is no fixed slot to pad to.
         public bool TrimToContent = false;
+
+        /// Called at most once if the assembled block would overflow MaxOutputSize, for
+        /// whichever of {texture, animation} is the larger byte share - lets a caller (e.g.
+        /// the import UI) ask the user before a fidelity-reduction fallback is applied.
+        /// Null (default) keeps every fallback fully automatic, matching non-interactive use.
+        public Rh0Assembler.ConfirmReduction? ConfirmReduction = null;
     }
 
     /// Size-check outcome, for surfacing a warning in the UI. No rescaling is performed.
@@ -137,7 +143,7 @@ public static class Rebuilder
         return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
             opt.RebuildTexturesNative, opt.MaxTextureDim,
             opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation,
-            opt.TrimToContent);
+            opt.TrimToContent, opt.ConfirmReduction);
     }
 
     private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)

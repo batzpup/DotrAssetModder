@@ -7,9 +7,7 @@ namespace DotrAssetModder;
 //Based on GMS' Picture extractor
 static class TextureExtractor
 {
-    public static ExtractResult Extract(byte[] data, string outDir,
-        string stem, IList<string>? names,
-        ExtractionProgress? progress = null)
+    public static ExtractResult Extract(byte[] data, string outDir, string stem, IList<string>? names, ExtractionProgress? progress = null)
     {
         var offsets = AssetExtractor.FindAllRh2Offsets(data);
         bool haveWordlist = names is { Count: > 0 };
@@ -25,15 +23,24 @@ static class TextureExtractor
 
         Parallel.For(0, offsets.Count, popts, () => 0, (i, _, localFails) =>
         {
-            if (progress?.IsCancellationRequested == true) return localFails;
+            if (progress?.IsCancellationRequested == true)
+            {
+                return localFails;
+            }
             uint off = offsets[i];
             string fname;
             if (haveWordlist && i < names!.Count && !string.IsNullOrEmpty(names[i]))
+            {
                 fname = $"{names[i]}_{i}.png";
+            }
             else if (haveWordlist)
+            {
                 fname = $"{i}.png";
+            }
             else
+            {
                 fname = $"{stem}_{i}.png";
+            }
             bool ok = TryDecodeAndWrite(data, (int)off, outDir, fname, alphaMode);
             progress?.Increment();
             return ok ? localFails : localFails + 1;
@@ -63,14 +70,14 @@ static class TextureExtractor
     }
 }
 
-internal static class GsSwizzle
+static class GsSwizzle
 {
-    private static readonly int[] PAGE_PSMCT16 = {
+    static readonly int[] PAGE_PSMCT16 = {
         0, 2, 8, 10, 1, 3, 9, 11, 4, 6, 12, 14, 5, 7, 13, 15,
         16, 18, 24, 26, 17, 19, 25, 27, 20, 22, 28, 30, 21, 23, 29, 31,
     };
 
-    private static readonly int[] COL_PSMT4 = {
+    static readonly int[] COL_PSMT4 = {
         0, 8, 32, 40, 64, 72, 96, 104, 2, 10, 34, 42, 66, 74, 98, 106, 4, 12, 36, 44, 68, 76, 100, 108, 6, 14, 38, 46, 70, 78, 102, 110,
         16, 24, 48, 56, 80, 88, 112, 120, 18, 26, 50, 58, 82, 90, 114, 122, 20, 28, 52, 60, 84, 92, 116, 124, 22, 30, 54, 62, 86, 94, 118, 126,
         65, 73, 97, 105, 1, 9, 33, 41, 67, 75, 99, 107, 3, 11, 35, 43, 69, 77, 101, 109, 5, 13, 37, 45, 71, 79, 103, 111, 7, 15, 39, 47,
@@ -81,17 +88,17 @@ internal static class GsSwizzle
         17, 25, 49, 57, 81, 89, 113, 121, 19, 27, 51, 59, 83, 91, 115, 123, 21, 29, 53, 61, 85, 93, 117, 125, 23, 31, 55, 63, 87, 95, 119, 127,
     };
 
-    private static readonly int[] PAGE_PSMCT32 = {
+    static readonly int[] PAGE_PSMCT32 = {
         0, 1, 4, 5, 16, 17, 20, 21, 2, 3, 6, 7, 18, 19, 22, 23,
         8, 9, 12, 13, 24, 25, 28, 29, 10, 11, 14, 15, 26, 27, 30, 31,
     };
 
-    private static readonly int[] COL_PSMCT32 =
+    static readonly int[] COL_PSMCT32 =
         { 0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15 };
 
-    private const int PAGE_BITS = 65536;
-    private const int BLOCK_BITS = 2048;
-    private const int COL_BITS = 512;
+    const int PAGE_BITS = 65536;
+    const int BLOCK_BITS = 2048;
+    const int COL_BITS = 512;
 
     internal sealed class Psmt4Tables
     {
@@ -100,8 +107,8 @@ internal static class GsSwizzle
         public required int[] Inv32 { get; init; }
     }
 
-    private static Psmt4Tables? _psmt4Cache;
-    private static readonly object _psmt4Lock = new();
+    static Psmt4Tables? _psmt4Cache;
+    static readonly object _psmt4Lock = new();
 
     internal static Psmt4Tables GetPsmt4Tables()
     {
@@ -122,7 +129,7 @@ internal static class GsSwizzle
         }
     }
 
-    private static (int[] sw, int bitsW, int pxTall) Build(
+    static (int[] sw, int bitsW, int pxTall) Build(
         int blocksX, int blocksY, int pxColX, int pxColY, int bpp,
         int[] pageSw, int[] colSw)
     {
@@ -149,7 +156,7 @@ internal static class GsSwizzle
         return (sw, bitsW, pxTall);
     }
 
-    private static readonly ConcurrentDictionary<(int w, int h), int[]> _psmt4BitCache = new();
+    static readonly ConcurrentDictionary<(int w, int h), int[]> _psmt4BitCache = new();
 
     internal static int[] GetPsmt4BitIndices(int wActual, int hActual)
         => _psmt4BitCache.GetOrAdd((wActual, hActual), static key =>
@@ -172,7 +179,7 @@ internal static class GsSwizzle
             return outArr;
         });
 
-    private static readonly ConcurrentDictionary<(int bw, int bh, int w, int h), int[]> _psmt8Cache = new();
+    static readonly ConcurrentDictionary<(int bw, int bh, int w, int h), int[]> _psmt8Cache = new();
 
     internal static int[] GetPsmt8Swizzle(int blockWidth, int blockHeight, int w, int h)
         => _psmt8Cache.GetOrAdd((blockWidth, blockHeight, w, h), static key =>
@@ -362,7 +369,7 @@ static class Rh2Decoder
         return new DecodedTexture(wActual, hActual, rgba, hasAlpha);
     }
 
-    private static DecodedTexture DecodePsmt8(
+    static DecodedTexture DecodePsmt8(
         ReadOnlySpan<byte> data, int startOfImage, int w, int h, int nSecs,
         ReadOnlySpan<byte> palette, int paletteLen, bool hasAlpha)
     {
@@ -435,7 +442,7 @@ static class Rh2Decoder
         return new DecodedTexture(w, h, outArr, hasAlpha);
     }
 
-    private static int IndexOf(ReadOnlySpan<byte> hay, ReadOnlySpan<byte> needle,
+    static int IndexOf(ReadOnlySpan<byte> hay, ReadOnlySpan<byte> needle,
         int start, int end)
     {
         if (start >= hay.Length || start >= end) return -1;

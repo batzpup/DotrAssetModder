@@ -43,6 +43,12 @@ namespace DotrAssetModder;
 // motions don't include them, we clone a present slot (idle/slot 0 preferred, else the
 // lowest-id slot) into the missing slot. A cloned idle looks wrong during an attack but is
 // a fully valid, terminating animation, so the battle plays out and resolves correctly.
+//
+// Clones are built at full fidelity by default (cloneKeyStride = 1). Rh0Assembler only
+// passes a stride > 1 as a last-resort size fallback, when the assembled block would
+// otherwise exceed its budget - a full-density clone of a densely-baked clip is disposable
+// cosmetic filler by design (see above), so it's the first thing traded for headroom, but
+// only when the budget actually demands it.
 // =====================================================================================
 
 public sealed class EncMotTrack
@@ -71,9 +77,13 @@ public static class MotWriter
 
     /// Serialise the motions (any order; emitted in ascending SlotId) into back-to-back MOT
     /// blocks, and report the RH0 sectionFlags low byte (set bit per slot present).
-    public static (byte[] Blocks, int SectionFlagsByte) Write(int nodeCount, IReadOnlyList<EncMotion> motions)
+    /// cloneKeyStride: keyframe decimation stride applied ONLY to synthesised battle-slot
+    /// clones (see EnsureBattleSlots) - 1 (default) keeps them full-fidelity; a caller under
+    /// size pressure (Rh0Assembler) passes progressively higher strides to shrink them.
+    public static (byte[] Blocks, int SectionFlagsByte) Write(int nodeCount, IReadOnlyList<EncMotion> motions,
+        int cloneKeyStride = 1)
     {
-        var ordered = EnsureBattleSlots(motions);
+        var ordered = EnsureBattleSlots(motions, cloneKeyStride);
         var outAll = new List<byte>();
         int flags = 0;
         foreach (var m in ordered)
@@ -88,7 +98,7 @@ public static class MotWriter
     /// cloning an existing slot if absent. Never mutates the caller's objects. If there are
     /// no motions at all, nothing is synthesised (a model with zero animation can't be a
     /// valid battle monster and there is nothing to clone from).
-    private static List<EncMotion> EnsureBattleSlots(IReadOnlyList<EncMotion> motions)
+    private static List<EncMotion> EnsureBattleSlots(IReadOnlyList<EncMotion> motions, int cloneKeyStride)
     {
         var ordered = motions.OrderBy(m => m.SlotId).ToList();
         if (ordered.Count == 0) return ordered;
@@ -101,7 +111,7 @@ public static class MotWriter
         foreach (int slot in BattleRequiredSlots)
         {
             if (present.Contains(slot)) continue;
-            ordered.Add(CloneMotion(donor, slot));
+            ordered.Add(CloneMotion(donor, slot, cloneKeyStride));
             present.Add(slot);
         }
 
@@ -109,21 +119,35 @@ public static class MotWriter
         return ordered;
     }
 
-    /// Deep-copies a motion's track data under a new slot id. Track lists are copied so the
-    /// clone and its source never share mutable state.
-    private static EncMotion CloneMotion(EncMotion src, int newSlotId)
+    /// Deep-copies a motion's track data under a new slot id. cloneKeyStride == 1 copies
+    /// every key (full fidelity, the default); a higher stride keeps every Nth key (plus
+    /// always the first and last key of each track, so the clone still starts/ends at the
+    /// source's actual pose) - used only as a size fallback, see Write's doc comment.
+    /// Track lists are copied so the clone and its source never share mutable state.
+    private static EncMotion CloneMotion(EncMotion src, int newSlotId, int cloneKeyStride = 1)
     {
         var dst = new EncMotion { SlotId = newSlotId, FrameCount = src.FrameCount };
         foreach (var (node, tr) in src.Tracks)
         {
             var copy = new EncMotTrack();
-            if (tr.Trans is { Count: > 0 })
-                copy.Trans = new List<(int, Vector3)>(tr.Trans);
-            if (tr.Rot is { Count: > 0 })
-                copy.Rot = new List<(int, int, int, int)>(tr.Rot);
+            if (tr.Trans is { Count: > 0 } trans)
+                copy.Trans = cloneKeyStride <= 1 ? new List<(int, Vector3)>(trans) : DecimateKeys(trans, cloneKeyStride);
+            if (tr.Rot is { Count: > 0 } rot)
+                copy.Rot = cloneKeyStride <= 1 ? new List<(int, int, int, int)>(rot) : DecimateKeys(rot, cloneKeyStride);
             dst.Tracks[node] = copy;
         }
         return dst;
+    }
+
+    private static List<T> DecimateKeys<T>(List<T> src, int stride) where T : struct
+    {
+        if (src.Count <= 2) return new List<T>(src);
+        var outp = new List<T>();
+        for (int i = 0; i < src.Count; i += stride)
+            outp.Add(src[i]);
+        if (!outp[^1].Equals(src[^1]))
+            outp.Add(src[^1]);
+        return outp;
     }
 
     private static byte[] WriteBlock(int nodeCount, EncMotion m)

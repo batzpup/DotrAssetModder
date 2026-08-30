@@ -61,7 +61,8 @@ public class ModelImporterWindow
         {
             monsterPath = fl.iso_data_files_all[5];
         }
-
+        //Orange
+        ImGui.TextColored( new Vector4(1,0.6f,0,1), "Only imports Monster models currently");
         if (ImGui.Button("Load GLB"))
         {
             var result = Dialog.FileOpen("glb,gltf", Path.GetDirectoryName(Program.config.lastModelImportPath));
@@ -112,6 +113,43 @@ public class ModelImporterWindow
             ImGui.EndPopup();
         }
 
+        if (openOverflowPopup)
+        {
+            ImGui.OpenPopup("Model Too Large");
+            openOverflowPopup = false;
+        }
+
+        bool overflowOpen = true;
+        if (ImGui.BeginPopupModal("Model Too Large", ref overflowOpen, ImGuiWindowFlags.AlwaysAutoResize))
+        {
+            double pct = pendingBudget > 0 ? 100.0 * pendingCategoryBytes / pendingBudget : 0;
+            bool isAnim = pendingCategory == Rh0Assembler.OverflowCategory.Animation;
+            string what = isAnim ? "the cloned idle animations" : "the texture(s)";
+            string action = isAnim ? "reduce their fidelity" : "downscale them";
+            ImGui.TextWrapped(
+                $"This model is too big for the 1 MiB slot ({pendingTotalBytes:N0} / {pendingBudget:N0} bytes). " +
+                $"{what} {(isAnim ? "are" : "is")} taking up {pct:0.#}% of that space " +
+                $"({pendingCategoryBytes:N0} bytes).");
+            ImGui.Spacing();
+            ImGui.Text($"Would you like to {action} to try to fit?");
+            ImGui.Spacing();
+
+            if (ImGui.Button(isAnim ? "Reduce animation fidelity" : "Downscale texture(s)"))
+            {
+                ImGui.CloseCurrentPopup();
+                pendingOverflowConfirm = false;
+                Import(pendingFl, pendingDataPath, true);
+            }
+            ImGui.SameLine();
+            if (ImGui.Button("Cancel import"))
+            {
+                ImGui.CloseCurrentPopup();
+                pendingOverflowConfirm = false;
+                Import(pendingFl, pendingDataPath, false);
+            }
+            ImGui.EndPopup();
+        }
+
         if (status != null)
         {
             ImGui.TextColored(
@@ -121,7 +159,7 @@ public class ModelImporterWindow
 
         if (previewLoaded)
         {
-            
+
             DrawPreview();
         }
     }
@@ -169,7 +207,7 @@ public class ModelImporterWindow
             {
                 animPlaying = !animPlaying;
             }
-        
+
 
         }
 
@@ -294,8 +332,23 @@ public class ModelImporterWindow
         return block;
     }
 
-    void Import(FileLoader fl, string dataPath)
+    // ---- overflow-confirm popup state ----
+    // Set when a first Import() attempt hits a fixable-but-unconfirmed overflow; Render()
+    // opens the popup on the next frame, and the user's choice re-invokes Import() with
+    // reductionDecision fixed to true/false so it never re-prompts for the same attempt.
+    bool openOverflowPopup = false;
+    bool pendingOverflowConfirm = false;
+    Rh0Assembler.OverflowCategory pendingCategory;
+    int pendingCategoryBytes, pendingTotalBytes, pendingBudget;
+    FileLoader pendingFl;
+    string pendingDataPath;
+
+    void Import(FileLoader fl, string dataPath, bool? reductionDecision = null)
     {
+        bool overflowAsked = false;
+        Rh0Assembler.OverflowCategory askedCategory = default;
+        int askedBytes = 0, askedTotal = 0, askedBudget = 0;
+
         try
         {
             byte[] mrg = fl.GetFileBytesFromDisk(dataPath);
@@ -315,6 +368,16 @@ public class ModelImporterWindow
                 AdoptTemplateScaleForCustomModels = false,
                 UseNeutralTextureForMissingSlots = true,
                 PreserveTemplateTextureAnimation = false,
+                ConfirmReduction = (category, categoryBytes, totalBytes, budget) =>
+                {
+                    if (reductionDecision.HasValue) return reductionDecision.Value;
+                    overflowAsked = true;
+                    askedCategory = category;
+                    askedBytes = categoryBytes;
+                    askedTotal = totalBytes;
+                    askedBudget = budget;
+                    return false; // don't apply yet - just probing whether reduction is needed
+                },
             };
 
             byte[] rebuiltModel = Rebuilder.Rebuild(model, LoadTemplate(mrg, blockOff), textures, options, new Rebuilder.FitInfo());
@@ -331,6 +394,20 @@ public class ModelImporterWindow
         }
         catch (Exception e)
         {
+            if (!reductionDecision.HasValue && overflowAsked)
+            {
+                // Not a real failure yet - stash and let the user decide via the popup.
+                pendingOverflowConfirm = true;
+                openOverflowPopup = true;
+                pendingCategory = askedCategory;
+                pendingCategoryBytes = askedBytes;
+                pendingTotalBytes = askedTotal;
+                pendingBudget = askedBudget;
+                pendingFl = fl;
+                pendingDataPath = dataPath;
+                return;
+            }
+
             ok = false;
             status = "Import failed: " + e.Message;
         }

@@ -28,6 +28,11 @@ namespace DotrAssetModder;
 
 public static class Rh0Assembler
 {
+    /// Which regenerated section is the larger share of the 1 MiB budget when an import
+    /// would overflow - passed to a confirmReduction callback so a caller (e.g. the import
+    /// UI) can ask the user before trading fidelity for headroom.
+    public enum OverflowCategory { Animation, Texture }
+
     public const uint Rh0Magic = 0x00304852;
     private const int HeaderPreambleEnd = 0xB0; // header (0x68) + fixed preamble; nodeTree starts here in stock models
     private const int Align = 16;
@@ -108,11 +113,18 @@ public static class Rh0Assembler
         throw new Exception("selected clean template does not contain an RH0 block at index 0 or the selected model index");
     }
 
+    /// (category, categoryBytes, totalBytes, budget) -> true to apply that category's
+    /// fidelity-reduction fallback, false to decline and let Place() throw normally.
+    /// Called at most once, only for whichever category is the larger byte share of an
+    /// overflowing layout. Pass null to keep every fallback fully automatic (the default,
+    /// matching pre-existing non-interactive behaviour).
+    public delegate bool ConfirmReduction(OverflowCategory category, int categoryBytes, int totalBytes, int budget);
+
     public static byte[] Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
         IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
         bool rebuildNative = false, int maxTexDim = 512,
         bool neutralMissingTextures = true, bool preserveTemplateAnm = false,
-        bool trimToContent = false)
+        bool trimToContent = false, ConfirmReduction? confirmReduction = null)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
 
@@ -120,7 +132,8 @@ public static class Rh0Assembler
         byte[] nodeTree = NodeTreeWriter.Write(rebuilt.Nodes,
             (rebuilt.BoundsCenter.X, rebuilt.BoundsCenter.Y, rebuilt.BoundsCenter.Z), rebuilt.BoundsRadius);
         GeometryWriteResult geo = GeometryWriter.Write(rebuilt.Pages, rebuilt.MaxMeshSlot); // also fills EncPage.WalkOff
-        var (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions);
+        byte[] motBlocks; int motByte;
+        (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions);
 
         // ---- textures: per TexTable entry, build RH2 + ANM ----
         // The TexTable count is NOT fixed to the template's: every texture-context record
@@ -345,12 +358,35 @@ public static class Rh0Assembler
             return c;
         }
 
+        // ---- interactive overflow reduction: ask the caller before trading fidelity for
+        // headroom. Only the larger of {texture, animation} - by raw byte share of the
+        // budget - is offered; Assemble makes one best-effort attempt at that single lever.
+        // confirmReduction == null preserves fully-automatic behaviour (the lever applies
+        // unconditionally, as before) for callers that don't want to ask, e.g. batch imports.
+        bool reduceTexture = false, reduceMotion = false;
+        if (EstimateTotal(texCount) > blockSize)
+        {
+            int texBytesPre = 0;
+            for (int i = 0; i < texCount; i++) texBytesPre += rh2[i].Length;
+            int motBytesPre = motBlocks.Length;
+            int totalPre = EstimateTotal(texCount);
+            bool textureIsLarger = texBytesPre > motBytesPre;
+            var category = textureIsLarger ? OverflowCategory.Texture : OverflowCategory.Animation;
+            int categoryBytes = textureIsLarger ? texBytesPre : motBytesPre;
+            bool apply = confirmReduction?.Invoke(category, categoryBytes, totalPre, blockSize) ?? true;
+            reduceTexture = apply && textureIsLarger;
+            reduceMotion = apply && !textureIsLarger;
+        }
+
         // ---- native-rebuild budget: downgrade oversized native slots to fit the block ----
         // BuildNative slots can dwarf the donor's footprint. For the fixed 1 MiB monster.mrg
-        // block, if the layout would overflow, downgrade native slots (largest first) back to
-        // the donor-fit Encode/verbatim path until it fits. This keeps a valid render (lower
-        // res) instead of throwing; the proper "grow the archive" handling is Phase 2/3.
-        if (rebuildNative)
+        // block, if the layout would overflow AND textures are the confirmed reduction
+        // target, downgrade native slots (largest first) back to the donor-fit Encode/
+        // verbatim path until it fits. This keeps a valid render (lower res) instead of
+        // throwing; the proper "grow the archive" handling is Phase 2/3. Only meaningful
+        // when rebuildNative produced native (oversized) slots in the first place - a no-op
+        // otherwise, so declining/lacking a lever here just falls through to Place()'s error.
+        if (rebuildNative && reduceTexture)
         {
             while (EstimateTotal(texCount) > blockSize)
             {
@@ -380,6 +416,25 @@ public static class Rh0Assembler
         {
             Array.Resize(ref rh2, texCount);
             Array.Resize(ref anm, texCount);
+        }
+
+        // ---- last-resort MOT budget fallback: decimate synthesised battle-slot clones ----
+        // Only runs when animation was the confirmed reduction target. Progressively
+        // increases the clone keyframe stride (see MotWriter.Write) and re-serialises MOT
+        // blocks until it fits or decimation stops helping (a plateau means the overflow
+        // isn't coming from the clones after all, so we stop rather than mangle them for no
+        // gain and let Place() throw with its normal message).
+        if (reduceMotion && EstimateTotal(texCount) > blockSize)
+        {
+            int[] strides = { 2, 3, 4, 6, 8, 12, 16, 24, 32 };
+            int lastLen = motBlocks.Length;
+            foreach (int stride in strides)
+            {
+                (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, stride);
+                if (EstimateTotal(texCount) <= blockSize) break;
+                if (motBlocks.Length >= lastLen) break; // no further shrinkage - give up early
+                lastLen = motBlocks.Length;
+            }
         }
 
         // ---- dispatch remap: every entry must land on a slot with a real RH2 ----
@@ -413,29 +468,38 @@ public static class Rh0Assembler
 
         int cursor = HeaderPreambleEnd;
 
-        int Place(byte[] data)
+        // TEMP DIAGNOSTIC: logs each section's size and the running cursor so we can see
+        // exactly which block pushes an import over the fixed 1 MiB budget. Remove once the
+        // Gilfer4.glb overflow is root-caused.
+        Console.WriteLine($"[Rh0Assembler] block budget = 0x{blockSize:X} start cursor = 0x{cursor:X}");
+
+        int Place(byte[] data, string label)
         {
             int o = Align16(cursor);
             cursor = o + data.Length;
-            if (cursor > blockSize) throw new InvalidOperationException("RH0 exceeds 1 MiB block");
+            Console.WriteLine($"[Rh0Assembler]   {label,-16} len=0x{data.Length:X} -> cursor=0x{cursor:X}");
+            if (cursor > blockSize)
+                throw new InvalidOperationException(
+                    $"RH0 exceeds 1 MiB block (overflowed while placing '{label}', len=0x{data.Length:X}, " +
+                    $"cursor would be 0x{cursor:X}, budget=0x{blockSize:X})");
             Array.Copy(data, 0, outBuf, o, data.Length);
             return o;
         }
 
-        int nodeTreeOff = Place(nodeTree);
-        int section1Off = Place(geo.Section1);
-        int section2Off = Place(geo.Section2);
-        int section1AltOff = geo.Section1Alt.Length > 0 ? Place(geo.Section1Alt) : section1Off;
-        int section2AltOff = geo.Section2Alt.Length > 0 ? Place(geo.Section2Alt) : section2Off;
-        int relocWalkOff = Place(geo.RelocWalk);
+        int nodeTreeOff = Place(nodeTree, "nodeTree");
+        int section1Off = Place(geo.Section1, "section1");
+        int section2Off = Place(geo.Section2, "section2");
+        int section1AltOff = geo.Section1Alt.Length > 0 ? Place(geo.Section1Alt, "section1Alt") : section1Off;
+        int section2AltOff = geo.Section2Alt.Length > 0 ? Place(geo.Section2Alt, "section2Alt") : section2Off;
+        int relocWalkOff = Place(geo.RelocWalk, "relocWalk");
 
         // texTable is built after we know rh2/anm offsets, so reserve its size now
         byte[] texTable = BuildTexTablePlaceholder(texCount, dispatch.Count);
-        int texTableOff = Place(texTable);
+        int texTableOff = Place(texTable, "texTable");
 
-        int aux0Off = aux0.Length > 0 ? Place(aux0) : 0;
-        int aux1Off = aux1.Length > 0 ? Place(aux1) : 0;
-        int aux2Off = aux2.Length > 0 ? Place(aux2) : 0;
+        int aux0Off = aux0.Length > 0 ? Place(aux0, "aux0") : 0;
+        int aux1Off = aux1.Length > 0 ? Place(aux1, "aux1") : 0;
+        int aux2Off = aux2.Length > 0 ? Place(aux2, "aux2") : 0;
 
         var rh2Offs = new int[texCount];
         var anmOffs = new int[texCount];
@@ -444,13 +508,13 @@ public static class Rh0Assembler
         {
             if (rh2[i].Length > 0)
             {
-                rh2Offs[i] = Place(rh2[i]);
+                rh2Offs[i] = Place(rh2[i], $"rh2[{i}]");
                 if (texDataOff == 0) texDataOff = rh2Offs[i];
             }
         }
         for (int i = 0; i < texCount; i++)
             if (anm[i].Length > 0)
-                anmOffs[i] = Place(anm[i]);
+                anmOffs[i] = Place(anm[i], $"anm[{i}]");
 
         // ---- header[0x0C] trailing-region chain ----
         // lSzModel_BindModelByAddr@0x1ee190 walks a cursor starting at header[0x0C], driven
@@ -478,12 +542,12 @@ public static class Rh0Assembler
         int motOff;
         if (motBlocks.Length > 0)
         {
-            motOff = Place(motBlocks);
-            if (postMot.Length > 0) Place(postMot); // contiguous: cursor flows from MOTs into it
+            motOff = Place(motBlocks, "motBlocks");
+            if (postMot.Length > 0) Place(postMot, "postMot"); // contiguous: cursor flows from MOTs into it
         }
         else if (postMot.Length > 0)
         {
-            motOff = Place(postMot);
+            motOff = Place(postMot, "postMot");
         }
         else
         {

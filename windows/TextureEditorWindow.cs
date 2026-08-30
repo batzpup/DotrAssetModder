@@ -58,6 +58,10 @@ public class TextureEditorWindow : IDisposable
 
     PicMiniFilter picMiniFilter = PicMiniFilter.Point;
 
+    public TextureEditorWindow()
+    {
+        
+    }
     public void Render()
     {
         DrawSidebar(glRD.GetScreenPixelsFromPercent(25, 10).X);
@@ -88,7 +92,7 @@ public class TextureEditorWindow : IDisposable
         string comboLabel = string.IsNullOrEmpty(selectedMrgName) ? "Pick MRG..." : selectedMrgName;
         if (ImGui.BeginCombo("##mrg", comboLabel))
         {
-            foreach (var name in TextureSlotManager.Rh2MrgNames)
+            foreach (var name in TextureSlotManager.GetTextureMrgs())
             {
                 if (!TextureSlotManager.IsoHasFile(name))
                 {

@@ -31,11 +31,22 @@ public sealed class TextureSlot
 
 public static class TextureSlotManager
 {
-    public static readonly string[] Rh2MrgNames = {
-        "PICTURE.MRG", "PICMINI.MRG", "PICPACK.MRG",
-        "TEXANM.MRG", "TEXEFF.MRG", "TEXETC.MRG", "TEXEVE.MRG", "TEXSYS.MRG",
-        "MODEL.MRG", "MONSTER.MRG",
-    };
+  public static IEnumerable<string> GetTextureMrgs()
+{
+    return FileLoader.Instance.iso_data_files_supported
+        .Select(Path.GetFileName)
+        .Where(name =>
+            name.StartsWith("PICTURE", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("PICMINI", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("PICPACK", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TEXANM", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TEXEFF", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TEXETC", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TEXEVE", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("TEXSYS", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("MODEL", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("MONSTER", StringComparison.OrdinalIgnoreCase));
+}
 
     public const string IconMrgName = "ICON.MRG";
     public const string PictureMrg = "PICTURE.MRG";
@@ -45,12 +56,12 @@ public static class TextureSlotManager
 
     public static bool IsoHasFile(string name)
     {
-        return FileLoader.Instance.iso_data_files_all?.Any(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase)) == true;
+        return FileLoader.Instance.iso_data_files_all?.Any(f => f.EndsWith(name, StringComparison.OrdinalIgnoreCase)) == true;
     }
 
     public static string IsoPath(string name)
     {
-        return FileLoader.Instance.iso_data_files_all.First(f => f.EndsWith(name + ";1", StringComparison.OrdinalIgnoreCase));
+        return FileLoader.Instance.iso_data_files_all.First(f => f.EndsWith(name , StringComparison.OrdinalIgnoreCase));
     }
 
     public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes)
@@ -170,7 +181,7 @@ public static class TextureSlotManager
         }
     }
 
-    public static Texture2D RefreshThumb(TextureSlot slot, SKBitmap fromBitmap)
+    public static Texture2D RefreshThumbnail(TextureSlot slot, SKBitmap fromBitmap)
     {
         Raylib.UnloadTexture(slot.Thumbnail);
         return BitmapToTexture(fromBitmap);
@@ -308,7 +319,7 @@ public static class TextureSlotManager
         return tex;
     }
 
-    public static Texture2D MakePlaceholderThumbNail()
+    public static Texture2D MakePlaceholderThumbnail()
     {
         var img = Raylib.GenImageColor(16, 16, Color.Purple);
         var tex = Raylib.LoadTextureFromImage(img);

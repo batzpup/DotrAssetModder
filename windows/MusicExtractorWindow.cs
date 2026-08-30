@@ -183,7 +183,6 @@ public class MusicExtractorWindow
         // Get the file from inside the ISO
         switch (currentMode)
         {
-
             case CurrentMusicMode.BGM:
                 return ExtractBgm(isoFile);
             case CurrentMusicMode.Card:

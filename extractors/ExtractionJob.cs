@@ -27,24 +27,22 @@ public sealed class ExtractionProgress
 
 public sealed class ExtractionJob
 {
-    private readonly Task<ExtractResult> _task;
+    readonly Task<ExtractResult> task;
 
     public ExtractionProgress Progress { get; }
 
-    public bool IsCompleted => _task.IsCompleted;
-    public bool IsFaulted => _task.IsFaulted;
-    public ExtractResult? Result =>
-        _task.Status == TaskStatus.RanToCompletion ? _task.Result : null;
-    public System.Exception? Error => _task.Exception?.GetBaseException();
+    public bool IsCompleted => task.IsCompleted;
+    public bool IsFaulted => task.IsFaulted;
+    public ExtractResult? Result => task.Status == TaskStatus.RanToCompletion ? task.Result : null;
+    public Exception? Error => task.Exception?.GetBaseException();
 
-    private ExtractionJob(Task<ExtractResult> task, ExtractionProgress progress)
+     ExtractionJob(Task<ExtractResult> task, ExtractionProgress progress)
     {
-        _task = task;
+        this.task = task;
         Progress = progress;
     }
 
-    public static ExtractionJob Start(
-        byte[] data, string outDir, string stem, IList<string>? names = null)
+    public static ExtractionJob Start(byte[] data, string outDir, string stem, IList<string>? names = null)
     {
         var progress = new ExtractionProgress();
         var extractor = new AssetExtractor();

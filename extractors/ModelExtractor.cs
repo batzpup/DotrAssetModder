@@ -10,7 +10,7 @@ using AlphaMode = SharpGLTF.Materials.AlphaMode;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-//partially AI
+//Mostly AI
 static class ModelExtractor
 {
     public const uint Rh0Magic = 0x00304852;
@@ -107,7 +107,7 @@ static class ModelExtractor
         return FindRh0Offsets(data);
     }
 
-    private static List<(int Off, int Len)> FindRh0Offsets(byte[] data)
+     static List<(int Off, int Len)> FindRh0Offsets(byte[] data)
     {
         ReadOnlySpan<byte> needle = stackalloc byte[] { 0x52, 0x48, 0x30, 0x00 };
         var raw = new List<int>();

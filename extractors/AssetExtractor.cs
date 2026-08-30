@@ -36,17 +36,7 @@ public class AssetExtractor
         };
     }
 
-    public ExtractResult Extract(string mrgPath, string outDir,
-        IList<string>? names = null)
-    {
-        if (!File.Exists(mrgPath))
-            throw new FileNotFoundException("mrg not found", mrgPath);
-        return Extract(
-            File.ReadAllBytes(mrgPath),
-            outDir,
-            Path.GetFileNameWithoutExtension(mrgPath),
-            names);
-    }
+   
 
     public static AssetKind DetectKind(ReadOnlySpan<byte> data)
     {

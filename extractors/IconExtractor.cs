@@ -38,7 +38,10 @@ public static class IconExtractor
                 }
             }
             if (idx < 0)
-                break;
+            {
+                break;   
+            }
+             
 
             uint animShapes = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(idx + 4, 4));
             uint texType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(idx + 8, 4));
@@ -79,7 +82,8 @@ public static class IconExtractor
         var icns = ScanIcns(mrgBytes);
         if (icns.Count == 0)
         {
-            return new ExtractResult(AssetKind.Ps2Icon, 0, 1, 1) {
+            return new ExtractResult(AssetKind.Ps2Icon, 0, 1, 1)
+            {
                 Failures = new List<FailureInfo> { new FailureInfo(-1, "scan", "No valid ICN blocks found in file") }
             };
         }
@@ -122,7 +126,8 @@ public static class IconExtractor
             }
         }
 
-        return new ExtractResult(AssetKind.Ps2Icon, written, failed, written + failed) {
+        return new ExtractResult(AssetKind.Ps2Icon, written, failed, written + failed) 
+        {
             Failures = failures
         };
     }
@@ -160,19 +165,19 @@ public static class IconExtractor
             .WithChannelParam(KnownChannel.MetallicRoughness, KnownProperty.MetallicFactor, 0f)
             .WithChannelParam(KnownChannel.MetallicRoughness, KnownProperty.RoughnessFactor, 1f);
         if (hasTexture)
+        {
             matBuilder.WithChannelImage(KnownChannel.BaseColor, new MemoryImage(texPng));
+        }
 
         var meshBuilder = new MeshBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(name);
         var prim = meshBuilder.UsePrimitive(matBuilder);
         for (int i = 0; i + 2 < vertCount; i += 3)
         {
             prim.AddTriangle(
-                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(
-                    new VertexPositionNormal(positions[i], normals[i]), new VertexTexture1(uvs[i])),
-                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(
-                    new VertexPositionNormal(positions[i + 1], normals[i + 1]), new VertexTexture1(uvs[i + 1])),
-                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(
-                    new VertexPositionNormal(positions[i + 2], normals[i + 2]), new VertexTexture1(uvs[i + 2])));
+                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(new VertexPositionNormal(positions[i], normals[i]), new VertexTexture1(uvs[i])),
+                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(new VertexPositionNormal(positions[i + 1], normals[i + 1]), new VertexTexture1(uvs[i + 1])),
+                new VertexBuilder<VertexPositionNormal, VertexTexture1, VertexEmpty>(new VertexPositionNormal(positions[i + 2], normals[i + 2]), new VertexTexture1(uvs[i + 2]))
+                );
         }
 
         var scene = new SceneBuilder(name);

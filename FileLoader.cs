@@ -16,7 +16,12 @@ public class FileLoader : IDisposable
     public string[] iso_data_files_supported;
     string[] unsupportedDataDefaults = ["BMODULE.MRG;1", "CMODULE.MRG;1", "MMODULE.MRG;1", "STAGECAM.MRG;1"];
 
-    public string[] MovieNames; 
+    public Action OnIsoloaded;
+
+    public string[] MovieNames;
+
+
+    bool isEuVersion;
     public void OpenIso(string filePath)
     {
         CurrentIsoPath = filePath;
@@ -49,6 +54,7 @@ public class FileLoader : IDisposable
             MovieNames = iso.GetFiles("MOVIE");
         }
         IsIsoLoaded = true;
+        OnIsoloaded?.Invoke();
     }
 
     public byte[] GetFileBytesFromDisk(string path)
