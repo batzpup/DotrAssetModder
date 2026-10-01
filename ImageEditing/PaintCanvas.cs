@@ -245,7 +245,7 @@ public class PaintCanvas
 
     public void SaveAs()
     {
-        DialogResult result = Dialog.FileSave("png,jpg,jpeg,webp");
+        DialogResult result = Dialog.FileSave(FileDialogFilter.Of("png,jpg,jpeg,webp"));
         if (!result.IsOk)
         {
             return;

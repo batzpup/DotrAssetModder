@@ -49,6 +49,11 @@ Use extracted 3D models as a size reference
 Good model Example:
 <img width="1991" height="1328" alt="image" src="https://github.com/user-attachments/assets/e4fedf86-7cee-4830-a6d6-93baed0ad84a" />
 
+### Animation notes
+Animations are matched to the game's motion slots by name: `slot_0` idle, `slot_2` attack, `slot_4` death, `slot_5` win, `slot_6` damage.
+A model missing one of these gets a copy of another motion in its place (the import status says which), so it still plays in battle, but a copied idle never shows a fall: give the model its own death and damage animations.
+Extracted models carry each part's scale on a `_bone` child node (parts that grow, shrink or hide during a motion animate its scale); keep those nodes when editing.
+
 ### Texture notes
 Keep textures sizes down, you cannot import a model greater than 1mb after compression from the importer.
 The max texture sizes may not be bigger than 512x512 and for textures on models 256 is the recommended max size

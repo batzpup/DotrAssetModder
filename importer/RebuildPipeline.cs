@@ -44,6 +44,7 @@ public static class RebuildPipeline
     private const float NormScale = 32767f;
     private const float WeightScale = 4096f;
     private const float S16Fit = 32000f; // target ceiling for |position| component
+    private const float S16Max = 32767.5f; // rounds into s16
     private const double BamsPerRad = 32768.0 / Math.PI;
 
 
@@ -143,6 +144,7 @@ public static class RebuildPipeline
         bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
+        LastClampedValues = 0;
 
         // ---- 0. donor/template frame is diagnostic only ------------------------------
         // The imported GLB is the spatial authority. The donor/template MRG is still used
@@ -161,6 +163,12 @@ public static class RebuildPipeline
         // their band. Explicit mat_texN names >= count are NOT merged (deliberate request
         // for a grown table, handled by Rh0Assembler's grow/shed path).
         var texMerges = ApplyTexMerges(im, templateTexCount);
+
+        // GlbImporter's MaxTexSlot (63) only catches typos; the real ceiling is the
+        // template's RH2 block count. Auto-assigned slots past it were just merged above,
+        // and an explicit mat_texN past it is a deliberate request for a grown TexTable.
+        // If the 1 MiB block cannot hold the grown table, Rh0Assembler sheds the slot and
+        // Rebuilder reports it (Rh0Assembler.LastShedTexSlots).
 
         // ---- 0. root selection / wrapper collapse (GNode(1) pivot contract) ----
         // The engine anchors monster (model type 4/5/6) scale+rotation AND the duel 3D
@@ -244,13 +252,24 @@ public static class RebuildPipeline
 
         // ---- 2. global scale S ----
         // S must be big enough that inverse(RWS)*world = (1/S)*inverse(world)*world fits s16.
+        // A `_bone` joint's vertices are encoded against the bone's bind matrix (step 5), whose
+        // scale is its own, so S - which then only scales the root and whatever hangs off it
+        // without a `_bone` - is sized from the other joints alone. Any other joint bound away
+        // from rest (an unskinned part at scale 0 at rest) uses its bind matrix throughout.
+        bool IsBoneOwner(int g) => im.Nodes[GlbPos(im, g)].ScaleBone >= 0;
         var jointWorld = new Dictionary<int, Matrix4x4>();
-        foreach (int g in effectiveJoints) jointWorld[g] = im.Nodes[GlbPos(im, g)].WorldMatrix;
+        foreach (int g in effectiveJoints)
+            jointWorld[g] = !IsBoneOwner(g) && im.JointBind.TryGetValue(g, out var bindW)
+                ? bindW
+                : im.Nodes[GlbPos(im, g)].WorldMatrix;
         double maxLocal = 1e-6;
+        bool anyPlainJoint = false;
         foreach (var prim in im.Primitives)
         foreach (var v in prim.Vertices)
         foreach (var inf in Influences(v, im))
         {
+            if (IsBoneOwner(inf.JointNode)) continue;
+            anyPlainJoint = true;
             if (!jointWorld.TryGetValue(inf.JointNode, out var jw)) continue;
             if (!Matrix4x4.Invert(jw, out var invJw)) continue; // singular joint: skip
             var lp = Vector3.Transform(v.Pos, invJw);
@@ -285,8 +304,25 @@ public static class RebuildPipeline
             fitReport.Reason = null;
         }
 
-        float S = (float)(maxLocal / S16Fit);
+        float S = anyPlainJoint ? (float)(maxLocal / S16Fit) : 1f;
         if (S <= 0f || float.IsNaN(S) || float.IsInfinity(S)) S = 1f;
+
+        // `_bone` joints: their bind matrix already carries the accumulated scale, so the
+        // bone-local positions it gives are the retail s16 values; scale down (sigma > 1) only
+        // if an edit pushed them out of s16 range. Their RH0 accumulated scale is sigma * the
+        // bone's glb scale (SolvePose).
+        double maxBoneLocal = 0;
+        foreach (var prim in im.Primitives)
+        foreach (var v in prim.Vertices)
+        foreach (var inf in Influences(v, im))
+        {
+            if (!IsBoneOwner(inf.JointNode) || !im.JointBind.TryGetValue(inf.JointNode, out var bw)) continue;
+            if (!Matrix4x4.Invert(bw, out var invBw)) continue;
+            var lp = Vector3.Transform(v.Pos, invBw);
+            if (float.IsNaN(lp.X) || float.IsInfinity(lp.X)) continue;
+            maxBoneLocal = Math.Max(maxBoneLocal, Math.Max(Math.Abs(lp.X), Math.Max(Math.Abs(lp.Y), Math.Abs(lp.Z))));
+        }
+        float boneSigma = maxBoneLocal > S16Max ? (float)(maxBoneLocal / S16Fit) : 1f;
 
         // Scale policy:
         //   * Extracted DotR GLBs may keep the template scale for round-trip / retail-motion compatibility.
@@ -298,7 +334,8 @@ public static class RebuildPipeline
             !float.IsInfinity(templateAnimTransScale))
         {
             float templS = 1f / templateAnimTransScale;
-            if (maxLocal / templS <= 32700.0) S = templS; // adopt template scale only when requested/safe
+            // adopt template scale only when requested/safe
+            if (!anyPlainJoint || maxLocal / templS <= 32700.0) S = templS;
         }
 
         // ---- 3. mesh-slot assignment ----
@@ -315,21 +352,9 @@ public static class RebuildPipeline
         {
             int g = order[i];
             var src = im.Nodes[GlbPos(im, g)];
-            bool isRoot = (g == root0);
-            float parentAccum = isRoot ? 1f : S;
-
             var nd = nodes[i];
-            // Per-node scale is honored (the engine applies it to the node's own matrix and
-            // propagates to children unless flags bit2). The root folds the global S in.
-            // Note: child translations are divided by the ROOT scale only, so deep chains of
-            // scaled intermediate nodes are approximated — rare in practice.
-            nd.Scale = isRoot
-                ? (S * src.Scale.X, S * src.Scale.Y, S * src.Scale.Z)
-                : (src.Scale.X, src.Scale.Y, src.Scale.Z);
             nd.Flags = 0;
             nd.MeshSlot = (ushort)(meshSlotOf.TryGetValue(g, out int ms) ? ms : 0);
-            nd.RotBams = QuatToBams(src.Rotation);
-            nd.Pos = (src.Translation.X / parentAccum, src.Translation.Y / parentAccum, src.Translation.Z / parentAccum);
 
             // parent / children remapped to enc indices (extra roots adopt root0)
             int gp = src.Parent;
@@ -345,6 +370,41 @@ public static class RebuildPipeline
         foreach (int er in extraRoots)
             if (encIndexOf.TryGetValue(er, out int ei))
                 nodes[0].Children.Add(ei);
+
+        // Rest values: scale, position and rotation solved from the glb rest pose with each
+        // parent's accumulated scale (SolvePose), so scaled intermediate nodes and the
+        // `_bone` scales of extracted models come out right. A child of a node at scale 0
+        // has no defined position at rest; take it from the first frame where it has one.
+        {
+            var restPose = SolvePose(nodes, order.ToArray(), im, null, 0, S, boneSigma);
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                var nd = nodes[i];
+                nd.Scale = (restPose.Scale[i].X, restPose.Scale[i].Y, restPose.Scale[i].Z);
+                nd.RotBams = QuatToBams(restPose.Rot[i]);
+                var pos = restPose.Pos[i];
+                if (!restPose.PosValid[i])
+                    pos = FirstValidPos(nodes, order.ToArray(), im, i, S, boneSigma) ?? Vector3.Zero;
+                nd.Pos = (pos.X, pos.Y, pos.Z);
+            }
+        }
+
+        // Node flags. The extractor names each node `node_N..._fXXXX` with its retail flags.
+        // Bits 1, 2 and 4 (no translation, rotation, own scale) go back only where the value
+        // they skip is already the identity, so they change nothing (a motion track clears its
+        // bit in the game anyway); the other bits (16 on some retail nodes, use unknown) are
+        // carried as they were.
+        for (int i = 0; i < nodes.Count; i++)
+        {
+            var fm = System.Text.RegularExpressions.Regex.Match(im.Nodes[GlbPos(im, order[i])].Name, @"_f([0-9A-F]{4})(?:_|$)");
+            if (!fm.Success) continue;
+            int f = Convert.ToInt32(fm.Groups[1].Value, 16);
+            var nd = nodes[i];
+            if (nd.Pos != (0f, 0f, 0f)) f &= ~1;
+            if (nd.RotBams != (0, 0, 0)) f &= ~2;
+            if (nd.Scale != (1f, 1f, 1f)) f &= ~4;
+            nd.Flags = (ushort)f;
+        }
 
         bool hasBounds = ComputeBounds(im, out var geomMin, out var geomMax);
         var geomCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
@@ -455,11 +515,15 @@ public static class RebuildPipeline
             boundsRadius = 1f;
 
         // ---- 5. per-joint RestWorldSkin = Scale(S) * glbWorld ; cache inverse + 3x3 inverse ----
+        // A `_bone` joint encodes against its bind matrix scaled by sigma: bone-local
+        // position = v * inverse(bind) / sigma, the retail values for an extracted model.
         var rwsInv = new Dictionary<int, Matrix4x4>();
         var scaleS = Matrix4x4.CreateScale(S);
         foreach (var kv in jointWorld)
         {
-            var rws = scaleS * kv.Value; // row-vector: apply scale then world
+            var rws = IsBoneOwner(kv.Key) && im.JointBind.TryGetValue(kv.Key, out var bw)
+                ? Matrix4x4.CreateScale(boneSigma) * bw
+                : scaleS * kv.Value; // row-vector: apply scale then world
             Matrix4x4.Invert(rws, out var inv);
             rwsInv[kv.Key] = inv;
         }
@@ -473,9 +537,44 @@ public static class RebuildPipeline
         var protos = new List<(MatKey Key, EncStrip Strip)>();
         foreach (var prim in im.Primitives)
         {
-            var matKey = new MatKey(prim.TexIdx, prim.IsAlt, prim.BaseColor);
+            var matKey = new MatKey(prim.TexIdx, prim.IsAlt, prim.BaseColor, prim.RawColor1, prim.Color0, prim.Color2, prim.Untextured);
             foreach (var strip in StripifyPrimitive(prim, im, rwsInv, meshSlotOf))
                 protos.Add((matKey, strip));
+        }
+
+        // ---- 6.5 per-node bounding spheres (node +0x30) ----
+        // Retail: a slot node's sphere is centred on the bbox of its bone-local positions,
+        // with the radius in world units; a node without a slot has none. Node 0's is the
+        // model's (step 4.6/4.7, written by NodeTreeWriter).
+        {
+            var lo = new Dictionary<int, Vector3>();
+            var hi = new Dictionary<int, Vector3>();
+            var pts = new Dictionary<int, List<Vector3>>();
+            void Add(int slot, short x, short y, short z)
+            {
+                if (!pts.TryGetValue(slot, out var l)) pts[slot] = l = new List<Vector3>();
+                l.Add(new Vector3(x, y, z));
+            }
+            foreach (var (_, strip) in protos)
+            foreach (var v in strip.Verts)
+            {
+                if (strip.Kind == StripKind.Indep) Add(strip.IndepVuAddr, v.X, v.Y, v.Z);
+                else if (v.Influences != null)
+                    foreach (var inf in v.Influences) Add(inf.Bone, inf.X, inf.Y, inf.Z);
+            }
+            for (int i = 0; i < nodes.Count; i++)
+            {
+                var nd = nodes[i];
+                if (nd.MeshSlot == 0 || !pts.TryGetValue(nd.MeshSlot, out var l)) continue;
+                var mn = l.Aggregate(Vector3.Min);
+                var mx = l.Aggregate(Vector3.Max);
+                var c = (mn + mx) * 0.5f;
+                float r = l.Max(q => Vector3.Distance(q, c));
+                float acc = 1f;
+                for (int k = i; k >= 0; k = nodes[k].Parent)
+                    acc *= Math.Max(Math.Abs(nodes[k].Scale.X), Math.Max(Math.Abs(nodes[k].Scale.Y), Math.Abs(nodes[k].Scale.Z)));
+                nd.Sphere = (c.X, c.Y, c.Z, r * acc);
+            }
         }
 
         // ---- 7. group by material, partition each group into <=8-bone pages, assign VU slots ----
@@ -499,6 +598,9 @@ public static class RebuildPipeline
                     TexIdx = grp.Key.TexIdx,
                     Color = ((float)grp.Key.R, (float)grp.Key.G, (float)grp.Key.B),
                     Alpha = grp.Key.A,
+                    Color0 = grp.Key.C0,
+                    Color2 = grp.Key.C2,
+                    Untextured = grp.Key.Untextured,
                 };
                 foreach (var ms in bones)
                     page.BoneBinds.Add(new EncBoneBind { VuAddr = slot2vu[ms], Slot = ms, VifEcho = 0 });
@@ -513,59 +615,94 @@ public static class RebuildPipeline
             }
         }
 
-        // ---- 8. animations: glb channels -> EncMotion (frame=time*30; quat->BAMS) ----
-        const float Fps = 30f;
+        // ---- 8. animations: per-frame RH0 poses -> fitted key lists ----
+        // Every channel arrives sampled at every frame (GlbImporter). Each frame is solved
+        // into RH0 node values (SolvePose: scale and position relative to each parent's
+        // accumulated scale), then each node's position, rotation and scale tracks are
+        // reduced to the fewest keys the game's own interpolation (FitKeys) reproduces.
         // RH0 +0x64 animTransScale: the retail contract (byte-verified on blue-eyes and
         // timeater) is animTransScale == 1 / rootScale. The duel draw path
         // (SzModel_DrawWithFunc_Pipe@0x1ec350) anchors monster scale/rotation at
         // GetGNode(1).pos / animTransScale — converting node-tree units back to world units —
-        // and the motion interpolator multiplies MOT translation keys by it at runtime.
-        // With aTS=1/S: root keys are stored as world/aTS (engine: key*aTS = world, no parent
-        // scale) and child keys as world (engine: key*aTS*parentScale(S) = world).
+        // and the motion interpolator multiplies non-root position keys by it at runtime
+        // (lRhModel_SetupFloatMotionRecursive); root keys are used as they are.
         float AnimTransScale = 1f / S;
+        var encGlb = new int[nodes.Count];
+        Array.Fill(encGlb, -1);
+        foreach (var (g, e) in encIndexOf) encGlb[e] = g;
+        float tolWorld = Math.Max(boundsRadius, 1e-3f) * 1e-5f;
         var motions = new List<EncMotion>();
         int animFallback = 0;
         foreach (var anim in im.Animations)
         {
             int slotId = ParseSlotId(anim.Name, animFallback++);
-            var motion = new EncMotion { SlotId = slotId };
-            int maxFrame = 0;
-            foreach (var kv in anim.Channels)
+            int frames = Math.Max(anim.FrameCount, 1);
+            var poses = new Rh0Pose[frames];
+            for (int f = 0; f < frames; f++)
+                poses[f] = SolvePose(nodes, encGlb, im, anim, f, S, boneSigma);
+            var motion = new EncMotion { SlotId = slotId, FrameCount = frames };
+            for (int i = 0; i < nodes.Count; i++)
             {
-                if (!encIndexOf.TryGetValue(kv.Key, out int enc)) continue;
-                var ch = kv.Value;
+                if (encGlb[i] < 0) continue; // synthetic node: never animated
+                var nd = nodes[i];
                 var track = new EncMotTrack();
-                float transDiv = enc == 0 ? AnimTransScale : AnimTransScale * S;
-                if (ch.Translation is { Count: > 0 } tk)
+                int p = nd.Parent;
+
+                // position: raw value per frame; non-root keys are stored / animTransScale
+                var pos = new Vector3[frames];
+                var posOk = new bool[frames];
+                for (int f = 0; f < frames; f++) { pos[f] = poses[f].Pos[i]; posOk[f] = poses[f].PosValid[i]; }
+                var restPos = new Vector3(nd.Pos.X, nd.Pos.Y, nd.Pos.Z);
+                var posKeys = FitKeys(pos, posOk, restPos, (f, d) =>
                 {
-                    track.Trans = new List<(int, Vector3)>(tk.Count);
-                    foreach (var (t, v) in tk)
-                    {
-                        int f = (int)MathF.Round(t * Fps);
-                        track.Trans.Add((f, transDiv != 0f ? v / transDiv : v));
-                        if (f > maxFrame) maxFrame = f;
-                    }
-                }
-                if (ch.Rotation is { Count: > 0 } rk)
+                    // error in world units: raw * parent accumulated scale
+                    var pa = p < 0 ? Vector3.One : poses[f].Acc[p];
+                    return (d * pa).Length() <= tolWorld;
+                });
+                if (posKeys != null)
                 {
-                    // Keyframes are sorted by time (glTF sampler requirement), so consecutive
-                    // entries are temporally adjacent: each one's BAMS triple is chosen to be
-                    // continuous with the previous, instead of an independent principal-value
-                    // decomposition per frame (see QuatToBamsContinuous for why that matters).
-                    track.Rot = new List<(int, int, int, int)>(rk.Count);
-                    (int X, int Y, int Z)? prevBams = null;
-                    foreach (var (t, q) in rk)
-                    {
-                        int f = (int)MathF.Round(t * Fps);
-                        var bams = QuatToBamsContinuous(q, prevBams);
-                        prevBams = bams;
-                        track.Rot.Add((f, bams.X, bams.Y, bams.Z));
-                        if (f > maxFrame) maxFrame = f;
-                    }
+                    float div = i == 0 ? 1f : AnimTransScale;
+                    track.Trans = posKeys.Select(k => (k, pos[Math.Min(k, frames - 1)] / div)).ToList();
                 }
-                if (track.Trans != null || track.Rot != null) motion.Tracks[enc] = track;
+
+                // rotation: BAMS, each frame's Euler triple continuous with the previous one
+                var rot = new Vector3[frames];
+                var rotOk = new bool[frames];
+                (int X, int Y, int Z)? prev = nd.RotBams;
+                for (int f = 0; f < frames; f++)
+                {
+                    var b = QuatToBamsContinuous(poses[f].Rot[i], prev);
+                    prev = b;
+                    rot[f] = new Vector3(b.X, b.Y, b.Z);
+                    rotOk[f] = true;
+                }
+                var restRot = new Vector3(nd.RotBams.X, nd.RotBams.Y, nd.RotBams.Z);
+                // equivalent triples (wrapped by 0x10000, or the other Euler branch) are the same pose
+                bool restRotEquivalent = rot.All(r => SamePose(r, restRot));
+                var rotKeys = restRotEquivalent ? null : FitKeys(rot, rotOk, restRot, (f, d) =>
+                    Math.Abs(d.X) <= RotTolBams && Math.Abs(d.Y) <= RotTolBams && Math.Abs(d.Z) <= RotTolBams,
+                    maxStep: 0x7F00);
+                if (rotKeys != null)
+                    track.Rot = rotKeys.Select(k => rot[Math.Min(k, frames - 1)])
+                        .Zip(rotKeys, (r, k) => (k, (int)r.X, (int)r.Y, (int)r.Z)).ToList();
+
+                // scale: RH0 local scale. A type-7 motion leaves the root's own scale alone.
+                if (i != 0)
+                {
+                    var sc = new Vector3[frames];
+                    var scOk = new bool[frames];
+                    for (int f = 0; f < frames; f++) { sc[f] = poses[f].Scale[i]; scOk[f] = true; }
+                    var restSc = new Vector3(nd.Scale.X, nd.Scale.Y, nd.Scale.Z);
+                    var scKeys = FitKeys(sc, scOk, restSc, (f, d) =>
+                    {
+                        var pa = p < 0 ? Vector3.One : poses[f].Acc[p];
+                        return (d * pa).Length() <= ScaleTol * Math.Max(pa.Length(), 1e-12f);
+                    });
+                    if (scKeys != null) track.Scale = scKeys.Select(k => (k, sc[Math.Min(k, frames - 1)])).ToList();
+                }
+
+                if (track.Trans != null || track.Rot != null || track.Scale != null) motion.Tracks[i] = track;
             }
-            motion.FrameCount = maxFrame + 1;
             motions.Add(motion);
         }
 
@@ -583,6 +720,192 @@ public static class RebuildPipeline
             FitDonorWorld = fitReport.DonorWorld,
             FitReason = fitReport.Reason,
         };
+    }
+
+    // ---- RH0 pose solving ----------------------------------------------------------------
+    // 2 BAMS = 0.011 deg, far below anything visible. 0.75 (the game's own integer rounding)
+    // fitted noise and came out ~9% denser than retail (card 671's attack: 15,362 keys
+    // against retail's 14,087).
+    private const float RotTolBams = 2f;
+    private const float ScaleTol = 1e-4f;    // relative to the parent's accumulated scale
+
+    /// One pose of the RH0 tree, per encoded node: raw position (pre parent scale), local
+    /// rotation, local scale, and accumulated scale. PosValid is false where the parent's
+    /// accumulated scale is 0 on some axis, which makes the raw position meaningless
+    /// (the game multiplies it by 0).
+    private sealed class Rh0Pose
+    {
+        public Vector3[] Pos, Scale, Acc;
+        public Quaternion[] Rot;
+        public bool[] PosValid;
+
+        public Rh0Pose(int n)
+        {
+            Pos = new Vector3[n];
+            Scale = new Vector3[n];
+            Acc = new Vector3[n];
+            Rot = new Quaternion[n];
+            PosValid = new bool[n];
+        }
+    }
+
+    /// Solves RH0 node values for a glb pose (anim == null: rest). RH0 scale propagates to
+    /// the children and multiplies their positions (lRhModel_SetupNoMotionRecursive @
+    /// 0x210010: local = T(position * parent scale) * R), while a glb translation is already
+    /// in parent-scaled units, so:
+    ///   accumulated A = S * s for the root, sigma * (glb world scale of the `_bone`) for a
+    ///   node that has one, else A_parent * s;
+    ///   local scale = A / A_parent; raw position = T / A_parent (the root's: T).
+    /// encGlb maps encoded node -> glb node (-1: synthetic, keeps its EncNode values).
+    private static Rh0Pose SolvePose(List<EncNode> nodes, int[] encGlb, ImportedModel im,
+        ImportedAnimation? anim, int frame, float S, float sigma)
+    {
+        int n = nodes.Count;
+        var pose = new Rh0Pose(n);
+        var glbScale = new Vector3[n]; // glb world scale (product of local scales)
+        for (int i = 0; i < n; i++)
+        {
+            int p = nodes[i].Parent;
+            var pa = p < 0 ? Vector3.One : pose.Acc[p];
+            var pg = p < 0 ? Vector3.One : glbScale[p];
+            int g = encGlb[i];
+            if (g < 0)
+            {
+                var nd = nodes[i];
+                pose.Pos[i] = new Vector3(nd.Pos.X, nd.Pos.Y, nd.Pos.Z);
+                pose.PosValid[i] = true;
+                pose.Rot[i] = Quaternion.Identity;
+                pose.Scale[i] = new Vector3(nd.Scale.X, nd.Scale.Y, nd.Scale.Z);
+                pose.Acc[i] = pa * pose.Scale[i];
+                glbScale[i] = pg;
+                continue;
+            }
+            var src = im.Nodes[g];
+            var (t, r, s) = LocalAt(im, g, anim, frame);
+            glbScale[i] = pg * s;
+            Vector3 acc;
+            if (p < 0) acc = S * s;
+            else if (src.ScaleBone >= 0) acc = sigma * glbScale[i] * LocalAt(im, src.ScaleBone, anim, frame).S;
+            else acc = pa * s;
+            pose.Acc[i] = acc;
+            pose.Scale[i] = p < 0 ? acc : SafeDiv(acc, pa, 1f);
+            pose.Rot[i] = r;
+            if (p < 0)
+            {
+                pose.Pos[i] = t;
+                pose.PosValid[i] = true;
+            }
+            else
+            {
+                pose.Pos[i] = SafeDiv(t, pa, 0f);
+                pose.PosValid[i] = !Tiny(pa.X) && !Tiny(pa.Y) && !Tiny(pa.Z);
+            }
+        }
+        return pose;
+    }
+
+    private static (Vector3 T, Quaternion R, Vector3 S) LocalAt(ImportedModel im, int g, ImportedAnimation? anim, int frame)
+    {
+        var n = im.Nodes[g];
+        var t = n.Translation;
+        var r = n.Rotation;
+        var s = n.Scale;
+        if (anim != null && anim.Channels.TryGetValue(g, out var c))
+        {
+            if (c.Translation is { Count: > 0 } ct) t = ct[Math.Min(frame, ct.Count - 1)].V;
+            if (c.Rotation is { Count: > 0 } cr) r = cr[Math.Min(frame, cr.Count - 1)].Q;
+            if (c.Scale is { Count: > 0 } cs) s = cs[Math.Min(frame, cs.Count - 1)].V;
+        }
+        return (t, r, s);
+    }
+
+    private static Vector3? FirstValidPos(List<EncNode> nodes, int[] encGlb, ImportedModel im, int i, float S, float sigma)
+    {
+        foreach (var anim in im.Animations)
+            for (int f = 0; f < anim.FrameCount; f++)
+            {
+                var pose = SolvePose(nodes, encGlb, im, anim, f, S, sigma);
+                if (pose.PosValid[i]) return pose.Pos[i];
+            }
+        return null;
+    }
+
+    private static bool Tiny(float v) => MathF.Abs(v) < 1e-12f;
+
+    private static Vector3 SafeDiv(Vector3 a, Vector3 b, float fallback) => new(
+        Tiny(b.X) ? fallback : a.X / b.X,
+        Tiny(b.Y) ? fallback : a.Y / b.Y,
+        Tiny(b.Z) ? fallback : a.Z / b.Z);
+
+    private static bool SamePose(Vector3 bams, Vector3 rest)
+    {
+        var a = Matrix4x4.CreateRotationX((float)(bams.X / BamsPerRad)) *
+                Matrix4x4.CreateRotationY((float)(bams.Y / BamsPerRad)) *
+                Matrix4x4.CreateRotationZ((float)(bams.Z / BamsPerRad));
+        var b = Matrix4x4.CreateRotationX((float)(rest.X / BamsPerRad)) *
+                Matrix4x4.CreateRotationY((float)(rest.Y / BamsPerRad)) *
+                Matrix4x4.CreateRotationZ((float)(rest.Z / BamsPerRad));
+        // 1.5 BAMS is ~1.4e-4 rad
+        const float tol = 1.4e-4f;
+        return MathF.Abs(a.M11 - b.M11) < tol && MathF.Abs(a.M12 - b.M12) < tol && MathF.Abs(a.M13 - b.M13) < tol &&
+               MathF.Abs(a.M21 - b.M21) < tol && MathF.Abs(a.M22 - b.M22) < tol && MathF.Abs(a.M23 - b.M23) < tol &&
+               MathF.Abs(a.M31 - b.M31) < tol && MathF.Abs(a.M32 - b.M32) < tol && MathF.Abs(a.M33 - b.M33) < tol;
+    }
+
+    /// Fits a key list to per-frame values for lRhModel_GetInterpolateMotionItem @ 0x210CF0,
+    /// which lerps each component between the keys around a frame. Returns the key frames,
+    /// or null when every frame matches `rest` (no track: the node keeps its default).
+    /// ok(frame, error) says whether an interpolated value is close enough; frames with
+    /// valid[f] false are free. The rules the game imposes: the first key is frame 0, frames
+    /// strictly increase, and a list with fewer than 3 keys plays key 0 only - so a constant
+    /// is one key, and a 2-key fit gets its last key repeated one frame later (identical
+    /// motion up to the last frame, then held). maxStep caps the change between consecutive
+    /// keys (angles: the game interpolates the short way round 0x10000).
+    private static List<int>? FitKeys(Vector3[] v, bool[] valid, Vector3 rest, Func<int, Vector3, bool> ok,
+        float maxStep = float.PositiveInfinity)
+    {
+        int n = v.Length;
+        // a value where it does not matter: hold the nearest one that does
+        int firstValid = Array.IndexOf(valid, true);
+        if (firstValid < 0) return null;
+        for (int f = 0; f < n; f++)
+            if (!valid[f]) v[f] = f < firstValid ? v[firstValid] : v[f - 1];
+
+        bool constant = true, atRest = true;
+        for (int f = 0; f < n; f++)
+        {
+            if (!valid[f]) continue;
+            constant &= ok(f, v[f] - v[0]);
+            atRest &= ok(f, v[f] - rest);
+        }
+        if (atRest) return null;
+        if (constant) return new List<int> { 0 };
+
+        var keys = new List<int> { 0 };
+        int a = 0;
+        while (a < n - 1)
+        {
+            int b = a + 1;
+            // extend the segment a..b while every frame between is reproduced
+            while (b + 1 < n && SegmentFits(v, valid, a, b + 1, ok, maxStep)) b++;
+            keys.Add(b);
+            a = b;
+        }
+        if (keys.Count == 2) keys.Add(keys[1] + 1);
+        return keys;
+    }
+
+    private static bool SegmentFits(Vector3[] v, bool[] valid, int a, int b, Func<int, Vector3, bool> ok, float maxStep)
+    {
+        var d = v[b] - v[a];
+        if (MathF.Abs(d.X) > maxStep || MathF.Abs(d.Y) > maxStep || MathF.Abs(d.Z) > maxStep) return false;
+        for (int f = a + 1; f < b; f++)
+        {
+            if (!valid[f]) continue;
+            float u = (f - a) / (float)(b - a);
+            if (!ok(f, v[a] + d * u - v[f])) return false;
+        }
+        return true;
     }
 
     // ---- UV-atlas slot merging ----------------------------------------------------------
@@ -702,9 +1025,10 @@ public static class RebuildPipeline
 
     private static void InitFramePositions(ImportedModel im)
     {
+        var undo = im.DroppedRootUndo ?? Matrix4x4.Identity;
         foreach (var prim in im.Primitives)
         foreach (var v in prim.Vertices)
-            v.FramePos = v.Pos;
+            v.FramePos = Vector3.Transform(v.Pos, undo);
     }
 
     // ---- root preparation / pivot guarantee -------------------------------------------
@@ -736,6 +1060,30 @@ public static class RebuildPipeline
         {
             var n = im.Nodes[g];
             return n.Parent < 0 && !n.HasMesh && !n.IsJoint && n.Children.Count == 0;
+        }
+
+        // Extractor output keeps the retail tree verbatim under MrgRoot, which carries only
+        // the -pivot recentring (ModelExtractor.WriteGlb). Drop just MrgRoot: retail's neutral
+        // nodes 0..3 above the first bone look like wrappers to the peel below, and peeling
+        // them shifts every DFS index (effect reference points, externally loaded motions).
+        // The shift is in every joint world and every vertex alike, so it cancels in the
+        // bone-local positions; node 0 keeps its own local transform and the model lands
+        // where retail has it. InitFramePositions undoes the shift for bounds.
+        if (im.IsDotrExtractedGlb)
+        {
+            int mrgSlot = im.RootNodes.FindIndex(r => im.Nodes[r].Name == "MrgRoot");
+            if (mrgSlot >= 0)
+            {
+                int mrg = im.RootNodes[mrgSlot];
+                var real = im.Nodes[mrg].Children.Where(c => !IsPureMeshInstancingLeaf(im, c)).ToList();
+                if (real.Count == 1)
+                {
+                    Matrix4x4.Invert(im.Nodes[mrg].WorldMatrix, out var undo);
+                    im.DroppedRootUndo = undo;
+                    im.Nodes[real[0]].Parent = -1;
+                    return (real[0], false, mrgSlot);
+                }
+            }
         }
 
         // prefer the first scene root that actually has children (the skinned-mesh node
@@ -1231,6 +1579,13 @@ public static class RebuildPipeline
     /// is irrelevant (the GS doesn't cull; the extractor re-orients by normals). Growth stops
     /// when the strip would exceed the per-batch VU budget (1 + sum(vnumOf) <= StripVuBudget)
     /// or, when `jointsOf` is given, span more than `maxJoints` distinct bones.
+    ///
+    /// Both the seed and each step follow the least-adjacency rule (SGI's tri-stripper): take
+    /// the triangle with the fewest still-free neighbours first. Seeding and stepping in
+    /// triangle order instead strands the mesh's fringe triangles - every one of them a
+    /// one-triangle strip at the end, and a strip costs a 24 B header plus, on a SHARED strip,
+    /// a whole repeated influence blob per vertex. Over the archive this is where the ~3%
+    /// excess against retail sat.
     private static List<List<int>> Stripify(List<(int A, int B, int C)> tris,
         Func<int, int> vnumOf, Func<int, int[]>? jointsOf, int maxJoints)
     {
@@ -1255,6 +1610,41 @@ public static class RebuildPipeline
         }
 
         var used = new bool[tris.Count];
+
+        // neighbour lists + live count of still-free neighbours, for the least-adjacency rule
+        var nbr = new List<int>[tris.Count];
+        for (int t = 0; t < tris.Count; t++) nbr[t] = new List<int>();
+        foreach (var l in edgeMap.Values)
+            for (int i = 0; i < l.Count; i++)
+            for (int j = i + 1; j < l.Count; j++)
+            {
+                if (!nbr[l[i]].Contains(l[j])) nbr[l[i]].Add(l[j]);
+                if (!nbr[l[j]].Contains(l[i])) nbr[l[j]].Add(l[i]);
+            }
+        var freeNbr = new int[tris.Count];
+        for (int t = 0; t < tris.Count; t++) freeNbr[t] = nbr[t].Count;
+
+        void Claim(int t)
+        {
+            used[t] = true;
+            foreach (int u in nbr[t]) freeNbr[u]--;
+        }
+
+        /// The free triangle on this edge with the fewest free neighbours of its own: stepping
+        /// into the more isolated side first leaves the open mesh behind us, not a fringe of
+        /// stranded single triangles. -1 when the edge has none left.
+        int LeastAdjacent(List<int> cand, HashSet<int> localUsed)
+        {
+            int best = -1, bestFree = int.MaxValue;
+            foreach (int t in cand)
+            {
+                if (used[t] || localUsed.Contains(t)) continue;
+                if (freeNbr[t] >= bestFree) continue;
+                bestFree = freeNbr[t];
+                best = t;
+            }
+            return best;
+        }
 
         int Third(int t, int p, int q)
         {
@@ -1297,13 +1687,7 @@ public static class RebuildPipeline
                 int p = strip[^2], q = strip[^1];
                 var k = p < q ? (p, q) : (q, p);
                 if (!edgeMap.TryGetValue(k, out var cand)) break;
-                int next = -1;
-                foreach (int t in cand)
-                    if (!used[t] && !localUsed.Contains(t))
-                    {
-                        next = t;
-                        break;
-                    }
+                int next = LeastAdjacent(cand, localUsed);
                 if (next < 0) break;
                 int r = Third(next, p, q);
                 if (!TryGrow(r, vnumOf(r))) break;
@@ -1324,13 +1708,7 @@ public static class RebuildPipeline
                 int p = strip[0], q = strip[1];
                 var k = p < q ? (p, q) : (q, p);
                 if (!edgeMap.TryGetValue(k, out var cand)) break;
-                int next = -1;
-                foreach (int t in cand)
-                    if (!used[t] && !localUsed.Contains(t))
-                    {
-                        next = t;
-                        break;
-                    }
+                int next = LeastAdjacent(cand, localUsed);
                 if (next < 0) break;
                 int r = Third(next, p, q);
                 if (!TryGrow(r, vnumOf(r))) break;
@@ -1344,17 +1722,30 @@ public static class RebuildPipeline
             return (strip, stripTris);
         }
 
-        for (int t = 0; t < tris.Count; t++)
+        // Seeds in least-adjacency order, lazily: a triangle is re-queued under its current
+        // count when it comes up stale, so the queue needs no decrease-key.
+        var seeds = new PriorityQueue<int, int>();
+        for (int t = 0; t < tris.Count; t++) seeds.Enqueue(t, freeNbr[t]);
+        int done = 0;
+        while (done < tris.Count && seeds.TryDequeue(out int t0, out int pri))
         {
-            if (used[t]) continue;
-            var (a, b, c) = tris[t];
-            var w1 = Walk(t, a, b, c);
-            var w2 = Walk(t, b, c, a);
-            var w3 = Walk(t, c, a, b);
+            if (used[t0]) continue;
+            if (pri != freeNbr[t0]) { seeds.Enqueue(t0, freeNbr[t0]); continue; }
+            var (a, b, c) = tris[t0];
+            var w1 = Walk(t0, a, b, c);
+            var w2 = Walk(t0, b, c, a);
+            var w3 = Walk(t0, c, a, b);
             var best = w1.Strip.Count >= w2.Strip.Count
                 ? (w1.Strip.Count >= w3.Strip.Count ? w1 : w3)
                 : (w2.Strip.Count >= w3.Strip.Count ? w2 : w3);
-            foreach (int u in best.Tris) used[u] = true;
+            foreach (int u in best.Tris)
+            {
+                Claim(u);
+                done++;
+                foreach (int n in nbr[u])
+                    if (!used[n])
+                        seeds.Enqueue(n, freeNbr[n]);
+            }
             strips.Add(best.Strip);
         }
         return strips;
@@ -1568,21 +1959,42 @@ public static class RebuildPipeline
         return (Q(n.X), Q(n.Y), Q(n.Z));
     }
 
+    /// Fixed-point values Q had to clamp in the last Build (positions, normals, UVs, weights).
+    /// Nonzero means geometry is distorted in game; card 178's hidden arms did this before the
+    /// extractor bound them at full size.
+    [ThreadStatic] public static int LastClampedValues;
+
     private static short Q(float v)
     {
         int r = (int)MathF.Round(v);
-        if (r > 32767) r = 32767;
-        else if (r < -32768) r = -32768;
+        if (r > 32767) { r = 32767; LastClampedValues++; }
+        else if (r < -32768) { r = -32768; LastClampedValues++; }
         return (short)r;
     }
 
-    private static (int X, int Y, int Z) QuatToBams(Quaternion q)
+    /// XYZ Euler (BAMS) of a rotation, for the game's RotX * RotY * RotZ. Worked in double with
+    /// atan2 throughout: asin(-m13) loses ~5 BAMS near ry = +-90 degrees, which retail uses a
+    /// lot (ry = 0x3FFF). There (gimbal lock) only rx and rz together are defined: rx is
+    /// taken as rxHint (the previous frame's, for continuity) and rz from what remains.
+    private static (int X, int Y, int Z) QuatToBams(Quaternion q, int rxHint = 0)
     {
-        var m = Matrix4x4.CreateFromQuaternion(q);
-        double m13 = Math.Clamp(m.M13, -1.0, 1.0);
-        double ry = Math.Asin(-m13);
-        double rx = Math.Atan2(m.M23, m.M33);
-        double rz = Math.Atan2(m.M12, m.M11);
+        double x = q.X, y = q.Y, z = q.Z, w = q.W;
+        double n = Math.Sqrt(x * x + y * y + z * z + w * w);
+        if (n > 0) { x /= n; y /= n; z /= n; w /= n; }
+        // System.Numerics (row-vector) rotation matrix elements
+        double m11 = 1 - 2 * (y * y + z * z), m12 = 2 * (x * y + z * w), m13 = 2 * (x * z - y * w);
+        double m21 = 2 * (x * y - z * w), m22 = 1 - 2 * (x * x + z * z), m23 = 2 * (y * z + x * w);
+        double m33 = 1 - 2 * (x * x + y * y);
+        double cy = Math.Sqrt(m11 * m11 + m12 * m12);
+        double ry = Math.Atan2(-m13, cy);
+        double rx = cy > 1e-6 ? Math.Atan2(m23, m33) : rxHint / BamsPerRad;
+        // M = Rx * Ry * Rz, so Rz = Ry^T * Rx^T * M; rz from its first row
+        double cxr = Math.Cos(rx), sxr = Math.Sin(rx), cyr = Math.Cos(ry), syr = Math.Sin(ry);
+        // first row of Ry^T * Rx^T: (cy, sx*sy, cx*sy), applied to M's columns 1 and 2
+        double m31 = 2 * (x * z + y * w), m32 = 2 * (y * z - x * w);
+        double n11 = cyr * m11 + sxr * syr * m21 + cxr * syr * m31;
+        double n12 = cyr * m12 + sxr * syr * m22 + cxr * syr * m32;
+        double rz = Math.Atan2(n12, n11);
         return (BamsRound(rx), BamsRound(ry), BamsRound(rz));
     }
 
@@ -1606,7 +2018,7 @@ public static class RebuildPipeline
     /// ~359 degrees where the original retail data only ever steps a few degrees per frame.
     private static (int X, int Y, int Z) QuatToBamsContinuous(Quaternion q, (int X, int Y, int Z)? prev)
     {
-        var principal = QuatToBams(q);
+        var principal = QuatToBams(q, prev?.X ?? 0);
         if (prev is not { } p) return principal;
 
         // Alternate Euler branch for the same rotation (XYZ convention): negate the pivot
@@ -1650,11 +2062,24 @@ public static class RebuildPipeline
         public readonly bool IsAlt;
         public readonly int R, G, B;
         public readonly float A;
+        public readonly (int R, int G, int B) C0, C2;
+        public readonly bool Untextured;
 
-        public MatKey(int tex, bool alt, Vector4 baseColor)
+        public MatKey(int tex, bool alt, Vector4 baseColor, (int R, int G, int B)? rawC1,
+                      (int R, int G, int B) c0, (int R, int G, int B) c2, bool untextured)
         {
             TexIdx = tex;
             IsAlt = alt;
+            Untextured = untextured;
+            C0 = c0;
+            C2 = c2;
+            A = Math.Clamp(baseColor.W, 0, 1) * 128f;
+            if (rawC1 is { } raw)
+            {
+                // the extractor's c1, unedited: written back as retail had it
+                (R, G, B) = raw;
+                return;
+            }
             // The +0x20 row is a lighting input the engine scales at runtime; retail's
             // neutral is (178,178,178), so exact White (the glTF default / "no tint")
             // maps to that for normal pages - emitting 255 bakes in a permanent ~1.43x
@@ -1673,11 +2098,11 @@ public static class RebuildPipeline
             // lRhModel_SetMaterialIntensity gates the +0x20 row's SET/MUL handling on
             // R != 0 - a pure-black red component would change engine behaviour, so clamp.
             if (R == 0) R = 1;
-            A = Math.Clamp(baseColor.W, 0, 1) * 128f;
         }
 
-        public bool Equals(MatKey o) => TexIdx == o.TexIdx && IsAlt == o.IsAlt && R == o.R && G == o.G && B == o.B && A == o.A;
+        public bool Equals(MatKey o) => TexIdx == o.TexIdx && IsAlt == o.IsAlt && R == o.R && G == o.G && B == o.B && A == o.A
+                                        && C0 == o.C0 && C2 == o.C2 && Untextured == o.Untextured;
         public override bool Equals(object? o) => o is MatKey m && Equals(m);
-        public override int GetHashCode() => HashCode.Combine(TexIdx, IsAlt, R, G, B, A);
+        public override int GetHashCode() => HashCode.Combine(HashCode.Combine(TexIdx, IsAlt, R, G, B, A), C0, C2, Untextured);
     }
 }

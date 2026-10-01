@@ -14,7 +14,7 @@ public class FileLoader : IDisposable
     public string[] folderNames = ["DATA", "MOVIE", "SOUND"];
     public string[] iso_data_files_all;
     public string[] iso_data_files_supported;
-    string[] unsupportedDataDefaults = ["BMODULE.MRG;1", "CMODULE.MRG;1", "MMODULE.MRG;1", "STAGECAM.MRG;1"];
+    string[] unsupportedDataDefaults = ["BMODULE.MRG", "CMODULE.MRG", "MMODULE.MRG", "STAGECAM.MRG"];
 
     public Action OnIsoloaded;
 
@@ -43,7 +43,7 @@ public class FileLoader : IDisposable
             List<string> supportedFiles = new List<string>();
             foreach (var file in iso_data_files_all)
             {
-                if (!unsupportedDataDefaults.Contains(file.Substring(5)))
+                if (!unsupportedDataDefaults.Contains(IsoPaths.FileName(file)))
                 {
                     supportedFiles.Add(file);
                 }

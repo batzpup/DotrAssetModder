@@ -34,7 +34,8 @@ namespace DotrAssetModder;
 //          bone-bind: { 0x30000007, d1, 0x10000000, 0x6C070000|vuAddr }
 //            d1 = (0x2|0x4)<<28 | (slot*0x10): matrix-table offset, tag 0x2 in Section1,
 //            0x4 in Section1Alt. Rebased per frame via aux0/aux1 (DynamicAddressBind).
-//          terminator: term0 = 0x30000000|(pktSize>>4), term1 = 0x30000000|sec2Off;
+//          terminator: term0 = 0x30000000|(pktSize>>4), term1 = (0x3|0x5)<<28|sec2Off
+//            (tag 3 = Section2 main, 5 = Section2Alt);
 //            walkOff = termOff+4 (relocated to absolute at load via RelocWalk).
 //   Section1Alt has NO opening tag / matrix table (the engine chains the alt copy
 //   manually and alt binds reference the MAIN copy's matrix table).
@@ -88,6 +89,9 @@ public sealed class EncPage
     public bool IsAlt;
     public (float R, float G, float B) Color = (178, 178, 178); // retail-neutral +0x20 row
     public float Alpha = 128f;          // 0..128
+    public (int R, int G, int B) Color0 = (127, 127, 127); // material record +0x10
+    public (int R, int G, int B) Color2 = (255, 255, 255); // material record +0x30
+    public bool Untextured;             // strips drawn with PRIM TME off (retail's 131 untextured strips)
     public List<EncStrip> Strips = new();
     public List<EncBoneBind> BoneBinds = new();
     public int TexIdx;                  // used later for the dispatch table (6.4)
@@ -118,7 +122,11 @@ public sealed class GeometryWriteResult
 public static class GeometryWriter
 {
     private const int VuBudget = 224;          // proven-safe per-batch VU address ceiling
-    private const uint TemplateY = 0x301E4000; // header word 1 (const)
+    private const uint TemplateY = 0x301E4000; // header word 1: GIF tag, PRIM 0x3C (tristrip, IIP, TME, FGE)
+    // Alpha-chain strips also set PRIM ABE (0x40): it is what makes the GS blend. Retail
+    // sets it on exactly the alpha-chain strips (8,176) and on no opaque one.
+    private const uint PrimAbe = 0x40u << 15;
+    private const uint PrimTme = 0x10u << 15;
     private const uint TemplateZIndep = 0x00000412;
     private const uint TemplateZShared = 0x00008412;
     private const int MatrixEntrySize = 0x70;  // 7 qwords per mesh-slot matrix entry
@@ -175,7 +183,7 @@ public static class GeometryWriter
         // Sticky state across pages: texture-context record on texture change, material
         // record on colour/alpha change (matches retail page streams).
         int lastTex = -1;
-        (int R, int G, int B, int A) lastMat = (-1, -1, -1, -1);
+        (int R, int G, int B, float A, (int, int, int) C0, (int, int, int) C2) lastMat = (-1, -1, -1, -1, (-1, -1, -1), (-1, -1, -1));
         uint secTag = isAlt ? 0x40000000u : 0x20000000u;
 
         foreach (var page in pages)
@@ -198,11 +206,11 @@ public static class GeometryWriter
             int curR = (int)MathF.Round(page.Color.R);
             int curG = (int)MathF.Round(page.Color.G);
             int curB = (int)MathF.Round(page.Color.B);
-            int curA = (int)MathF.Round(page.Alpha);
-            if ((curR, curG, curB, curA) != lastMat)
+            float curA = page.Alpha;   // retail has fractional alphas (63.5)
+            if ((curR, curG, curB, curA, page.Color0, page.Color2) != lastMat)
             {
-                WriteMaterial(sec1, curR, curG, curB, curA);
-                lastMat = (curR, curG, curB, curA);
+                WriteMaterial(sec1, page.Color0, curR, curG, curB, page.Alpha, page.Color2);
+                lastMat = (curR, curG, curB, curA, page.Color0, page.Color2);
             }
             foreach (var bb in page.BoneBinds)
             {
@@ -211,8 +219,10 @@ public static class GeometryWriter
             }
 
             // terminator (16B): term0, term1, 0, 0 ; walkOff points at term1
+            // term1 is a tagged pointer that RhModel_BindAddress rebases by its tag: 3 =
+            // Section2, 5 = Section2Alt. Retail alt chains use tag 5 on every packet REF.
             uint term0 = 0x30000000u | (uint)(page.PktSize >> 4);
-            uint term1 = 0x30000000u | (uint)page.Sec2Off;
+            uint term1 = (isAlt ? 0x50000000u : 0x30000000u) | (uint)page.Sec2Off;
             WriteU32(sec1, term0);
             page.WalkOff = (int)sec1.Length; // == termOff + 4
             WriteU32(sec1, term1);
@@ -233,7 +243,7 @@ public static class GeometryWriter
             for (int i = 0; i < batch.Count; i++)
             {
                 bool last = i == batch.Count - 1;
-                a = WriteStrip(sec2, batch[i], a, last);
+                a = WriteStrip(sec2, batch[i], a, last, page.IsAlt, page.Untextured);
             }
             WriteU32(sec2, 0x15000000); // MSCALF
             batch.Clear();
@@ -252,8 +262,9 @@ public static class GeometryWriter
     }
 
     /// Emits one strip at VU address `a`; returns the next free VU address.
-    private static int WriteStrip(MemoryStream s, EncStrip strip, int a, bool last)
+    private static int WriteStrip(MemoryStream s, EncStrip strip, int a, bool last, bool blend, bool untextured)
     {
+        uint gifTag = (TemplateY | (blend ? PrimAbe : 0u)) & (untextured ? ~PrimTme : ~0u);
         int vnum = VertUnpackNum(strip);
         int nvField = strip.Verts.Count | (last ? 0x8000 : 0);
 
@@ -261,7 +272,7 @@ public static class GeometryWriter
         {
             WriteU32(s, 0x6C010000u | (uint)(a | 0x8000));           // UNPACK V4-32 num=1
             WriteU32(s, (uint)nvField);                              // X = nv (|bit15)
-            WriteU32(s, TemplateY);                                  // Y
+            WriteU32(s, gifTag);                                  // Y
             WriteU32(s, TemplateZIndep);                             // Z
             WriteU32(s, (uint)strip.IndepVuAddr);                    // W = this strip's bone VU slot
             WriteU32(s, 0x69000000u | ((uint)vnum << 16) | (uint)((a + 1) | 0x8000)); // V3-16
@@ -279,7 +290,7 @@ public static class GeometryWriter
         {
             WriteU32(s, 0x68010000u | (uint)(a | 0x8000));           // UNPACK V3-32 num=1
             WriteU32(s, (uint)nvField);
-            WriteU32(s, TemplateY);
+            WriteU32(s, gifTag);
             WriteU32(s, TemplateZShared);
             WriteU32(s, 0x69000000u | ((uint)vnum << 16) | (uint)((a + 1) | 0x8000));
             int wrote = 0;
@@ -332,18 +343,20 @@ public static class GeometryWriter
     }
 
     /// Material record (0x40 bytes): cnt tag + VIF FLUSHE + UNPACK V4-32 num=3 to VU 0x3C.
-    /// +0x10 / +0x30 are per-material lighting triples (vary in retail; glb can't carry them)
-    /// — we emit the retail defaults (127,127,127 / 255,255,255). +0x20 = page RGBA; these
-    /// rows are also what lRhModel_SetMaterialIntensity@0x210080 patches at runtime.
-    private static void WriteMaterial(MemoryStream s, int r, int g, int b, int a)
+    /// +0x10 / +0x30 are per-material lighting triples (vary in retail; an extracted glb
+    /// carries them in DOTR_blend, otherwise the retail defaults 127,127,127 / 255,255,255).
+    /// +0x20 = page RGBA; these rows are also what lRhModel_SetMaterialIntensity@0x210080
+    /// patches at runtime.
+    private static void WriteMaterial(MemoryStream s, (int R, int G, int B) c0, int r, int g, int b, float a,
+                                      (int R, int G, int B) c2)
     {
         WriteU32(s, 0x10000003);
         WriteU32(s, 0x00000000);
         WriteU32(s, 0x10000000);
         WriteU32(s, 0x6C03003C);
-        WriteF32(s, 127f); WriteF32(s, 127f); WriteF32(s, 127f); WriteU32(s, 0);
+        WriteF32(s, c0.R); WriteF32(s, c0.G); WriteF32(s, c0.B); WriteU32(s, 0);
         WriteF32(s, r); WriteF32(s, g); WriteF32(s, b); WriteF32(s, a); // +0x20 RGBA
-        WriteF32(s, 255f); WriteF32(s, 255f); WriteF32(s, 255f); WriteU32(s, 0);
+        WriteF32(s, c2.R); WriteF32(s, c2.G); WriteF32(s, c2.B); WriteU32(s, 0);
     }
 
     /// Bone-bind: ref tag DMA-ing this slot's 7-qword matrix from the Section1 scratch copy

@@ -66,7 +66,7 @@ public class ModelViewerWindow
 
     void ButtonLoadModel()
     {
-        DialogResult dialogResult = Dialog.FileOpen("glb,gltf");
+        DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf"));
         if (!dialogResult.IsOk)
         {
             return;

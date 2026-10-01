@@ -237,9 +237,9 @@ public class MusicExtractorWindow
 
             foreach (var file in fileEntry)
             {
-                if (!Path.GetFileName(file).StartsWith("00"))
+                string fileName = IsoPaths.FileName(file);
+                if (!fileName.StartsWith("00"))
                     continue;
-                string pathFileName = Path.GetFileName(file);
 
                 if (!Directory.Exists(bgmPath))
                 {
@@ -249,7 +249,6 @@ public class MusicExtractorWindow
                 {
                     Directory.CreateDirectory(pcmPath);
                 }
-                string fileName = pathFileName.Substring(0, pathFileName.Length - 2);
                 string extractedFilePath = Path.Combine(pcmPath, fileName);
                 RawSourceWaveStream pcmReader;
                 using (FileStream fileStream = File.OpenWrite(extractedFilePath))
@@ -260,7 +259,7 @@ public class MusicExtractorWindow
                 }
                 using (FileStream fileStream = File.OpenRead(extractedFilePath))
                 {
-                    string mp3FilePath = Path.Combine(bgmPath, Path.GetFileNameWithoutExtension(file) + ".mp3");
+                    string mp3FilePath = Path.Combine(bgmPath, IsoPaths.FileNameWithoutExtension(file) + ".mp3");
                     var desiredBitRate = 0; // ask for lowest available bitrate
                     pcmReader = new RawSourceWaveStream(fileStream, new WaveFormat(48000, 16, 1));
                     MediaFoundationEncoder.EncodeToMp3(pcmReader, mp3FilePath, desiredBitRate);

@@ -27,9 +27,5 @@
       <EmbeddedResource Include="fonts\NotoSansJP-Regular.ttf" />
     </ItemGroup>
 
-    <ItemGroup>
-      <Content Include="DotrAssetModder.sln.DotSettings.user" />
-    </ItemGroup>
-
 
 </Project>

@@ -777,7 +777,7 @@ public class TextureEditorWindow : IDisposable
         mrgBytes = FileLoader.Instance.GetFileBytesFromDisk(TextureSlotManager.IsoPath(name));
         slots = kind == TextureMrgKind.Icon
             ? TextureSlotManager.LoadIconSlots(mrgBytes)
-            : TextureSlotManager.LoadRh2Slots(mrgBytes);
+            : TextureSlotManager.LoadRh2Slots(mrgBytes, name);
 
         if (slots.Count > 0)
         {
@@ -912,7 +912,7 @@ public class TextureEditorWindow : IDisposable
             return;
         }
         var slot = slots[currentIndex];
-        var r = Dialog.FileOpen("png,jpg,jpeg,webp");
+        var r = Dialog.FileOpen(FileDialogFilter.Of("png,jpg,jpeg,webp"));
         if (!r.IsOk)
         {
             return;

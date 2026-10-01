@@ -17,8 +17,10 @@ public sealed class TextureSlot
     public int Height;
     public TextureMrgKind Kind;
     public int IconIndex;
+    internal Rh2Decoder.AlphaTreat Alpha;
 
-    public TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1)
+    internal TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1,
+        Rh2Decoder.AlphaTreat alpha = Rh2Decoder.AlphaTreat.Keep)
     {
         Bytes = bytes;
         Thumbnail = thumbnail;
@@ -26,6 +28,7 @@ public sealed class TextureSlot
         Height = height;
         Kind = kind;
         IconIndex = iconIndex;
+        Alpha = alpha;
     }
 }
 
@@ -34,7 +37,7 @@ public static class TextureSlotManager
   public static IEnumerable<string> GetTextureMrgs()
 {
     return FileLoader.Instance.iso_data_files_supported
-        .Select(Path.GetFileName)
+        .Select(IsoPaths.FileName)
         .Where(name =>
             name.StartsWith("PICTURE", StringComparison.OrdinalIgnoreCase) ||
             name.StartsWith("PICMINI", StringComparison.OrdinalIgnoreCase) ||
@@ -56,23 +59,40 @@ public static class TextureSlotManager
 
     public static bool IsoHasFile(string name)
     {
-        return FileLoader.Instance.iso_data_files_all?.Any(f => f.EndsWith(name, StringComparison.OrdinalIgnoreCase)) == true;
+        return FileLoader.Instance.iso_data_files_all?.Any(f => IsoPaths.NameEquals(f, name)) == true;
     }
 
     public static string IsoPath(string name)
     {
-        return FileLoader.Instance.iso_data_files_all.First(f => f.EndsWith(name , StringComparison.OrdinalIgnoreCase));
+        return FileLoader.Instance.iso_data_files_all.First(f => IsoPaths.NameEquals(f, name));
     }
 
-    public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes)
+    // Card art and event pictures are drawn by the game with alpha test and blending off,
+    // so their palette alpha is never seen in-game. Their 5551 CLUTs still carry black
+    // entries with STP clear (0x0000), which decode as alpha 0 and punched holes through
+    // every black pixel of the art. Effect and model sheets do rely on that alpha
+    // (black STP-clear backgrounds are cut out), so they keep it.
+    internal static Rh2Decoder.AlphaTreat AlphaTreatFor(string mrgName)
     {
+        string n = IsoPaths.FileName(mrgName);
+        bool drawnOpaque =
+            n.StartsWith("PICTURE", StringComparison.OrdinalIgnoreCase) ||
+            n.StartsWith("PICMINI", StringComparison.OrdinalIgnoreCase) ||
+            n.StartsWith("PICPACK", StringComparison.OrdinalIgnoreCase) ||
+            n.StartsWith("TEXEVE", StringComparison.OrdinalIgnoreCase);
+        return drawnOpaque ? Rh2Decoder.AlphaTreat.ForceOpaque : Rh2Decoder.AlphaTreat.Keep;
+    }
+
+    public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes, string mrgName)
+    {
+        var alpha = AlphaTreatFor(mrgName);
         var slots = new List<TextureSlot>();
         var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
         foreach (uint off in offsets)
         {
             try
             {
-                var dec = Rh2Decoder.Decode(mrgBytes, (int)off, Rh2Decoder.AlphaTreat.Keep);
+                var dec = Rh2Decoder.Decode(mrgBytes, (int)off, alpha);
                 if (dec.IsEmpty)
                     continue;
                 var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
@@ -80,7 +100,7 @@ public static class TextureSlotManager
                 bmp.Dispose();
                 int next = offsets.Count > slots.Count + 1 ? (int)offsets[slots.Count + 1] : mrgBytes.Length;
                 var slotBytes = mrgBytes.AsSpan((int)off, next - (int)off).ToArray();
-                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2));
+                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2, alpha: alpha));
             }
             catch (Exception ex)
             {
@@ -134,7 +154,8 @@ public static class TextureSlotManager
         // alpha-blended over the scene. Forcing alpha to 255 here discarded that alpha
         // channel - the only channel with real content - leaving nothing but the flat grey
         // RGB, which is why some textures rendered as plain grey boxes in the viewer.
-        var dec = Rh2Decoder.Decode(slot.Bytes, 0, Rh2Decoder.AlphaTreat.Keep);
+        // Only MRGs the game draws opaque drop alpha (see AlphaTreatFor).
+        var dec = Rh2Decoder.Decode(slot.Bytes, 0, slot.Alpha);
         return RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
     }
 

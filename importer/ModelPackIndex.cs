@@ -43,12 +43,33 @@ public static class ModelPackIndex
                                     // NOT reuse this for the replacement (ties newBlock's
                                     // padding to 0x800 instead, see ReplaceAt's remarks)
         public uint Flags;         // header+0x04 (mot-chain-shape bits, model-type bits)
-        public int NodeCount;      // (header+0x14 nodeTreeSize - 0x10 bounds record) / 0x30
+        public int NodeCount;      // nodes reachable from the root (child/sibling links)
         public int TexCount;       // texTable's own count field (header+0x38 -> +0x00)
         public bool HasEmbeddedMot;// flags bit 0..7 nonzero (this block carries its own MOT)
     }
 
     private static uint U32(ReadOnlySpan<byte> d, long o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice((int)o));
+
+    // Walks child (+0x1C) / sibling (+0x2C) links from the root. The size alone can't tell
+    // retail 64-byte nodes from the old importer's 48-byte nodes plus a 16-byte record.
+    private static int CountNodes(byte[] pack, long treeAbs, int treeSize)
+    {
+        int count = 0;
+        var stack = new Stack<long>();
+        var seen = new HashSet<long>();
+        stack.Push(0);
+        while (stack.Count > 0)
+        {
+            long off = stack.Pop();
+            if (off < 0 || off + 0x30 > treeSize || treeAbs + off + 0x30 > pack.Length || !seen.Add(off)) continue;
+            count++;
+            long child = U32(pack, treeAbs + off + 0x1C) & 0x0FFFFFFF;
+            long sib = U32(pack, treeAbs + off + 0x2C) & 0x0FFFFFFF;
+            if (sib != 0) stack.Push(sib);
+            if (child != 0) stack.Push(child);
+        }
+        return count;
+    }
 
     // The gap between one block's computed end and the next block's real start is NOT a
     // fixed alignment rule - verified against the real MODEL.MRG, it varies block to block
@@ -87,7 +108,7 @@ public static class ModelPackIndex
             int nodeTreeSize = (int)U32(pack, pos + 0x14);
             int texTableOff = (int)U32(pack, pos + 0x38);
 
-            int nodeCount = nodeTreeSize >= 0x10 ? (nodeTreeSize - 0x10) / 0x30 : 0;
+            int nodeCount = CountNodes(pack, pos + nodeTreeOff, nodeTreeSize);
             int texCount = 0;
             long texTableAbs = pos + texTableOff;
             if (texTableAbs >= pos && texTableAbs + 4 <= end)

@@ -54,6 +54,8 @@ public sealed class AnimatedGltfModel : IDisposable
         public Vector3[] LocalPos;  // bind-space positions
         public Vector4[] Joints;    // per-vertex joint indices (null => rigid)
         public Vector4[] Weights;   // per-vertex weights
+        public Vector4[] Joints1;   // JOINTS_1/WEIGHTS_1: influences 5-8 (null => none)
+        public Vector4[] Weights1;
         public int[] Tri;           // flat triangle indices into LocalPos (len 3*TriCount)
 
         public int MaterialIndex = -1;
@@ -79,6 +81,9 @@ public sealed class AnimatedGltfModel : IDisposable
     SceneInstance _instance;
     readonly List<List<Renderable>> _byDrawable = new(); // aligned to DrawableInstances order
     readonly List<Renderable> _all = new();
+    // First renderable built for each glTF material. Rigid models split one material
+    // across many per-bone primitives; they all share that one set of GPU textures.
+    readonly Dictionary<int, Renderable> _materialOwners = new();
 
     RlMaterial _drawMaterial;
     Raylib_cs.Shader _defaultShader;
@@ -86,6 +91,7 @@ public sealed class AnimatedGltfModel : IDisposable
     Texture2D _whiteTex;
     bool _hasDrawMaterial;
     bool _hasAlphaMaskShader;
+    int _alphaCutoffLoc = -1;
 
     private const string AlphaMaskFragmentShader = @"#version 330
         in vec2 fragTexCoord;
@@ -94,11 +100,12 @@ public sealed class AnimatedGltfModel : IDisposable
 
         uniform sampler2D texture0;
         uniform vec4 colDiffuse;
+        uniform float alphaCutoff;
 
         void main()
         {
             vec4 color = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
-            if (color.a < 0.5) discard;
+            if (color.a < alphaCutoff) discard;
             finalColor = vec4(color.rgb, 1.0);
         }";
 
@@ -194,6 +201,8 @@ public sealed class AnimatedGltfModel : IDisposable
         _defaultShader = _drawMaterial.Shader;
         _alphaMaskShader = Raylib.LoadShaderFromMemory(null, AlphaMaskFragmentShader);
         _hasAlphaMaskShader = _alphaMaskShader.Id != 0;
+        if (_hasAlphaMaskShader)
+            _alphaCutoffLoc = Raylib.GetShaderLocation(_alphaMaskShader, "alphaCutoff");
         _hasDrawMaterial = true;
         unsafe { _whiteTex = _drawMaterial.Maps[(int)MaterialMapIndex.Albedo].Texture; }
     }
@@ -212,6 +221,9 @@ public sealed class AnimatedGltfModel : IDisposable
         var wAcc = prim.GetVertexAccessor("WEIGHTS_0");
         var joints = jAcc?.AsVector4Array();
         var weights = wAcc?.AsVector4Array();
+        // DotR vertices carry up to 8 influences; the extractor writes the second four here
+        var joints1 = prim.GetVertexAccessor("JOINTS_1")?.AsVector4Array();
+        var weights1 = prim.GetVertexAccessor("WEIGHTS_1")?.AsVector4Array();
 
         // Flatten triangle indices (handles strips/fans too).
         var triList = new List<int>(V * 3);
@@ -238,10 +250,34 @@ public sealed class AnimatedGltfModel : IDisposable
             r.Joints = new Vector4[V];
             r.Weights = new Vector4[V];
             for (int i = 0; i < V; i++) { r.Joints[i] = joints[i]; r.Weights[i] = weights[i]; }
+            if (joints1 != null && weights1 != null && joints1.Count == V)
+            {
+                r.Joints1 = new Vector4[V];
+                r.Weights1 = new Vector4[V];
+                for (int i = 0; i < V; i++) { r.Joints1[i] = joints1[i]; r.Weights1[i] = weights1[i]; }
+            }
         }
 
         // Material tint + base color texture.
-        BuildMaterial(prim.Material, r);
+        if (r.MaterialIndex >= 0 && _materialOwners.TryGetValue(r.MaterialIndex, out Renderable? owner))
+        {
+            r.Tint = owner.Tint;
+            r.HasTexture = owner.HasTexture;
+            r.Texture = owner.Texture;
+            r.Additive = owner.Additive;
+            r.AlphaBlend = owner.AlphaBlend;
+            r.AlphaMask = owner.AlphaMask;
+            r.AlphaCutoff = owner.AlphaCutoff;
+            r.HasAnim = owner.HasAnim;
+            r.AnimFrames = owner.AnimFrames;
+            r.AnimTimes = owner.AnimTimes;
+            r.AnimDuration = owner.AnimDuration;
+        }
+        else
+        {
+            BuildMaterial(prim.Material, r);
+            if (r.MaterialIndex >= 0) _materialOwners[r.MaterialIndex] = r;
+        }
 
         // Allocate GPU buffers (RL_MALLOC so UnloadMesh frees them) and fill static channels.
         int gpuVerts = r.Indexed ? V : r.TriCount * 3;
@@ -295,7 +331,11 @@ public sealed class AnimatedGltfModel : IDisposable
         }
         else
         {
-            // Backward compatibility for older/non-DOTR glTF files.
+            // Backward compatibility for older/non-DOTR glTF files. Generic DCC
+            // exporters (Blender, Maya, ...) commonly default a material's alphaMode
+            // to BLEND regardless of whether its texture actually carries alpha, so
+            // this is only a starting guess - it gets vetoed below once the base
+            // color texture's real alpha channel has been decoded.
             r.Additive = false;
             r.AlphaBlend = mat != null && mat.Alpha == AlphaMode.BLEND;
             r.AlphaMask = mat != null && mat.Alpha == AlphaMode.MASK;
@@ -333,23 +373,88 @@ public sealed class AnimatedGltfModel : IDisposable
                 if (img.IsValid)
                 {
                     string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
-                    string tmp = Path.Combine(Path.GetTempPath(), "rlgltf_" + Guid.NewGuid().ToString("N") + "." + ext);
-                    img.SaveToFile(tmp);
-
-                    RlImage cpu = Raylib.LoadImage(tmp);
+                    RlImage cpu = Raylib.LoadImageFromMemory("." + ext, img.Content.ToArray());
                     if (cpu.Width > 0 && cpu.Height > 0)
                     {
+                        if (!hasDotrBlend && (r.AlphaBlend || r.AlphaMask) && !ImageHasAlpha(cpu))
+                        {
+                            // The foreign glTF's alphaMode guess doesn't match reality -
+                            // the decoded texture has no transparent/semi-transparent
+                            // texels, so don't push an opaque mesh into the no-depth-write
+                            // blend pass.
+                            r.AlphaBlend = false;
+                            r.AlphaMask = false;
+                        }
                         r.Texture = Raylib.LoadTextureFromImage(cpu);
                         r.HasTexture = r.Texture.Id != 0;
+                        if (r.HasTexture) ApplySampler(mat, r.Texture);
                         Raylib.UnloadImage(cpu);
                     }
-                    try { File.Delete(tmp); } catch { }
                 }
             }
         }
         catch { }
 
         LoadTextureAnimation(mat, r);
+    }
+
+    // Applies the material's glTF sampler (written by the extractor from the GS
+    // CLAMP/TEX1 registers) to a Raylib texture. Raylib's default is REPEAT on both
+    // axes, which lets bilinear filtering at a clamped edge pull in the opposite side
+    // of an atlas. glbs without a sampler keep Raylib's defaults.
+    static void ApplySampler(GltfMaterial? mat, Texture2D tex)
+    {
+        const int GlTextureWrapS = 0x2802;
+        const int GlTextureWrapT = 0x2803;
+        const int GlRepeat = 0x2901;
+        const int GlClampToEdge = 0x812F;
+        const int GlMirroredRepeat = 0x8370;
+        try
+        {
+            SharpGLTF.Schema2.MaterialChannel? ch = mat?.FindChannel("BaseColor");
+            if (!ch.HasValue) return;
+            SharpGLTF.Schema2.TextureSampler? sampler = ch.Value.TextureSampler;
+            if (sampler == null) return;
+
+            int wrapS = GlRepeat;
+            int wrapT = GlRepeat;
+            if (sampler.WrapS == SharpGLTF.Schema2.TextureWrapMode.CLAMP_TO_EDGE) wrapS = GlClampToEdge;
+            if (sampler.WrapS == SharpGLTF.Schema2.TextureWrapMode.MIRRORED_REPEAT) wrapS = GlMirroredRepeat;
+            if (sampler.WrapT == SharpGLTF.Schema2.TextureWrapMode.CLAMP_TO_EDGE) wrapT = GlClampToEdge;
+            if (sampler.WrapT == SharpGLTF.Schema2.TextureWrapMode.MIRRORED_REPEAT) wrapT = GlMirroredRepeat;
+            Rlgl.TextureParameters(tex.Id, GlTextureWrapS, wrapS);
+            Rlgl.TextureParameters(tex.Id, GlTextureWrapT, wrapT);
+
+            if (sampler.MagFilter == SharpGLTF.Schema2.TextureInterpolationFilter.LINEAR)
+            {
+                Raylib.SetTextureFilter(tex, TextureFilter.Bilinear);
+            }
+            if (sampler.MagFilter == SharpGLTF.Schema2.TextureInterpolationFilter.NEAREST)
+            {
+                Raylib.SetTextureFilter(tex, TextureFilter.Point);
+            }
+        }
+        catch { }
+    }
+
+    static bool ImageHasAlpha(RlImage img)
+    {
+        RlImage rgba = Raylib.ImageCopy(img);
+        try
+        {
+            Raylib.ImageFormat(ref rgba, PixelFormat.UncompressedR8G8B8A8);
+            int count = rgba.Width * rgba.Height;
+            if (count <= 0) return false;
+            byte[] bytes = new byte[count * 4];
+            unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)rgba.Data, bytes, 0, bytes.Length); }
+            for (int i = 3; i < bytes.Length; i += 4)
+                if (bytes[i] != 255) return true;
+            return false;
+        }
+        finally
+        {
+            Raylib.UnloadImage(rgba);
+        }
     }
 
     static bool TryReadDotrBlendInfo(GltfMaterial? mat, out string? mode, out float alphaCutoff)
@@ -407,16 +512,18 @@ public sealed class AnimatedGltfModel : IDisposable
                 var content = _gltf.LogicalImages[imgIdx].Content;
                 if (!content.IsValid) continue;
                 string ext = string.IsNullOrEmpty(content.FileExtension) ? "png" : content.FileExtension;
-                string tmp = Path.Combine(Path.GetTempPath(), "rlgltfanm_" + Guid.NewGuid().ToString("N") + "." + ext);
-                content.SaveToFile(tmp);
-                RlImage cpu = Raylib.LoadImage(tmp);
+                RlImage cpu = Raylib.LoadImageFromMemory("." + ext, content.Content.ToArray());
                 if (cpu.Width > 0 && cpu.Height > 0)
                 {
                     Texture2D t2d = Raylib.LoadTextureFromImage(cpu);
                     Raylib.UnloadImage(cpu);
-                    if (t2d.Id != 0) { texList.Add(t2d); timeList.Add(t); }
+                    if (t2d.Id != 0)
+                    {
+                        ApplySampler(mat, t2d);
+                        texList.Add(t2d);
+                        timeList.Add(t);
+                    }
                 }
-                try { File.Delete(tmp); } catch { }
             }
 
             if (texList.Count >= 2 && duration > 0f)
@@ -461,7 +568,9 @@ public sealed class AnimatedGltfModel : IDisposable
         {
             IReadOnlyList<Matrix4x4> skin = st.SkinMatrices; // already jointWorld * inverseBind
             for (int v = 0; v < r.V; v++)
-                outv[v] = Vector3.Transform(r.LocalPos[v], Blend(skin, r.Joints[v], r.Weights[v]));
+                outv[v] = Vector3.Transform(r.LocalPos[v], r.Joints1 == null
+                    ? Blend(skin, r.Joints[v], r.Weights[v])
+                    : Blend(skin, r.Joints[v], r.Weights[v], r.Joints1[v], r.Weights1![v]));
         }
         else if (xform is SharpGLTF.Transforms.RigidTransform rt)
         {
@@ -483,6 +592,22 @@ public sealed class AnimatedGltfModel : IDisposable
         m = Add(m, skin, (int)j.Z, w.Z);
         m = Add(m, skin, (int)j.W, w.W);
         float tw = w.X + w.Y + w.Z + w.W;
+        if (tw < 1e-5f) return Matrix4x4.Identity; // avoid collapsing unweighted verts
+        return m;
+    }
+
+    static Matrix4x4 Blend(IReadOnlyList<Matrix4x4> skin, Vector4 j, Vector4 w, Vector4 j1, Vector4 w1)
+    {
+        Matrix4x4 m = default; // all zeros
+        m = Add(m, skin, (int)j.X, w.X);
+        m = Add(m, skin, (int)j.Y, w.Y);
+        m = Add(m, skin, (int)j.Z, w.Z);
+        m = Add(m, skin, (int)j.W, w.W);
+        m = Add(m, skin, (int)j1.X, w1.X);
+        m = Add(m, skin, (int)j1.Y, w1.Y);
+        m = Add(m, skin, (int)j1.Z, w1.Z);
+        m = Add(m, skin, (int)j1.W, w1.W);
+        float tw = w.X + w.Y + w.Z + w.W + w1.X + w1.Y + w1.Z + w1.W;
         if (tw < 1e-5f) return Matrix4x4.Identity; // avoid collapsing unweighted verts
         return m;
     }
@@ -559,6 +684,8 @@ public sealed class AnimatedGltfModel : IDisposable
             foreach (var r in _all)
             {
                 if (!r.AlphaMask) continue;
+                if (_alphaCutoffLoc >= 0)
+                    Raylib.SetShaderValue(_alphaMaskShader, _alphaCutoffLoc, r.AlphaCutoff, ShaderUniformDataType.Float);
                 DrawOne(r);
             }
             _drawMaterial.Shader = _defaultShader;
@@ -623,6 +750,9 @@ public sealed class AnimatedGltfModel : IDisposable
     {
         unsafe
         {
+            // Textures are shared between renderables of the same material, so
+            // unload each GPU texture once.
+            HashSet<uint> unloaded = new HashSet<uint>();
             foreach (var r in _all)
             {
                 // If your Raylib-cs declares UnloadMesh(ref Mesh), use: Raylib.UnloadMesh(ref r.Mesh);
@@ -630,11 +760,14 @@ public sealed class AnimatedGltfModel : IDisposable
                 if (r.HasAnim)
                 {
                     // r.Texture aliases AnimFrames[0]; unload the frame array only.
-                    foreach (var t in r.AnimFrames) Raylib.UnloadTexture(t);
+                    foreach (var t in r.AnimFrames)
+                    {
+                        if (unloaded.Add(t.Id)) Raylib.UnloadTexture(t);
+                    }
                 }
                 else if (r.HasTexture)
                 {
-                    Raylib.UnloadTexture(r.Texture);
+                    if (unloaded.Add(r.Texture.Id)) Raylib.UnloadTexture(r.Texture);
                 }
             }
         }
@@ -644,6 +777,7 @@ public sealed class AnimatedGltfModel : IDisposable
             _hasAlphaMaskShader = false;
         }
         _all.Clear();
+        _materialOwners.Clear();
         _byDrawable.Clear();
         _instance = null;
         _gltf = null;

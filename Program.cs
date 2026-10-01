@@ -48,16 +48,25 @@ class Program
         public string lastModelFolderPath { get; set; }
         public string lastMovieExtractPath { get; set; }
 
-        static string PathName =>
+        
+        
+        static string PortablePath =>
             Path.Combine(AppContext.BaseDirectory, configName);
+
+        static string UserPath =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DotrAssetModder", configName);
 
         public static Config Load()
         {
             try
             {
-                if (!File.Exists(PathName)) return new Config();
+                string? path = new[] { PortablePath, UserPath }
+                    .Where(File.Exists)
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .FirstOrDefault();
+                if (path == null) return new Config();
 
-                string json = File.ReadAllText(PathName);
+                string json = File.ReadAllText(path);
 
                 return JsonSerializer.Deserialize<Config>(json) ?? new Config();
             }
@@ -74,7 +83,24 @@ class Program
                 WriteIndented = true
             });
 
-            File.WriteAllText(PathName, json);
+            try
+            {
+                File.WriteAllText(PortablePath, json);
+                return;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+            }
+
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(UserPath)!);
+                File.WriteAllText(UserPath, json);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("Failed to save config: " + ex.Message);
+            }
         }
     }
 }

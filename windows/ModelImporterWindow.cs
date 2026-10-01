@@ -18,7 +18,6 @@ public class ModelImporterWindow
     string modelPath;
     string templatePath;
     string status;
-    bool hasMonster = false;
     string monsterPath;
     bool ok;
 
@@ -57,15 +56,17 @@ public class ModelImporterWindow
             ImGui.TextDisabled("Load an ISO first.");
             return;
         }
-        if (!hasMonster)
+        monsterPath = fl.iso_data_files_all.FirstOrDefault(f => IsoPaths.NameEquals(f, "MONSTER.MRG"));
+        if (monsterPath == null)
         {
-            monsterPath = fl.iso_data_files_all[5];
+            ImGui.TextDisabled("MONSTER.MRG not found in ISO.");
+            return;
         }
         //Orange
         ImGui.TextColored( new Vector4(1,0.6f,0,1), "Only imports Monster models currently");
         if (ImGui.Button("Load GLB"))
         {
-            var result = Dialog.FileOpen("glb,gltf", Path.GetDirectoryName(Program.config.lastModelImportPath));
+            var result = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf"),Path.GetDirectoryName(Program.config.lastModelImportPath));
             if (result.IsOk)
             {
                 SetupModel(result.Path);
@@ -79,7 +80,7 @@ public class ModelImporterWindow
 
         if (ImGui.Button("Load clean template"))
         {
-            var result = Dialog.FileOpen("mrg,rh0,bin");
+            var result = Dialog.FileOpen(FileDialogFilter.Of("mrg,rh0,bin"));
             if (result.IsOk)
             {
                 templatePath = result.Path;
@@ -124,8 +125,8 @@ public class ModelImporterWindow
         {
             double pct = pendingBudget > 0 ? 100.0 * pendingCategoryBytes / pendingBudget : 0;
             bool isAnim = pendingCategory == Rh0Assembler.OverflowCategory.Animation;
-            string what = isAnim ? "the cloned idle animations" : "the texture(s)";
-            string action = isAnim ? "reduce their fidelity" : "downscale them";
+            string what = isAnim ? "the animations" : "the texture(s)";
+            string action = isAnim ? "store their rotations less precisely (up to 0.2 degrees)" : "downscale them";
             ImGui.TextWrapped(
                 $"This model is too big for the 1 MiB slot ({pendingTotalBytes:N0} / {pendingBudget:N0} bytes). " +
                 $"{what} {(isAnim ? "are" : "is")} taking up {pct:0.#}% of that space " +
@@ -364,7 +365,6 @@ public class ModelImporterWindow
 
             var options = new Rebuilder.Options {
                 MaxTextureDim = MaxTextureDim,
-                DebugFrame = true,
                 AdoptTemplateScaleForCustomModels = false,
                 UseNeutralTextureForMissingSlots = true,
                 PreserveTemplateTextureAnimation = false,
@@ -391,6 +391,18 @@ public class ModelImporterWindow
             fl.WriteBytes(isoOff, rebuiltModel);
             ok = true;
             status = $"Imported index {modelIndex}. ISO offset 0x{isoOff:X}.";
+            if (RebuildPipeline.LastClampedValues > 0)
+                status += $" Warning: {RebuildPipeline.LastClampedValues} vertex values were out of range and clamped; " +
+                          "parts may look stretched or flattened in game.";
+            // texture-slot problems found while reading the glb (GlbImporter) and while
+            // fitting it to the template's RH2 count (RebuildPipeline)
+            if (model.TexSlotWarnings.Count > 0)
+                status += " Texture slots: " + string.Join("; ", model.TexSlotWarnings) + ".";
+            // battle slots the glb lacked, filled with a copy of another motion (MotWriter)
+            if (MotWriter.LastClones is { Count: > 0 } clones)
+                status += " Missing motions copied: " +
+                          string.Join(", ", clones.Select(c => $"slot {c.Slot} from slot {c.From}")) +
+                          " (4 death, 5 win, 6 damage; a copied idle never shows a fall).";
         }
         catch (Exception e)
         {

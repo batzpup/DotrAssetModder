@@ -48,7 +48,7 @@ public class MovieExtractorWindow
                 Task.Run(async () =>
                 {
                     string filePath = FileLoader.Instance.MovieNames[currentMovieIndex];
-                    string tempFile = Path.Combine(Path.GetTempPath(), Path.GetFileName(filePath));
+                    string tempFile = Path.Combine(Path.GetTempPath(), IsoPaths.FileName(filePath));
 
                     try
                     {
@@ -59,7 +59,7 @@ public class MovieExtractorWindow
                             await openFile.CopyToAsync(output);
                         }
 
-                        string outputPath = Path.Combine(movieDestinationPath, Path.GetFileNameWithoutExtension(filePath) + ".mp4");
+                        string outputPath = Path.Combine(movieDestinationPath, IsoPaths.FileNameWithoutExtension(filePath) + ".mp4");
 
 
                     }

@@ -1,4 +1,5 @@
 ﻿using System.IO;
+using System.Buffers.Binary;
 using System.Numerics;
 using Raylib_cs;
 using SharpGLTF.Schema2;
@@ -34,6 +35,11 @@ public sealed class ImportedNode
     public List<int> Children = new();
     public bool IsJoint;                    // referenced by the skin
     public bool HasMesh;                    // true when this node instantiates a glTF mesh
+
+    /// Extracted glbs only: the `_bone` child carrying this node's accumulated RH0 scale
+    /// (ModelExtractor.WriteGlb), or -1. The child is folded back into this node: it is
+    /// removed from Children, and skin joints / rigid meshes on it refer to this node.
+    public int ScaleBone = -1;
 }
 
 public struct ImportedInfluence
@@ -67,19 +73,31 @@ public sealed class ImportedPrimitive
     public int TexIdx;
     public bool IsAlt;
     public Vector4 BaseColor = Vector4.One; // RGBA 0..1
+    /// The material record's c0 and c2 rows (+0x10 / +0x30), which a glb has no field for;
+    /// an extracted glb carries them in DOTR_blend, anything else gets the retail defaults.
+    public (int R, int G, int B) Color0 = (127, 127, 127);
+    public (int R, int G, int B) Color2 = (255, 255, 255);
+    /// The raw c1 row (+0x20) when the base colour is still the one the extractor wrote.
+    public (int R, int G, int B)? RawColor1;
+    /// An extracted "mat_untextured" page: its strips are drawn with PRIM TME off.
+    public bool Untextured;
     public List<ImportedVertex> Vertices = new();
     public List<(int A, int B, int C)> Triangles = new();
 }
 
+/// Every channel is resampled at every integer frame 0..FrameCount-1 (t = frame / 30) with
+/// its own sampler's interpolation (STEP, LINEAR or CUBICSPLINE), so entry i is frame i.
 public sealed class ImportedAnimChannel
 {
     public List<(float Time, Vector3 V)>? Translation;
     public List<(float Time, Quaternion Q)>? Rotation;
+    public List<(float Time, Vector3 V)>? Scale;
 }
 
 public sealed class ImportedAnimation
 {
     public string Name = "";
+    public int FrameCount;
     public Dictionary<int, ImportedAnimChannel> Channels = new(); // key = glb node index
 }
 
@@ -90,6 +108,12 @@ public sealed class ImportedModel
     public List<int> JointNodeIndices = new();      // skin joints, in skin order
     public List<ImportedPrimitive> Primitives = new();
     public List<ImportedAnimation> Animations = new();
+
+    /// Joints bound somewhere other than at their rest world matrix: an extracted `_bone`
+    /// joint (glb-space inverse of its inverse bind matrix, accumulated scale included), or
+    /// an unskinned mesh node at scale 0 in the rest pose (its world matrix in the first
+    /// animation frame where it is not). Keyed by the joint's glb node index.
+    public Dictionary<int, Matrix4x4> JointBind = new();
 
     /// Embedded base-colour images per texture index (from material names "mat_texN"),
     /// kept as SharpGLTF MemoryImage (PNG/JPEG bytes). Decode + pass to the assembler as
@@ -125,6 +149,21 @@ public sealed class ImportedModel
     /// glb's materials array order IS the slot order, independent of node/mesh iteration.
     public Dictionary<int, int> MaterialTexAuto = new();
 
+    /// Dense renumbering of explicitly named "mat_texN" materials, for CUSTOM (non-extracted)
+    /// glbs only: material LogicalIndex -> final texture slot, holding only the materials whose
+    /// number actually changed. Empty for extracted glbs, whose mat_texN numbers ARE the retail
+    /// slot numbers and must survive a round trip untouched.
+    public Dictionary<int, int> MatTexRemap = new();
+
+    /// The retail texture-animation records of an extracted glb, per texture slot, already
+    /// packed as the 24-byte entries the game reads (ModelExtractor's "DOTR_texAnimRecords"
+    /// material extras). They hold no pointers, so they are written back verbatim.
+    public Dictionary<int, byte[]> TextureAnimRecords = new();
+
+    /// Duplicate or out-of-range "mat_texN" slots seen by the texture-slot pre-pass, one line
+    /// each (also echoed to stderr). Reported rather than silently mishandled.
+    public List<string> TexSlotWarnings = new();
+
     /// Set by RebuildPipeline.ApplyTexMerges after it rewrites primitive UVs/TexIdx for
     /// UV-atlas slot merging; guards against double-applying when Build runs twice on the
     /// same instance. Carries the merge plan (base slot -> member slots in band order).
@@ -135,6 +174,10 @@ public sealed class ImportedModel
     /// round-trip coordinate space, so the importer must not treat them like generic
     /// Blender/Sketchfab GLBs.
     public bool IsDotrExtractedGlb;
+
+    /// Inverse of the extractor's MrgRoot world, when RebuildPipeline.PrepareRoot dropped it
+    /// without baking it into node 0: maps glb-space positions back to model space.
+    public Matrix4x4? DroppedRootUndo;
 
     /// Deprecated/unused in DOTR-convention mode. Marker names are intentionally ignored.
     public Vector3? AuthorCameraLookAtWorld;
@@ -185,7 +228,7 @@ public static class GlbImporter
                 Translation = lt.Translation,
                 Rotation = lt.Rotation,
                 Scale = lt.Scale,
-                WorldMatrix = n.WorldMatrix,
+                WorldMatrix = WorldOf(n),
             };
             byLogical[n.LogicalIndex] = im.Nodes.Count;
             im.Nodes.Add(node);
@@ -198,13 +241,92 @@ public static class GlbImporter
             foreach (var c in n.VisualChildren) node.Children.Add(c.LogicalIndex);
         }
 
+        // --- extracted `_bone` scale nodes (ModelExtractor.WriteGlb) ---
+        // A slot node's accumulated scale rides a `_bone` child so that, as in RH0, it reaches
+        // only that node's own matrix. Fold each one back into its node: the RH0 tree has no
+        // such node, and the skin joint and any rigid mesh on it belong to the node.
+        // RebuildPipeline reads the child's scale (rest and animated) as the node's
+        // accumulated scale.
+        var boneOwner = new Dictionary<int, int>(); // `_bone` glb index -> owning node
+        if (im.IsDotrExtractedGlb)
+        {
+            foreach (var n in im.Nodes)
+            {
+                if (n.Parent < 0 || n.Children.Count != 0) continue;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(n.Name, @"_bone(?:\.\d+)?$")) continue;
+                var owner = im.Nodes[byLogical[n.Parent]];
+                if (owner.ScaleBone >= 0) continue;
+                owner.ScaleBone = n.Index;
+                owner.Children.Remove(n.Index);
+                boneOwner[n.Index] = owner.Index;
+            }
+        }
+        int Owner(int g) => boneOwner.TryGetValue(g, out int o) ? o : g;
+
         // --- skin joints ---
         if (model.LogicalSkins.Count > 0)
         {
             var skin = model.LogicalSkins[0];
             for (int i = 0; i < skin.JointsCount; i++)
             {
-                int idx = skin.GetJoint(i).Joint.LogicalIndex;
+                var (joint, inverseBind) = skin.GetJoint(i);
+                int idx = Owner(joint.LogicalIndex);
+                im.JointNodeIndices.Add(idx);
+                im.Nodes[byLogical[idx]].IsJoint = true;
+                // A `_bone` joint is bound where its part is visible, which for a part at
+                // scale 0 at rest is not the rest pose: take the bind from the skin.
+                if (idx != joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out var bindWorld))
+                    im.JointBind[idx] = bindWorld;
+            }
+        }
+
+        // --- animations: every channel resampled at every integer frame ---
+        // Sampling with each sampler's own interpolation turns STEP and CUBICSPLINE into
+        // plain per-frame values (CUBICSPLINE outputs are tangent/value/tangent triplets,
+        // which must never be read as keys), and lets RebuildPipeline fit the game's key
+        // lists (per-axis Euler lerp, a list under 3 keys plays key 0 only) to the motion
+        // rather than copying glTF keys one for one.
+        foreach (var anim in model.LogicalAnimations)
+        {
+            int frames = (int)MathF.Round(anim.Duration * AnimFps) + 1;
+            var ia = new ImportedAnimation { Name = anim.Name ?? "", FrameCount = frames };
+            foreach (var ch in anim.Channels)
+            {
+                if (ch.TargetNode == null) continue;
+                int node = ch.TargetNode.LogicalIndex;
+                if (!ia.Channels.TryGetValue(node, out var c)) { c = new ImportedAnimChannel(); ia.Channels[node] = c; }
+                switch (ch.TargetNodePath)
+                {
+                    case PropertyPath.translation:
+                        c.Translation = Resample(ch.GetTranslationSampler()?.CreateCurveSampler(), frames);
+                        break;
+                    case PropertyPath.rotation:
+                        c.Rotation = Resample(ch.GetRotationSampler()?.CreateCurveSampler(), frames);
+                        break;
+                    case PropertyPath.scale:
+                        c.Scale = Resample(ch.GetScaleSampler()?.CreateCurveSampler(), frames);
+                        break;
+                }
+            }
+            im.Animations.Add(ia);
+        }
+
+        // Rigid extractor output (ModelExtractor.WriteGlb's rigid mode): no skin; each bone's
+        // mesh sits on the bone's own node, which carries a `_m<slot>` name suffix. Rebuild the
+        // joint set the skinned export would have declared - every slot node, in slot order -
+        // so the pipeline sees the same shape (joint nodes, not mesh nodes) and a round trip
+        // keeps the original matrix slots, including slots with no geometry.
+        bool rigidDotr = im.IsDotrExtractedGlb && model.LogicalSkins.Count == 0;
+        if (rigidDotr)
+        {
+            var slotted = new List<(int Slot, int Node)>();
+            foreach (var n in model.LogicalNodes)
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(n.Name ?? "", @"_m(\d+)(?:\.\d+)?$");
+                if (m.Success) slotted.Add((int.Parse(m.Groups[1].Value), n.LogicalIndex));
+            }
+            foreach (var (_, idx) in slotted.OrderBy(s => s.Slot))
+            {
                 im.JointNodeIndices.Add(idx);
                 im.Nodes[byLogical[idx]].IsJoint = true;
             }
@@ -215,15 +337,62 @@ public static class GlbImporter
         // the next free slot in materials-array order. Doing this as a pre-pass (instead
         // of first-seen-during-node-iteration) makes the material -> slot mapping stable
         // and predictable from the glb alone.
+        //
+        // A slot number indexes the template model's RH2 blocks, and a slot nothing supplies
+        // costs a 9 KB white placeholder (Rh0Assembler), so a gap is pure waste. An extracted
+        // glb's mat_texN numbers ARE the retail slot numbers, so they are kept exactly and a
+        // round trip is unchanged. A custom glb's numbers are only the author's labels, so
+        // they are compacted to a dense 0..k-1 in ascending mat_texN order; unnamed materials
+        // then take k, k+1, ... in materials-array order as before (sharing a slot when they
+        // share a base-colour image or flat colour). A duplicate or out-of-range mat_texN is
+        // reported in TexSlotWarnings.
+        // mat_texN label -> dense slot for a custom glb (empty for an extracted one). The
+        // "tex{N}_anim{frame}" pass below is keyed by the same author labels, so it has to
+        // follow the same remap.
+        var texLabelRemap = new Dictionary<int, int>();
         {
-            var explicitSlots = new HashSet<int>();
+            var explicitSlot = new Dictionary<int, int>();  // material LogicalIndex -> mat_texN
+            // mat_texN -> first material naming it and its image/colour. Several materials on
+            // one slot is normal (retail splits a slot by alpha/GS state, and the extractor
+            // writes one material per page), but two DIFFERENT images on one slot is a real
+            // clash: only the first is harvested into TextureImages, the other is dropped.
+            var firstOwner = new Dictionary<int, (int Mat, string Key)>();
             foreach (var m in model.LogicalMaterials)
-                if (TryParseMatTexIndex(m.Name, out int t)) explicitSlots.Add(t);
+            {
+                if (!TryParseMatTexIndex(m.Name, out int t)) continue;
+                if (t < 0 || t > MaxTexSlot)
+                    im.TexSlotWarnings.Add($"material {m.LogicalIndex} \"{m.Name}\": texture slot {t} is out of range 0..{MaxTexSlot}");
+                string key = MaterialShareKey(m);
+                if (firstOwner.TryGetValue(t, out var first))
+                {
+                    if (first.Key != key)
+                        im.TexSlotWarnings.Add($"material {m.LogicalIndex} \"{m.Name}\": texture slot {t} already holds a different image from material {first.Mat}; only material {first.Mat}'s image is imported");
+                }
+                else firstOwner[t] = (m.LogicalIndex, key);
+                explicitSlot[m.LogicalIndex] = t;
+            }
+            if (!im.IsDotrExtractedGlb && explicitSlot.Count != 0)
+            {
+                // custom glb: compact the named slots (an out-of-range one lands in range here)
+                var compact = new Dictionary<int, int>();
+                int dense = 0;
+                foreach (int s in new SortedSet<int>(explicitSlot.Values)) compact[s] = dense++;
+                foreach (var kv in explicitSlot)
+                    if (compact[kv.Value] != kv.Value) im.MatTexRemap[kv.Key] = compact[kv.Value];
+                foreach (var kv in compact)
+                    if (kv.Key != kv.Value) texLabelRemap[kv.Key] = kv.Value;
+            }
+            foreach (var w in im.TexSlotWarnings) Console.Error.WriteLine("GlbImporter: " + w);
+            // the slots the named materials hold after that remap; auto assignment steps over them
+            var explicitSlots = new HashSet<int>();
+            foreach (var kv in explicitSlot)
+                explicitSlots.Add(im.MatTexRemap.TryGetValue(kv.Key, out int d) ? d : kv.Value);
             int nextAuto = 0;
             var slotByKey = new Dictionary<string, int>();   // image/colour dedupe
             foreach (var m in model.LogicalMaterials)
             {
-                if (TryParseMatTexIndex(m.Name, out _)) continue;
+                if (explicitSlot.ContainsKey(m.LogicalIndex)) continue;
+                if (IsUntexturedMaterial(m.Name)) continue;   // draws with TME off: no slot of its own
                 // materials sharing the same base-colour image (or the same flat colour)
                 // share one texture slot - texture slots are a scarce resource (template
                 // RH2 count) and duplicating identical images wastes them
@@ -248,25 +417,31 @@ public static class GlbImporter
         foreach (var meshNode in model.LogicalNodes)
         {
             if (meshNode.Mesh == null) continue;
-            if (byLogical.TryGetValue(meshNode.LogicalIndex, out int meshNodePos))
+            // a rigid mesh on an extracted `_bone` belongs to the bone's node
+            int meshOwner = Owner(meshNode.LogicalIndex);
+            // A rigid-extract joint keeps joint-only status (as in the skinned export), so the
+            // root/wrapper detection in RebuildPipeline treats both export shapes alike.
+            if (byLogical.TryGetValue(meshOwner, out int meshNodePos)
+                && !(rigidDotr && im.Nodes[meshNodePos].IsJoint))
                 im.Nodes[meshNodePos].HasMesh = true;
             bool nodeSkinned = meshNode.Skin != null;
-            Matrix4x4 nodeWorld = meshNode.WorldMatrix;
+            Matrix4x4 nodeWorld = WorldOf(meshNode);
             if (!nodeSkinned)
             {
-                // scale-0 nodes are a common "hidden mesh" trick (e.g. a car's lights-on
-                // variant scaled to zero). The world matrix is singular: the bake collapses
-                // every vertex to a point and inverse(RWS) is undefined, which poisons the
-                // global-scale pass with garbage. The mesh is invisible by intent - skip it.
-                float det =
-                    nodeWorld.M11 * (nodeWorld.M22 * nodeWorld.M33 - nodeWorld.M23 * nodeWorld.M32) -
-                    nodeWorld.M12 * (nodeWorld.M21 * nodeWorld.M33 - nodeWorld.M23 * nodeWorld.M31) +
-                    nodeWorld.M13 * (nodeWorld.M21 * nodeWorld.M32 - nodeWorld.M22 * nodeWorld.M31);
-                if (MathF.Abs(det) < 1e-12f) continue;
+                // A node at scale 0 is how DotR models keep a part hidden until a motion
+                // scales it up (Meteor Dragon's head and limbs), so it is not dropped: its
+                // vertices are bound at the first animation frame where it is visible, and
+                // the pipeline encodes them against that same matrix. Only a node that is
+                // invisible in every frame is skipped.
+                var bind = FirstVisibleWorld(im, meshNode.LogicalIndex, nodeWorld);
+                if (bind is not { } bindWorld) continue;
+                if (meshOwner != meshNode.LogicalIndex || bindWorld != nodeWorld)
+                    im.JointBind[meshOwner] = bindWorld;
+                nodeWorld = bindWorld;
             }
             foreach (var prim in meshNode.Mesh.Primitives)
             {
-                var ip = new ImportedPrimitive { NodeIndex = meshNode.LogicalIndex };
+                var ip = new ImportedPrimitive { NodeIndex = meshOwner };
                 ParseMaterial(prim.Material, ip, im);
 
                 var pos = prim.GetVertexAccessor("POSITION")?.AsVector3Array();
@@ -275,6 +450,9 @@ public static class GlbImporter
                 var uv = prim.GetVertexAccessor("TEXCOORD_0")?.AsVector2Array();
                 var jnt = prim.GetVertexAccessor("JOINTS_0")?.AsVector4Array();
                 var wgt = prim.GetVertexAccessor("WEIGHTS_0")?.AsVector4Array();
+                // a vertex may carry up to 8 influences (ModelExtractor writes a second set)
+                var jnt1 = prim.GetVertexAccessor("JOINTS_1")?.AsVector4Array();
+                var wgt1 = prim.GetVertexAccessor("WEIGHTS_1")?.AsVector4Array();
 
                 bool skinnedPrim = nodeSkinned && jnt != null && wgt != null;
                 int vcount = pos.Count;
@@ -308,10 +486,18 @@ public static class GlbImporter
                         AddInfluence(iv, im, (int)j.Y, w.Y);
                         AddInfluence(iv, im, (int)j.Z, w.Z);
                         AddInfluence(iv, im, (int)j.W, w.W);
+                        if (jnt1 != null && wgt1 != null)
+                        {
+                            var j1 = jnt1[v]; var w1 = wgt1[v];
+                            AddInfluence(iv, im, (int)j1.X, w1.X);
+                            AddInfluence(iv, im, (int)j1.Y, w1.Y);
+                            AddInfluence(iv, im, (int)j1.Z, w1.Z);
+                            AddInfluence(iv, im, (int)j1.W, w1.W);
+                        }
                     }
                     else
                     {
-                        iv.Influences.Add(new ImportedInfluence { JointNode = meshNode.LogicalIndex, Weight = 1f });
+                        iv.Influences.Add(new ImportedInfluence { JointNode = meshOwner, Weight = 1f });
                     }
                     ip.Vertices.Add(iv);
                 }
@@ -323,30 +509,6 @@ public static class GlbImporter
 
                 im.Primitives.Add(ip);
             }
-        }
-
-        // --- animations (linear samplers; the extractor writes linear curves) ---
-        foreach (var anim in model.LogicalAnimations)
-        {
-            var ia = new ImportedAnimation { Name = anim.Name ?? "" };
-            foreach (var ch in anim.Channels)
-            {
-                if (ch.TargetNode == null) continue;
-                int node = ch.TargetNode.LogicalIndex;
-                if (!ia.Channels.TryGetValue(node, out var c)) { c = new ImportedAnimChannel(); ia.Channels[node] = c; }
-                switch (ch.TargetNodePath)
-                {
-                    case PropertyPath.translation:
-                        var ts = ch.GetTranslationSampler();
-                        if (ts != null) c.Translation = ts.GetLinearKeys().Select(k => (k.Key, k.Value)).ToList();
-                        break;
-                    case PropertyPath.rotation:
-                        var rs = ch.GetRotationSampler();
-                        if (rs != null) c.Rotation = rs.GetLinearKeys().Select(k => (k.Key, k.Value)).ToList();
-                        break;
-                }
-            }
-            im.Animations.Add(ia);
         }
 
         // --- animated-texture frame sequences ("tex{N}_anim{frame}" image naming) ---
@@ -361,6 +523,10 @@ public static class GlbImporter
             {
                 if (TryParseAnimImageName(img.Name, out int texIdx, out int frame, out int ticks) && img.Content.IsValid)
                 {
+                    // N is the author's mat_texN label; a custom glb's labels were compacted
+                    // above, so the frames have to move with their slot (an extracted glb's
+                    // table is empty, so its names are kept exactly)
+                    if (texLabelRemap.TryGetValue(texIdx, out int denseTex)) texIdx = denseTex;
                     if (!byTex.TryGetValue(texIdx, out var list))
                         byTex[texIdx] = list = new();
                     list.Add((frame, img.Content));
@@ -382,6 +548,68 @@ public static class GlbImporter
         }
 
         return im;
+    }
+
+    public const float AnimFps = 30f;
+
+    // Node.WorldMatrix rejects a node whose local matrix is not invertible; DotR models hide
+    // parts with tiny or zero scales (card 83 nests 1e-5 per level down to ~1e-24).
+    private static Matrix4x4 WorldOf(Node n) =>
+        n.VisualParent == null ? n.LocalTransform.Matrix : n.LocalTransform.Matrix * WorldOf(n.VisualParent);
+
+    private static List<(float Time, T V)>? Resample<T>(SharpGLTF.Animations.ICurveSampler<T>? sampler, int frames)
+    {
+        if (sampler == null) return null;
+        var outp = new List<(float, T)>(frames);
+        for (int f = 0; f < frames; f++)
+        {
+            float t = f / AnimFps;
+            outp.Add((t, sampler.GetPoint(t)));
+        }
+        return outp;
+    }
+
+    /// glb world matrix of node g at a frame of an animation (rest values where it has no
+    /// channel); anim == null is the rest pose.
+    public static Matrix4x4 WorldAt(ImportedModel im, int g, ImportedAnimation? anim, int frame)
+    {
+        var n = im.Nodes[g];
+        var t = n.Translation;
+        var r = n.Rotation;
+        var s = n.Scale;
+        if (anim != null && anim.Channels.TryGetValue(g, out var c))
+        {
+            if (c.Translation is { Count: > 0 } ct) t = ct[Math.Min(frame, ct.Count - 1)].V;
+            if (c.Rotation is { Count: > 0 } cr) r = cr[Math.Min(frame, cr.Count - 1)].Q;
+            if (c.Scale is { Count: > 0 } cs) s = cs[Math.Min(frame, cs.Count - 1)].V;
+        }
+        var local = Matrix4x4.CreateScale(s) * Matrix4x4.CreateFromQuaternion(r) * Matrix4x4.CreateTranslation(t);
+        return n.Parent < 0 ? local : local * WorldAt(im, n.Parent, anim, frame);
+    }
+
+    /// The rest world matrix if it is invertible, else the first animation frame's that is;
+    /// null when the node is at scale 0 in every frame.
+    private static Matrix4x4? FirstVisibleWorld(ImportedModel im, int g, Matrix4x4 rest)
+    {
+        if (!IsSingular(rest)) return rest;
+        foreach (var anim in im.Animations)
+            for (int f = 0; f < anim.FrameCount; f++)
+            {
+                var w = WorldAt(im, g, anim, f);
+                if (!IsSingular(w)) return w;
+            }
+        return null;
+    }
+
+    /// Scale 0 on some axis. Relative to the largest axis, since DotR worlds carry the model's
+    /// root scale (often ~1e-3) and an absolute determinant test would trip on whole models.
+    public static bool IsSingular(Matrix4x4 m)
+    {
+        float a = new Vector3(m.M11, m.M12, m.M13).Length();
+        float b = new Vector3(m.M21, m.M22, m.M23).Length();
+        float c = new Vector3(m.M31, m.M32, m.M33).Length();
+        float max = Math.Max(a, Math.Max(b, c));
+        return !(max > 0f) || Math.Min(a, Math.Min(b, c)) < max * 1e-6f;
     }
 
     /// Matches image names of the form "tex{N}_anim{frame}" (case-insensitive), with an
@@ -453,13 +681,32 @@ public static class GlbImporter
         }
         string name = mat.Name ?? "";
         ip.IsAlt = name.EndsWith("_alt", StringComparison.OrdinalIgnoreCase);
+        // A page the extractor wrote as "mat_untextured" is drawn with TME off, so it has no
+        // texture of its own; the extractor clamps it to slot 0 (ModelExtractor's GetMaterial).
+        // It must not claim a texture slot: an extracted model's own untextured materials would
+        // otherwise push the slot count past the template's RH2 count, and RebuildPipeline's
+        // ApplyTexMerges would fold real textures into atlas bands (card 682: slots 6 and 7
+        // merged onto slots 0 and 1, wrecking both).
+        bool untextured = IsUntexturedMaterial(name);
+        ip.Untextured = untextured;
         int p = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
         bool named = false;
+        if (untextured)
+        {
+            ip.TexIdx = 0;
+            named = true;
+            p = -1;
+        }
         if (p >= 0)
         {
             int start = p + "mat_tex".Length, end = start;
             while (end < name.Length && char.IsDigit(name[end])) end++;
-            if (end > start && int.TryParse(name.AsSpan(start, end - start), out int tex)) { ip.TexIdx = tex; named = true; }
+            if (end > start && int.TryParse(name.AsSpan(start, end - start), out int tex))
+            {
+                // a custom glb's named slots are renumbered densely by the pre-pass in FromModel
+                ip.TexIdx = im.MatTexRemap.TryGetValue(mat.LogicalIndex, out int dense) ? dense : tex;
+                named = true;
+            }
         }
         if (!named)
         {
@@ -489,12 +736,13 @@ public static class GlbImporter
             }
         }
         catch { }
+        RestoreColourBlock(mat, ip);
 
         // Harvest the material's base-colour image for texture reimport (best-effort;
         // first material seen per texture slot wins - slots are deduped by image upstream).
         try
         {
-            if (ip.TexIdx >= 0)
+            if (ip.TexIdx >= 0 && !untextured)
             {
                 if (hasTexture)
                 {
@@ -526,6 +774,89 @@ public static class GlbImporter
             }
         }
         catch { /* texture harvest must never break geometry import */ }
+
+        // The slot's retail texture animation, carried on the extracted glb's material
+        // (ModelExtractor.InjectTextureAnimationRecords). Re-embedded verbatim by the
+        // assembler, so an unedited round trip keeps the animation the extractor baked away.
+        try
+        {
+            if (ip.TexIdx >= 0 && !untextured && !im.TextureAnimRecords.ContainsKey(ip.TexIdx)
+                && mat.Extras is System.Text.Json.Nodes.JsonObject mex
+                && mex["DOTR_texAnimRecords"] is System.Text.Json.Nodes.JsonArray recs && recs.Count > 0)
+                im.TextureAnimRecords[ip.TexIdx] = PackTexAnimRecords(recs);
+        }
+        catch { /* a malformed extras block just means no animation */ }
+    }
+
+    /// The extractor's name for a material with no texture (ModelExtractor.GetMaterial).
+    private static bool IsUntexturedMaterial(string? name) =>
+        name != null && name.StartsWith("mat_untextured", StringComparison.OrdinalIgnoreCase);
+
+    /// Pack "DOTR_texAnimRecords" back into the 24-byte entries SzModel_LoadTexAnim_Pipe
+    /// reads, the inverse of ModelExtractor.TexAnimRecords: flags@0 (bit0 last, bit1 own
+    /// clock, bits 2-4 mode, bits 5+ direction), motions@1, cols|rows<<4 @2, state@3,
+    /// p0@4, p1@6, size@8, src@0xC, dst@0x10; the runtime counter @0x14 stays zero.
+    private static byte[] PackTexAnimRecords(System.Text.Json.Nodes.JsonArray recs)
+    {
+        const int EntrySize = 0x18;
+        var o = new byte[recs.Count * EntrySize];
+        for (int i = 0; i < recs.Count; i++)
+        {
+            if (recs[i] is not System.Text.Json.Nodes.JsonObject r) continue;
+            int b = i * EntrySize;
+            int I(string k) => r[k] is { } v ? v.GetValue<int>() : 0;
+            int Pair(string k, int j) => r[k] is System.Text.Json.Nodes.JsonArray a && a.Count > j
+                ? a[j]!.GetValue<int>() : 0;
+            bool ownClock = r["ownClock"] is { } oc && oc.GetValue<bool>();
+            o[b] = (byte)((i == recs.Count - 1 ? 1 : 0) | (ownClock ? 2 : 0)
+                          | ((I("mode") & 7) << 2) | ((I("direction") & 7) << 5));
+            o[b + 1] = (byte)I("motions");
+            o[b + 2] = (byte)((I("cols") & 15) | ((I("rows") & 15) << 4));
+            o[b + 3] = (byte)I("state");
+            void W16(int at, int v) => BinaryPrimitives.WriteUInt16LittleEndian(o.AsSpan(b + at), (ushort)v);
+            W16(0x04, I("p0"));
+            W16(0x06, I("p1"));
+            W16(0x08, Pair("size", 0));
+            W16(0x0A, Pair("size", 1));
+            W16(0x0C, Pair("src", 0));
+            W16(0x0E, Pair("src", 1));
+            W16(0x10, Pair("dst", 0));
+            W16(0x12, Pair("dst", 1));
+        }
+        return o;
+    }
+
+    /// Put back the colour block (c0, c1, c2) the extractor saved in DOTR_blend. c0 and c2
+    /// have no glb field and are always restored. The base colour is only a display of c1
+    /// (an alpha-chain material shows c0 + c1/2, an opaque neutral or zero c1 shows white),
+    /// so while it is still the one the extractor wrote, the raw c1 is restored as well.
+    private static void RestoreColourBlock(Material mat, ImportedPrimitive ip)
+    {
+        try
+        {
+            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex) return;
+            if (ex["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend) return;
+            static (int, int, int)? Rgb(System.Text.Json.Nodes.JsonNode? n) =>
+                n is System.Text.Json.Nodes.JsonArray a && a.Count == 3
+                    ? (a[0]!.GetValue<int>(), a[1]!.GetValue<int>(), a[2]!.GetValue<int>()) : null;
+            if (Rgb(blend["materialColor0"]) is { } c0) ip.Color0 = c0;
+            if (Rgb(blend["materialColor2"]) is { } c2) ip.Color2 = c2;
+            if (blend["displayColor"] is not System.Text.Json.Nodes.JsonArray shown || shown.Count != 3) return;
+            var c = ip.BaseColor;
+            const float tol = 1.5f / 255f;
+            if (MathF.Abs(c.X - shown[0]!.GetValue<float>()) > tol ||
+                MathF.Abs(c.Y - shown[1]!.GetValue<float>()) > tol ||
+                MathF.Abs(c.Z - shown[2]!.GetValue<float>()) > tol) return; // edited: keep it
+            ip.RawColor1 = (blend["materialColorR"]!.GetValue<int>(),
+                            blend["materialColorG"]!.GetValue<int>(),
+                            blend["materialColorB"]!.GetValue<int>());
+            // an opaque page's alpha still matters to its alpha test (card 53's alpha-0
+            // untextured pages are never drawn); keep c1.w unless the glb alpha was edited
+            if (blend["materialAlpha"] is { } ma && MathF.Abs(c.W - ma.GetValue<float>()) <= tol
+                && blend["materialAlphaW"] is { } aw)
+                ip.BaseColor = c with { W = aw.GetValue<float>() / 128f };
+        }
+        catch { }
     }
 
     /// 8x8 single-colour PNG wrapped as a glTF MemoryImage (for textureless materials).
@@ -555,6 +886,10 @@ public static class GlbImporter
         catch { }
         return "mat:" + m.LogicalIndex;
     }
+
+    /// Highest texture slot a "mat_texN" name may ask for. RH2 blocks per model; retail's
+    /// largest monster is far below this, so anything above is a typo, not a real slot.
+    private const int MaxTexSlot = 63;
 
     /// Parses the explicit "mat_texN" naming convention (suffix "_alt" allowed elsewhere).
     private static bool TryParseMatTexIndex(string? name, out int tex)
@@ -682,6 +1017,7 @@ public static class GlbImporter
                     Rgba = rgba,
                     Width = cpu.Width,
                     Height = cpu.Height,
+                    AnimRecords = model.TextureAnimRecords.TryGetValue(texIdx, out var ar) ? ar : null,
                 });
                 Raylib.UnloadImage(cpu);
             }

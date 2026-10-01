@@ -54,7 +54,7 @@ public static class Rebuilder
         public bool PreserveTemplateTextureAnimation = false;
 
         /// Print frame diagnostics to the console during rebuild.
-        public bool DebugFrame = true;
+        public bool DebugFrame = false;
 
         /// Upper bound (bytes) the assembled RH0 block must fit within - Rh0Assembler's
         /// texture-table growth/shrink budgeting and the final Place() bounds check both
@@ -140,10 +140,17 @@ public static class Rebuilder
             fit.DonorWorld = rebuilt.FitDonorWorld;
             fit.Message = rebuilt.FitReason;
         }
-        return Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
+        var outBytes = Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
             opt.RebuildTexturesNative, opt.MaxTextureDim,
             opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation,
             opt.TrimToContent, opt.ConfirmReduction);
+        // a slot past the template's count that the 1 MiB block could not grow to hold
+        foreach (var (slot, onto) in Rh0Assembler.LastShedTexSlots ?? new())
+        {
+            string w = $"texture slot {slot} did not fit in the 1 MiB block; its faces use slot {onto}'s texture";
+            if (!model.TexSlotWarnings.Contains(w)) model.TexSlotWarnings.Add(w);
+        }
+        return outBytes;
     }
 
     private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)

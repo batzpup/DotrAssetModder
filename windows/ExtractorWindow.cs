@@ -33,7 +33,7 @@ public class ExtractorWindow
         if (ImGui.Button("Load ISO"))
         {
             DialogResult result;
-            result = Dialog.FileOpen("iso", Path.GetDirectoryName(Program.config.lastIsoPath));
+            result = Dialog.FileOpen(FileDialogFilter.Of("iso"),Path.GetDirectoryName(Program.config.lastIsoPath));
             if (result.IsOk)
             {
                 FileLoader.Instance.OpenIso(result.Path);
@@ -133,7 +133,7 @@ public class ExtractorWindow
         jobError = null;
         string currentFile = fileList[index];
         byte[] fileBytes = FileLoader.Instance.GetFileBytesFromDisk(currentFile);
-        string stem = Path.GetFileNameWithoutExtension(currentFile);
+        string stem = IsoPaths.FileNameWithoutExtension(currentFile);
         IList<string>? names = LoadWordlist();
         activeJob = ExtractionJob.Start(fileBytes, dataDestinationPath, stem, names);
     }
@@ -236,7 +236,7 @@ public class ExtractorWindow
 
         if (ImGui.Button("Load Wordlist"))
         {
-            DialogResult dialogResult = Dialog.FileOpen("txt", Path.GetDirectoryName(Program.config.lastWordlistPath));
+            DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of("txt"),Path.GetDirectoryName(Program.config.lastWordlistPath));
 
             if (dialogResult.IsOk)
             {
