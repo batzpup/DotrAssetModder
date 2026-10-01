@@ -5,3 +5,4 @@ riderModule.iml
 /_ReSharper.Caches/
 .idea/**/workspace.xml
 *.DotSettings.user
+/docs/model-pipeline-status.md
