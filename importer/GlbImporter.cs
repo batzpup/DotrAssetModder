@@ -393,6 +393,10 @@ public static class GlbImporter
             {
                 if (explicitSlot.ContainsKey(m.LogicalIndex)) continue;
                 if (IsUntexturedMaterial(m.Name)) continue;   // draws with TME off: no slot of its own
+                // A custom glb's flat-colour material (no base-colour texture) is handled the
+                // same way by ParseMaterial - drawn with TME off, its colour carried as the
+                // page colour - so it must not be counted here either.
+                if (!HasBaseColorTexture(m)) continue;
                 // materials sharing the same base-colour image (or the same flat colour)
                 // share one texture slot - texture slots are a scarce resource (template
                 // RH2 count) and duplicating identical images wastes them
@@ -670,13 +674,14 @@ public static class GlbImporter
     {
         if (mat == null)
         {
-            // Primitive with no material at all: park it on slot 0 with a neutral solid
-            // texture if nothing else supplies one, so the template's old texture can't
-            // bleed through (the engine has no untextured draw path).
+            // Primitive with no material at all: like a flat-colour material, draw it with
+            // PRIM TME off on slot 0 so no texture slot and no slot-0 image are spent on it
+            // (a solid image here used to win over the real slot-0 texture when the
+            // material-less primitive happened to be parsed first). Its page colour is the
+            // neutral grey MatKey maps White onto.
             ip.TexIdx = 0;
+            ip.Untextured = true;
             ip.BaseColor = Vector4.One;
-            if (!im.TextureImages.ContainsKey(0))
-                im.TextureImages[0] = SolidImage(178, 178, 178, 255);
             return;
         }
         string name = mat.Name ?? "";
@@ -689,6 +694,9 @@ public static class GlbImporter
         // merged onto slots 0 and 1, wrecking both).
         bool untextured = IsUntexturedMaterial(name);
         ip.Untextured = untextured;
+        // Needed before the slot decision below: a material with no base-colour texture
+        // claims no slot either (see the !named branch).
+        bool hasTexture = HasBaseColorTexture(mat);
         int p = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
         bool named = false;
         if (untextured)
@@ -708,6 +716,19 @@ public static class GlbImporter
                 named = true;
             }
         }
+        if (!named && !hasTexture)
+        {
+            // A custom glb's flat-colour material: no base-colour texture, so there is nothing
+            // to put in a texture slot. Treat it exactly like the extractor's `mat_untextured`
+            // - park it on slot 0, draw it with PRIM TME off and carry its base colour as the
+            // page colour (MatKey's c1) - instead of baking a solid image into an auto slot.
+            // Those auto slots used to push the slot count past the template's RH2 count and
+            // make RebuildPipeline atlas-merge real textures (card 682).
+            untextured = true;
+            ip.Untextured = true;
+            ip.TexIdx = 0;
+            named = true;
+        }
         if (!named)
         {
             // Unnamed material: give each DISTINCT material its own texture slot (stable per
@@ -725,15 +746,10 @@ public static class GlbImporter
         // the engine scales at runtime (lRhModel_SetMaterialIntensity SET/ADD/MUL modes);
         // retail neutral is (178,178,178)/alpha 128, which the pipeline maps White onto.
         ip.BaseColor = Vector4.One;
-        bool hasTexture = false;
         try
         {
             var bc = mat.FindChannel("BaseColor");
-            if (bc.HasValue)
-            {
-                ip.BaseColor = bc.Value.Color;
-                hasTexture = bc.Value.Texture?.PrimaryImage != null;
-            }
+            if (bc.HasValue) ip.BaseColor = bc.Value.Color;
         }
         catch { }
         RestoreColourBlock(mat, ip);
@@ -786,6 +802,17 @@ public static class GlbImporter
                 im.TextureAnimRecords[ip.TexIdx] = PackTexAnimRecords(recs);
         }
         catch { /* a malformed extras block just means no animation */ }
+    }
+
+    /// True when the material's base-colour channel carries an actual image.
+    private static bool HasBaseColorTexture(Material m)
+    {
+        try
+        {
+            var ch = m.FindChannel("BaseColor");
+            return ch.HasValue && ch.Value.Texture?.PrimaryImage != null;
+        }
+        catch { return false; }
     }
 
     /// The extractor's name for a material with no texture (ModelExtractor.GetMaterial).
