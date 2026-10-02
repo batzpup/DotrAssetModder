@@ -281,6 +281,8 @@ static class ModelExtractor
             LocalR = new Quaternion[n];
         }
 
+        public int Motion;                 // which animation a sampled pose came from
+
         public Matrix4x4 SlotMatrix(int i) => M.Scale(Acc[i].X, Acc[i].Y, Acc[i].Z) * World[i];
     }
 
@@ -419,10 +421,13 @@ static class ModelExtractor
             best[n.Mslot] = (Size(rest.Acc[n.Idx]), rest);
             spread[n.Mslot] = Vector3.Abs(rest.Acc[n.Idx]);
         }
+        int motion = 0;
         foreach (var anim in animations)
+        {
             for (int t = 0; t < anim.FrameCount; t++)
             {
                 var pose = EvalPose(nodes, anim, t, posScale);
+                pose.Motion = motion;
                 if (t % SampleEvery == 0) samples.Add(pose);
                 foreach (var n in slotted)
                 {
@@ -431,6 +436,8 @@ static class ModelExtractor
                     spread[n.Mslot] = Vector3.Max(spread[n.Mslot], Vector3.Abs(pose.Acc[n.Idx]));
                 }
             }
+            motion++;
+        }
 
         sampledPoses = samples;
         mslotNode = slotted.GroupBy(n => n.Mslot).ToDictionary(g => g.Key, g => g.First().Idx);
@@ -660,6 +667,16 @@ static class ModelExtractor
         }
 
         public Vector3 Position(List<(int Slot, float W, Vector3 P)> infl, Vector3 average)
+            => Fitted(infl, null, average, "P");
+
+        // The same fit for the normal. A glb normal is skinned by the same A(t) without the
+        // translation, and the game's own normal is Sum w_i*S_i*n_i normalised, so x is the
+        // least-squares fit of that unnormalised sum over the same sampled frames, kept only
+        // where its worst frame is no worse than the plain average's. The caller normalises.
+        public Vector3 Normal(List<(int Slot, float W, Vector3 P)> infl, List<Vector3> nrm, Vector3 average)
+            => Fitted(infl, nrm, average, "N");
+
+        Vector3 Fitted(List<(int Slot, float W, Vector3 P)> infl, List<Vector3> nrm, Vector3 average, string kind)
         {
             if (_samples == null || _samples.Count == 0 || _node == null) return average;
             if (infl.Count < 2) return average;
@@ -668,10 +685,16 @@ static class ModelExtractor
                 if (infl[i].Slot != infl[0].Slot) { mixed = true; break; }
             if (!mixed) return average;
 
-            var key = new System.Text.StringBuilder();
-            foreach (var (s, w, p) in infl)
+            var key = new System.Text.StringBuilder(kind);
+            for (int i = 0; i < infl.Count; i++)
+            {
+                var (s, w, p) = infl[i];
                 key.Append(s).Append(':').Append(w).Append(':')
                    .Append(p.X).Append(',').Append(p.Y).Append(',').Append(p.Z).Append(';');
+                if (nrm != null)
+                    key.Append(nrm[i].X).Append(',').Append(nrm[i].Y).Append(',')
+                       .Append(nrm[i].Z).Append(';');
+            }
             string k = key.ToString();
             if (_memo.TryGetValue(k, out var hit)) return hit;
 
@@ -700,10 +723,23 @@ static class ModelExtractor
                     A.M21 += w * C.M21; A.M22 += w * C.M22; A.M23 += w * C.M23;
                     A.M31 += w * C.M31; A.M32 += w * C.M32; A.M33 += w * C.M33;
                     A.M41 += w * C.M41; A.M42 += w * C.M42; A.M43 += w * C.M43;
-                    g += w * M.Apply(S, infl[i].P.X, infl[i].P.Y, infl[i].P.Z);
+                    g += w * (nrm == null
+                        ? M.Apply(S, infl[i].P.X, infl[i].P.Y, infl[i].P.Z)
+                        : Vector3.TransformNormal(nrm[i], S));
                 }
                 double[] L = { A.M11, A.M12, A.M13, A.M21, A.M22, A.M23, A.M31, A.M32, A.M33 };
-                double b0 = g.X - A.M41, b1 = g.Y - A.M42, b2 = g.Z - A.M43;
+                float t0 = nrm == null ? A.M41 : 0, t1 = nrm == null ? A.M42 : 0,
+                    t2 = nrm == null ? A.M43 : 0;
+                double b0 = g.X - t0, b1 = g.Y - t1, b2 = g.Z - t2;
+                // Only a normal's direction is kept, so every frame counts the same: divide
+                // the frame out by the game normal's length, or a frame where the bones are
+                // large drags the direction of the small ones.
+                if (nrm != null && g.Length() > 0)
+                {
+                    double s = 1.0 / g.Length();
+                    for (int a = 0; a < 9; a++) L[a] *= s;
+                    b0 *= s; b1 *= s; b2 *= s;
+                }
                 if (!double.IsFinite(L[0] + L[4] + L[8] + b0 + b1 + b2)) return average;
                 for (int a = 0; a < 3; a++)
                 {
@@ -722,32 +758,74 @@ static class ModelExtractor
             if (!Solve3(N, r, out var x)) return average;
             if (!float.IsFinite(x.X) || !float.IsFinite(x.Y) || !float.IsFinite(x.Z)) x = average;
 
-            // The fit is a least-squares one: it can trade a little of its worst frame for the
-            // rest. A vertex that pokes through its neighbours is a worst-frame problem, so
-            // keep the fit only where its worst frame is no worse than the average's.
-            if (Worst(infl, inv, x) > Worst(infl, inv, average)) x = average;
+            // The fit is a least-squares one: it can trade a little of one frame for the rest.
+            // A position's fit is kept on its worst frame over the whole sample (a vertex
+            // poking through its neighbours is a worst-frame problem). A normal is kept only
+            // where its worst frame is no worse in every single motion, so that a motion
+            // whose normals were already close cannot pay for another one's.
+            if (nrm == null ? Worst(infl, nrm, inv, x) > Worst(infl, nrm, inv, average)
+                            : WorseInSomeMotion(infl, nrm, inv, x, average)) x = average;
             _memo[k] = x;
             return x;
         }
 
         // The largest distance, over the sampled frames, between the glb's skinning of x and
-        // the game's own result for this vertex.
-        float Worst(List<(int Slot, float W, Vector3 P)> infl, Matrix4x4[] inv, Vector3 x)
+        // the game's own result for this vertex. For a normal both sides are normalised
+        // first, so the distance is the chord of the angle between them.
+        float Worst(List<(int Slot, float W, Vector3 P)> infl, List<Vector3> nrm, Matrix4x4[] inv, Vector3 x)
         {
             float worst = 0;
             foreach (var pose in _samples)
+                worst = MathF.Max(worst, Err(pose, infl, nrm, inv, x));
+            return worst;
+        }
+
+        // Whether x's worst frame is worse than the average's within any one motion (the
+        // samples come in motion order).
+        bool WorseInSomeMotion(List<(int Slot, float W, Vector3 P)> infl, List<Vector3> nrm,
+            Matrix4x4[] inv, Vector3 x, Vector3 average)
+        {
+            float wx = 0, wa = 0;
+            int motion = _samples[0].Motion;
+            foreach (var pose in _samples)
             {
-                Vector3 glb = Vector3.Zero, game = Vector3.Zero;
-                for (int i = 0; i < infl.Count; i++)
+                if (pose.Motion != motion)
                 {
-                    var S = pose.SlotMatrix(_node[infl[i].Slot]);
+                    if (wx > wa + 1e-6f) return true;
+                    wx = wa = 0;
+                    motion = pose.Motion;
+                }
+                wx = MathF.Max(wx, Err(pose, infl, nrm, inv, x));
+                wa = MathF.Max(wa, Err(pose, infl, nrm, inv, average));
+            }
+            return wx > wa + 1e-6f;
+        }
+
+        // One frame's distance between the glb's skinning of x and the game's own result for
+        // this vertex. For a normal both sides are normalised first, so the distance is the
+        // chord of the angle between them.
+        float Err(Pose pose, List<(int Slot, float W, Vector3 P)> infl, List<Vector3> nrm,
+            Matrix4x4[] inv, Vector3 x)
+        {
+            Vector3 glb = Vector3.Zero, game = Vector3.Zero;
+            for (int i = 0; i < infl.Count; i++)
+            {
+                var S = pose.SlotMatrix(_node[infl[i].Slot]);
+                if (nrm == null)
+                {
                     var local = M.Apply(inv[i], x.X, x.Y, x.Z);
                     glb += infl[i].W * M.Apply(S, local.X, local.Y, local.Z);
                     game += infl[i].W * M.Apply(S, infl[i].P.X, infl[i].P.Y, infl[i].P.Z);
                 }
-                worst = MathF.Max(worst, (glb - game).Length());
+                else
+                {
+                    var local = Vector3.TransformNormal(x, inv[i]);
+                    glb += infl[i].W * Vector3.TransformNormal(local, S);
+                    game += infl[i].W * Vector3.TransformNormal(nrm[i], S);
+                }
             }
-            return worst;
+            if (nrm != null) { glb = NSafe(glb); game = NSafe(game); }
+            return (glb - game).Length();
         }
 
         // Symmetric 3x3 solve by Cramer's rule; a singular system falls back to the average.
@@ -1328,6 +1406,7 @@ static class ModelExtractor
                         float nx = 0, ny = 0, nz = 0;
                         var jlist = new List<(int Joint, float W)>();
                         var infl = new List<(int Slot, float W, Vector3 P)>();
+                        var inrm = new List<Vector3>();
                         if (v.Weights != null)
                         {
                             foreach (var wt in v.Weights)
@@ -1348,6 +1427,7 @@ static class ModelExtractor
                                 int jidx = bm.MslotToJoint.TryGetValue(mslot, out var ji) ? ji : -1;
                                 if (jidx >= 0) jlist.Add((jidx, ww));
                                 infl.Add((mslot, ww, new Vector3(wt.Pos.X, wt.Pos.Y, wt.Pos.Z)));
+                                inrm.Add(new Vector3(wt.Nrm.X, wt.Nrm.Y, wt.Nrm.Z));
                             }
                         }
                         if (wsum != 0)
@@ -1361,7 +1441,7 @@ static class ModelExtractor
                                 infl[k] = (infl[k].Slot, infl[k].W / wsum, infl[k].P);
                         }
                         bm.Vertices.Add(fit.Position(infl, new Vector3(wx, wy, wz)));
-                        bm.Normals.Add(NSafe(new Vector3(nx, ny, nz)));
+                        bm.Normals.Add(NSafe(fit.Normal(infl, inrm, NSafe(new Vector3(nx, ny, nz)))));
                         bm.Uvs.Add(new Vector2(v.Uv.U / 4096f, v.Uv.V / 4096f));
                         bm.VertJoints.Add(jlist);
                     }
