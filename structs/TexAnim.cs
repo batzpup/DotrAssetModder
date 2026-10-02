@@ -88,12 +88,25 @@ internal readonly struct TexAnimEntry
     public bool IsStaticStamp => Valid && !IsFlash && !IsTimed && FrameCount == 1;
 }
 
+// One GS copy that made a baked frame: entry Rec of the record array stamped cell
+// Cell of its sheet onto (DstX,DstY)+(W,H). The extractor writes these alongside the
+// frame image (ModelExtractor.InjectTextureAnimations) so the importer can push an
+// edited frame's pixels back into the cell the game copies them from, without having
+// to re-simulate the animation.
+internal readonly struct TexAnimStamp
+{
+    public readonly int Rec, Cell, DstX, DstY, W, H;
+    public TexAnimStamp(int rec, int cell, int dx, int dy, int w, int h)
+    { Rec = rec; Cell = cell; DstX = dx; DstY = dy; W = w; H = h; }
+}
+
 internal sealed class TexAnimBake
 {
     public int Width;
     public int Height;
     public List<byte[]> FramesRgba = new();
     public List<float> FrameTimes = new();   // seconds
+    public List<List<TexAnimStamp>> FrameStamps = new();  // per kept frame, in stamp order
     public float Duration;                    // loop length (seconds)
 }
 
@@ -206,6 +219,7 @@ internal static class TexAnim
     private sealed class Sim
     {
         public TexAnimEntry E;
+        public int Index;        // position in the record array (for TexAnimStamp.Rec)
         public int Period;       // ticks for one full loop
         public int Scale = 1;    // anti-strobe slowdown (flash only)
         public int OnTicks;      // flash on (scaled)
@@ -271,8 +285,9 @@ internal static class TexAnim
 
         var sims = new List<Sim>();
         var seen = new HashSet<(bool, bool, int, int, int, int, int, int, int, int)>();
-        foreach (var e in entries)
+        for (int ei = 0; ei < entries.Count; ei++)
         {
+            var e = entries[ei];
             if (!e.Animates) continue;
             // Runtime gate (SzModel_LoadTexAnim_Pipe @0x1e81b8): an entry only draws
             // when (slotMask & (1 << currentAnimSlot)) != 0. The extracted glb shows
@@ -285,7 +300,9 @@ internal static class TexAnim
             // a time in game, so collapse by geometry and keep the first speed.
             var key = (e.IsFlash, e.IsPingPong, e.Cols, e.Rows, e.BlockW, e.BlockH, e.SrcX, e.SrcY, e.DstX, e.DstY);
             if (!seen.Add(key)) continue;
-            sims.Add(MakeSim(e));
+            var sim = MakeSim(e);
+            sim.Index = ei;
+            sims.Add(sim);
         }
         if (sims.Count == 0) return null;
 
@@ -301,14 +318,20 @@ internal static class TexAnim
         for (long t = 0; t < period; t += step)
         {
             var frame = (byte[])baseRgba.Clone();
+            var stamps = new List<TexAnimStamp>();
             foreach (var s in sims)
             {
                 int f = FrameAt(s, t);
-                if (f >= 0) StampFrame(frame, w, h, baseRgba, s.E, f);
+                if (f < 0) continue;
+                StampFrame(frame, w, h, baseRgba, s.E, f);
+                int n2 = Math.Max(1, s.E.FrameCount);
+                stamps.Add(new TexAnimStamp(s.Index, ((f % n2) + n2) % n2,
+                    s.E.DstX, s.E.DstY, s.E.BlockW, s.E.BlockH));
             }
             if (prev != null && frame.AsSpan().SequenceEqual(prev)) continue;
             bake.FramesRgba.Add(frame);
             bake.FrameTimes.Add(t / BaseTicksPerSecond);
+            bake.FrameStamps.Add(stamps);
             prev = frame;
         }
 

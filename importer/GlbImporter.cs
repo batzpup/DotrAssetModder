@@ -160,6 +160,19 @@ public sealed class ImportedModel
     /// material extras). They hold no pointers, so they are written back verbatim.
     public Dictionary<int, byte[]> TextureAnimRecords = new();
 
+    /// The named frame images of an EXTRACTED glb's animated slot ("tex{N}_anim{frame}",
+    /// written by ModelExtractor.InjectTextureAnimations), kept apart from
+    /// TextureAnimFrames: this slot's animation is already carried by TextureAnimRecords,
+    /// so the frames are not repacked into a flipbook sheet. An edited frame is written
+    /// back into the cell the record copies it from instead, so the records stay retail's
+    /// (GlbImporter.ApplyEditedAnimFrames). Keyed by texIdx, then frame index.
+    public Dictionary<int, SortedDictionary<int, SharpGLTF.Memory.MemoryImage>> TextureAnimEditFrames = new();
+
+    /// The GS copies each of those frames is made of, from the material's "DOTR_texAnim"
+    /// extras: texIdx -> frame -> (record index, cell of that record's sheet, hash of the
+    /// frame's destination rectangle as extracted).
+    public Dictionary<int, Dictionary<int, List<(int Rec, int Cell, uint Hash)>>> TextureAnimStamps = new();
+
     /// Duplicate or out-of-range "mat_texN" slots seen by the texture-slot pre-pass, one line
     /// each (also echoed to stderr). Reported rather than silently mishandled.
     public List<string> TexSlotWarnings = new();
@@ -531,6 +544,17 @@ public static class GlbImporter
                     // above, so the frames have to move with their slot (an extracted glb's
                     // table is empty, so its names are kept exactly)
                     if (texLabelRemap.TryGetValue(texIdx, out int denseTex)) texIdx = denseTex;
+                    // An extracted glb's frames are views of the base image the retail
+                    // records copy from, not a flipbook to repack: keep them aside so the
+                    // records (and the texture's size) stay retail's, and let
+                    // ApplyEditedAnimFrames push an edited frame back into its source cell.
+                    if (im.TextureAnimRecords.ContainsKey(texIdx))
+                    {
+                        if (!im.TextureAnimEditFrames.TryGetValue(texIdx, out var ef))
+                            im.TextureAnimEditFrames[texIdx] = ef = new();
+                        ef[frame] = img.Content;
+                        continue;
+                    }
                     if (!byTex.TryGetValue(texIdx, out var list))
                         byTex[texIdx] = list = new();
                     list.Add((frame, img.Content));
@@ -802,6 +826,31 @@ public static class GlbImporter
                 im.TextureAnimRecords[ip.TexIdx] = PackTexAnimRecords(recs);
         }
         catch { /* a malformed extras block just means no animation */ }
+
+        // Which record and cell each baked frame image came from, so an edited frame can be
+        // written back into its source cell (see TextureAnimStamps / ApplyEditedAnimFrames).
+        try
+        {
+            if (ip.TexIdx >= 0 && !untextured && !im.TextureAnimStamps.ContainsKey(ip.TexIdx)
+                && mat.Extras is System.Text.Json.Nodes.JsonObject aex
+                && aex["DOTR_texAnim"] is System.Text.Json.Nodes.JsonObject anim
+                && anim["frames"] is System.Text.Json.Nodes.JsonArray frames)
+            {
+                var byFrame = new Dictionary<int, List<(int Rec, int Cell, uint Hash)>>();
+                for (int f = 0; f < frames.Count; f++)
+                {
+                    if (frames[f] is not System.Text.Json.Nodes.JsonObject fo
+                        || fo["stamps"] is not System.Text.Json.Nodes.JsonArray sts) continue;
+                    var list = new List<(int, int, uint)>();
+                    foreach (var st in sts)
+                        if (st is System.Text.Json.Nodes.JsonObject so)
+                            list.Add(((int)so["rec"]!, (int)so["cell"]!, (uint)so["hash"]!));
+                    if (list.Count > 0) byFrame[f] = list;
+                }
+                if (byFrame.Count > 0) im.TextureAnimStamps[ip.TexIdx] = byFrame;
+            }
+        }
+        catch { /* a malformed extras block just means no write-back */ }
     }
 
     /// True when the material's base-colour channel carries an actual image.
@@ -1039,6 +1088,7 @@ public static class GlbImporter
                 {
                     System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length);
                 }
+                ApplyEditedAnimFrames(model, texIdx, rgba, cpu.Width, cpu.Height);
                 inputs.Add(new Rh0Assembler.TextureInput {
                     TexIdx = texIdx,
                     Rgba = rgba,
@@ -1174,6 +1224,120 @@ public static class GlbImporter
         }
 
         return inputs;
+    }
+
+    /// Fold an edited animation frame of an extracted glb back into the base image.
+    ///
+    /// An animated retail slot is ONE texture: each record makes the GS copy cell i of a
+    /// cols x rows sheet inside that texture onto a fixed destination rectangle of the same
+    /// texture (TexAnim), so a frame image is just the base image with those cells stamped
+    /// in. Repainting a cell in the base image therefore already works; repainting a FRAME
+    /// has to be mapped back to the cell the game copies it from, which is what this does.
+    /// The extractor's per-frame stamps say which record and cell made each destination
+    /// rectangle and what its pixels hashed to when extracted: an unchanged hash means the
+    /// frame was not touched and the base image's own (possibly edited) cell wins, a changed
+    /// hash means the frame was painted and its pixels replace the cell. The records
+    /// themselves are untouched, so the animation still plays exactly as retail's.
+    private static void ApplyEditedAnimFrames(ImportedModel model, int texIdx, byte[] rgba, int w, int h)
+    {
+        if (!model.TextureAnimEditFrames.TryGetValue(texIdx, out var frames)) return;
+        if (!model.TextureAnimStamps.TryGetValue(texIdx, out var stampsByFrame)) return;
+        if (!model.TextureAnimRecords.TryGetValue(texIdx, out var recs)) return;
+
+        foreach (var (frame, img) in frames)
+        {
+            if (!stampsByFrame.TryGetValue(frame, out var stamps)) continue;
+            string tmp = null;
+            try
+            {
+                string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
+                tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_animedit_" + Guid.NewGuid().ToString("N") + "." + ext);
+                img.SaveToFile(tmp);
+                Image cpu = Raylib.LoadImage(tmp);
+                try
+                {
+                    // The records' rectangles are in the retail texture's pixel space, so a
+                    // frame that is no longer the base image's size cannot be mapped back.
+                    if (cpu.Width != w || cpu.Height != h) continue;
+                    Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
+                    byte[] fr = new byte[w * h * 4];
+                    unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, fr, 0, fr.Length); }
+
+                    for (int k = 0; k < stamps.Count; k++)
+                    {
+                        var (rec, cell, hash) = stamps[k];
+                        int o = rec * 0x18;
+                        if (o + 0x18 > recs.Length) continue;
+                        int cols = Math.Max(1, recs[o + 2] & 0xF);
+                        int bw = U16L(recs, o + 0x08), bh = U16L(recs, o + 0x0A);
+                        int sx = U16L(recs, o + 0x0C) + bw * (cell % cols);
+                        int sy = U16L(recs, o + 0x0E) + bh * (cell / cols);
+                        int dx = U16L(recs, o + 0x10), dy = U16L(recs, o + 0x12);
+                        if (bw <= 0 || bh <= 0) continue;
+                        if (RectHash(fr, w, h, dx, dy, bw, bh) == hash) continue;  // frame untouched
+
+                        for (int y = 0; y < bh; y++)
+                        {
+                            int syy = sy + y, dyy = dy + y;
+                            if ((uint)syy >= (uint)h || (uint)dyy >= (uint)h) continue;
+                            for (int x = 0; x < bw; x++)
+                            {
+                                int sxx = sx + x, dxx = dx + x;
+                                if ((uint)sxx >= (uint)w || (uint)dxx >= (uint)w) continue;
+                                // A later stamp of the same frame drew over this pixel, so
+                                // it is not this cell's (the bake stamps in record order).
+                                if (CoveredLater(recs, stamps, k, dxx, dyy)) continue;
+                                int d = (syy * w + sxx) * 4, sO = (dyy * w + dxx) * 4;
+                                rgba[d] = fr[sO]; rgba[d + 1] = fr[sO + 1];
+                                rgba[d + 2] = fr[sO + 2]; rgba[d + 3] = fr[sO + 3];
+                            }
+                        }
+                    }
+                }
+                finally { Raylib.UnloadImage(cpu); }
+            }
+            catch { /* a frame that will not decode just means no write-back for it */ }
+            finally
+            {
+                try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+        }
+    }
+
+    /// Is (x,y) inside the destination rectangle of a stamp after index k of this frame?
+    private static bool CoveredLater(byte[] recs, List<(int Rec, int Cell, uint Hash)> stamps, int k, int x, int y)
+    {
+        for (int j = k + 1; j < stamps.Count; j++)
+        {
+            int o = stamps[j].Rec * 0x18;
+            if (o + 0x18 > recs.Length) continue;
+            int bw = U16L(recs, o + 0x08), bh = U16L(recs, o + 0x0A);
+            int dx = U16L(recs, o + 0x10), dy = U16L(recs, o + 0x12);
+            if (x >= dx && x < dx + bw && y >= dy && y < dy + bh) return true;
+        }
+        return false;
+    }
+
+    private static int U16L(byte[] b, int o) => b[o] | (b[o + 1] << 8);
+
+    /// FNV-1a over one rectangle of an RGBA image; the same walk as
+    /// ModelExtractor.RectHash, which produced the hashes in the extras.
+    private static uint RectHash(byte[] rgba, int w, int h, int x0, int y0, int rw, int rh)
+    {
+        uint hash = 2166136261u;
+        for (int y = 0; y < rh; y++)
+        {
+            int yy = y0 + y;
+            if ((uint)yy >= (uint)h) continue;
+            for (int x = 0; x < rw; x++)
+            {
+                int xx = x0 + x;
+                if ((uint)xx >= (uint)w) continue;
+                int o = (yy * w + xx) * 4;
+                for (int c = 0; c < 4; c++) hash = (hash ^ rgba[o + c]) * 16777619u;
+            }
+        }
+        return hash;
     }
 
     private static bool IsPow2Local(int v) => v > 0 && (v & (v - 1)) == 0;

@@ -1886,6 +1886,11 @@ static class ModelExtractor
                 var png = PngEncoder.Encode(bake.Width, bake.Height, bake.FramesRgba[f]);
                 var img = model.CreateImage();
                 img.Content = new MemoryImage(png);
+                // Named so a modder can find the frames in Blender and so GlbImporter can
+                // route them back (the flipbook path's own "tex{N}_anim{frame}" naming; a
+                // slot that also carries DOTR_texAnimRecords takes the write-back path in
+                // GlbImporter.ApplyEditedAnimFrames instead of being repacked as a sheet).
+                img.Name = $"tex{texIdx}_anim{f}";
                 imgIndices[f] = img.LogicalIndex;
             }
 
@@ -1896,8 +1901,26 @@ static class ModelExtractor
                 if (f > 0) frameJson.Append(',');
                 float t = f < bake.FrameTimes.Count ? bake.FrameTimes[f] : 0f;
                 frameJson.Append("{\"image\":").Append(imgIndices[f])
-                    .Append(",\"t\":").Append(t.ToString(System.Globalization.CultureInfo.InvariantCulture))
-                    .Append('}');
+                    .Append(",\"t\":").Append(t.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                // The GS copies this frame is made of: which record, which cell of its
+                // sheet, and a hash of the pixels as extracted. GlbImporter compares the
+                // hash with the frame image it is given: unchanged means the base image
+                // still owns those pixels (an edited base cell survives), changed means
+                // the modder painted the frame, and the new pixels are written back into
+                // the record's source cell.
+                frameJson.Append(",\"stamps\":[");
+                var stamps = f < bake.FrameStamps.Count ? bake.FrameStamps[f] : new List<TexAnimStamp>();
+                for (int k = 0; k < stamps.Count; k++)
+                {
+                    if (k > 0) frameJson.Append(',');
+                    var st = stamps[k];
+                    frameJson.Append("{\"rec\":").Append(st.Rec)
+                        .Append(",\"cell\":").Append(st.Cell)
+                        .Append(",\"hash\":").Append(RectHash(bake.FramesRgba[f], bake.Width, bake.Height,
+                            st.DstX, st.DstY, st.W, st.H))
+                        .Append('}');
+                }
+                frameJson.Append("]}");
             }
             frameJson.Append(']');
 
@@ -1945,6 +1968,26 @@ static class ModelExtractor
             if ((fl & 1) != 0) break;
         }
         return recs;
+    }
+
+    // FNV-1a over one rectangle of an RGBA image, clipped like TexAnim.Stamp. The pair
+    // with GlbImporter.RectHash has to stay byte-for-byte the same walk.
+    internal static uint RectHash(byte[] rgba, int w, int h, int x0, int y0, int rw, int rh)
+    {
+        uint hash = 2166136261u;
+        for (int y = 0; y < rh; y++)
+        {
+            int yy = y0 + y;
+            if ((uint)yy >= (uint)h) continue;
+            for (int x = 0; x < rw; x++)
+            {
+                int xx = x0 + x;
+                if ((uint)xx >= (uint)w) continue;
+                int o = (yy * w + xx) * 4;
+                for (int c = 0; c < 4; c++) hash = (hash ^ rgba[o + c]) * 16777619u;
+            }
+        }
+        return hash;
     }
 
     private static void InjectTextureAnimationRecords(ModelRoot model,
