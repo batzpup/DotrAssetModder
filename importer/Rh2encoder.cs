@@ -274,8 +274,16 @@ public static class Rh2Encoder
         bool clut32 = clutPsm == 0x00;
         int paletteLen = clut32 ? Math.Min(maxColors, paletteSize / 4) : Math.Min(maxColors, paletteSize / 2);
 
-        // resample source -> decoded dims, then quantise
+        // resample source -> decoded dims
         byte[] img = Resample(rgba, srcW, srcH, decW, decH);
+
+        // An unedited image decodes to exactly the donor's pixels. The quantiser would
+        // renumber the palette and reassign every index without changing a pixel, so an
+        // untouched round trip would differ from retail byte for byte; keep the donor's
+        // CLUT order and indices by returning its bytes verbatim instead.
+        if (DecodesTo(templateRh2, img, decW, decH))
+            return templateRh2.Slice(0, (int)totalSize).ToArray();
+
         var (palette, indices) = Quantize(img, decW * decH, paletteLen);
 
         var outBuf = new byte[totalSize];
@@ -287,6 +295,21 @@ public static class Rh2Encoder
         else WriteImagePsmt8(outBuf, startOfImage, w, h, paletteLen, indices);
 
         return outBuf;
+    }
+
+    /// True when <paramref name="img"/> (w x h RGBA) is pixel-for-pixel what the donor RH2
+    /// decodes to, i.e. the image came out of this template and was never edited.
+    private static bool DecodesTo(ReadOnlySpan<byte> templateRh2, byte[] img, int w, int h)
+    {
+        try
+        {
+            var dec = Rh2Decoder.Decode(templateRh2, 0);
+            return dec.Width == w && dec.Height == h && dec.Rgba.AsSpan().SequenceEqual(img);
+        }
+        catch
+        {
+            return false; // a template the decoder cannot read goes down the quantiser path
+        }
     }
 
     // ---- palette ---------------------------------------------------------------------
@@ -323,25 +346,31 @@ public static class Rh2Encoder
             return ((q % paletteLen) + paletteLen) % paletteLen;
         }
 
-        if (w < 128 || h < 64)
-        {
-            int n = w * h;
-            for (int i = 0; i < n; i++) o[startOfImage + i] = (byte)Q(idx[i]);
-            return;
-        }
-
         int bw = Math.Min(w, 128), bh = Math.Min(h, 64), partial = bw * bh;
         int cols = Math.Max(w / bw, 1), rows = Math.Max(h / bh, 1);
-        int[] pos = GsSwizzle.GetPsmt8Swizzle(bw, bh, w, h); // entries = (y*w+x)*4 or -1
+        // Only a full 128x64 GS page carries the PSMT8 block swizzle. A narrower (or
+        // shorter) texture stores each section as a plain linear bw x bh block - retail's
+        // 64x64, 64x128 and 64x256 textures are all like that. Either way the sections are
+        // (partial + Pad) apart, because each one follows its own 0x60 setup block: writing
+        // w*h bytes straight from startOfImage (what this did for w < 128) overwrote the
+        // second and later setup blocks.
+        int[] pos = w >= 128 && h >= 64
+            ? GsSwizzle.GetPsmt8Swizzle(bw, bh, w, h) // entries = (y*w+x)*4 or -1
+            : null!;
         for (int sec = 0; sec < cols * rows; sec++)
         {
             int secOff = startOfImage + (partial + Pad) * sec;
             int xs = bw * (sec % cols), ys = bh * (sec / cols);
             for (int i = 0; i < partial; i++)
             {
-                int baseDst = pos[i];
-                if (baseDst < 0) continue;
-                int pix = baseDst / 4 + ys * w + xs;
+                int pix;
+                if (pos == null) pix = (ys + i / bw) * w + xs + i % bw;
+                else
+                {
+                    int baseDst = pos[i];
+                    if (baseDst < 0) continue;
+                    pix = baseDst / 4 + ys * w + xs;
+                }
                 if ((uint)pix < (uint)(w * h)) o[secOff + i] = (byte)Q(idx[pix]);
             }
         }

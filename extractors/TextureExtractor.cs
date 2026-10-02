@@ -393,31 +393,23 @@ static class Rh2Decoder
             }
         }
 
-        if (w < 128 || h < 64)
-        {
-            int n = w * h;
-            int avail = Math.Min(n, data.Length - startOfImage);
-            var rgba = new byte[n * 4];
-            for (int i = 0; i < avail; i++)
-            {
-                int p = data[startOfImage + i] * 4;
-                int o = i * 4;
-                rgba[o] = lut[p];
-                rgba[o + 1] = lut[p + 1];
-                rgba[o + 2] = lut[p + 2];
-                rgba[o + 3] = lut[p + 3];
-            }
-            return new DecodedTexture(w, h, rgba, hasAlpha);
-        }
-
         int blockWidth = Math.Min(w, 128);
         int blockHeight = Math.Min(h, 64);
         int partial = blockWidth * blockHeight;
         int colsPerRow = Math.Max(w / blockWidth, 1);
-        var posTbl = GsSwizzle.GetPsmt8Swizzle(blockWidth, blockHeight, w, h);
+        int rowsOfSecs = Math.Max(h / blockHeight, 1);
+        // Only a full 128x64 GS page carries the PSMT8 block swizzle; a narrower (or shorter)
+        // texture stores each section as a plain linear blockWidth x blockHeight block
+        // (retail's 64x64, 64x128 and 64x256 textures). Sections are always (partial + Pad)
+        // apart, each after its own 0x60 setup block, so a 64x128 texture is two stacked
+        // blocks - not w*h linear bytes, which is what this read before and which ran
+        // straight through the second section's setup block.
+        var posTbl = blockWidth == 128 && blockHeight == 64
+            ? GsSwizzle.GetPsmt8Swizzle(blockWidth, blockHeight, w, h)
+            : null;
         int rgbaLen = w * h * 4;
         var outArr = new byte[rgbaLen];
-        int sectionCap = Math.Min(nSecs, 100);
+        int sectionCap = Math.Min(nSecs, colsPerRow * rowsOfSecs);
 
         for (int sec = 0; sec < sectionCap; sec++)
         {
@@ -428,9 +420,14 @@ static class Rh2Decoder
             int secDstShift = (yShift * w + xShift) * 4;
             for (int i = 0; i < partial; i++)
             {
-                int baseDst = posTbl[i];
-                if (baseDst < 0) continue;
-                int pOff = baseDst + secDstShift;
+                int pOff;
+                if (posTbl == null) pOff = ((i / blockWidth) * w + i % blockWidth) * 4 + secDstShift;
+                else
+                {
+                    int baseDst = posTbl[i];
+                    if (baseDst < 0) continue;
+                    pOff = baseDst + secDstShift;
+                }
                 if ((uint)pOff > (uint)(rgbaLen - 4)) continue;
                 int place = data[secOff + i] * 4;
                 outArr[pOff] = lut[place];
