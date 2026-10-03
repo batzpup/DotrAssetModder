@@ -53,7 +53,7 @@ public class AssetExtractor
     internal static ReadOnlySpan<byte> Rh2Magic =>
         new byte[] { 0x52, 0x48, 0x32, 0x00 };
 
-    internal static List<uint> FindAllRh2Offsets(ReadOnlySpan<byte> data)
+    public static List<uint> FindAllRh2Offsets(ReadOnlySpan<byte> data)
     {
         var result = new List<uint>();
         int pos = 0;

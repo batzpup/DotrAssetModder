@@ -127,10 +127,27 @@ public static class Rebuilder
             if (tt > 0 && tt + 4 <= originalMrg.Length)
                 templateTexCount = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(originalMrg.AsSpan(tt));
         }
+        // The template root node's own scale (node tree +0x00). On all 683 monsters
+        // animTransScale == 1 / rootScale byte-exactly, but MODEL.MRG breaks the contract:
+        // STAGE7/00 (model 162) stores rootScale 0.0534 with ats 187.2 and STAGE7/03 the same
+        // way, so 1/ats is a tenth of the real scale and those two rebuilt 10x too small.
+        // Read it here, NOT in ReadTemplateFrame: both models are single-node, so the frame's
+        // GNode(1) pivot check rejects them and the frame comes back null (which is why the
+        // earlier attempt inside ReadTemplateFrame changed nothing).
+        float templateRootScale = 0f;
+        if (originalMrg.Length >= 0x18)
+        {
+            int nt = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(originalMrg.AsSpan(0x10));
+            if (nt > 0 && nt + 0x40 <= originalMrg.Length)
+            {
+                float rs = System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(originalMrg.AsSpan(nt));
+                if (rs > 1e-9f && !float.IsNaN(rs) && !float.IsInfinity(rs)) templateRootScale = rs;
+            }
+        }
         var templateFrame = ReadTemplateFrame(originalMrg);
         var rebuilt = RebuildPipeline.Build(model, templateATS, templateTexCount,
             opt.WarnMinRatio, opt.WarnMaxRatio, templateFrame,
-            opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels);
+            opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels, templateRootScale);
 
         if (resultOut != null && resultOut.Length > 0) resultOut[0] = rebuilt;
 

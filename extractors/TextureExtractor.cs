@@ -206,7 +206,7 @@ static class GsSwizzle
         });
 }
 
-static class Rh2Decoder
+public static class Rh2Decoder
 {
     public readonly record struct DecodedTexture(int Width, int Height, byte[] Rgba, bool HasAlpha)
     {
@@ -313,9 +313,13 @@ static class Rh2Decoder
             for (int i = 0; i < paletteLen; i++)
             {
                 ushort px = U16(data, paletteOff + i * 2);
-                byte r = (byte)(((px & 0x1F) * 255) / 31);
-                byte g = (byte)((((px >> 5) & 0x1F) * 255) / 31);
-                byte b = (byte)((((px >> 10) & 0x1F) * 255) / 31);
+                // 5 -> 8 bits by bit replication (v << 3 | v >> 2), the rounded expansion
+                // DotR-PC's tools/textures.py uses. Truncating (v * 255 / 31) was one low
+                // for 12 of the 32 levels, so no decoded pixel matched the reference tools.
+                static byte X5(int v) => (byte)(v << 3 | v >> 2);
+                byte r = X5(px & 0x1F);
+                byte g = X5((px >> 5) & 0x1F);
+                byte b = X5((px >> 10) & 0x1F);
                 byte a = (byte)(((px & 0x8000) != 0) ? 255 : 0);
                 if (a == 0) hasAlpha = true;
                 int o = i * 4;

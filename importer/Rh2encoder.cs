@@ -247,7 +247,10 @@ public static class Rh2Encoder
     // =================================================================================
 
     /// Encode <paramref name="rgba"/> (srcW x srcH, 4 bytes/px) into a copy of <paramref name="templateRh2"/>.
-    public static byte[] Encode(ReadOnlySpan<byte> templateRh2, byte[] rgba, int srcW, int srcH)
+    /// <paramref name="alpha"/> must be the treatment the image was decoded with, so an
+    /// unedited image is recognised as unedited (see DecodesTo).
+    public static byte[] Encode(ReadOnlySpan<byte> templateRh2, byte[] rgba, int srcW, int srcH,
+        Rh2Decoder.AlphaTreat alpha = Rh2Decoder.AlphaTreat.Keep)
     {
         uint totalSize = U32(templateRh2, 8);
         int psm = U16(templateRh2, 0x50); // 0x13 PSMT8, 0x14 PSMT4
@@ -281,7 +284,7 @@ public static class Rh2Encoder
         // renumber the palette and reassign every index without changing a pixel, so an
         // untouched round trip would differ from retail byte for byte; keep the donor's
         // CLUT order and indices by returning its bytes verbatim instead.
-        if (DecodesTo(templateRh2, img, decW, decH))
+        if (DecodesTo(templateRh2, img, decW, decH, alpha))
             return templateRh2.Slice(0, (int)totalSize).ToArray();
 
         var (palette, indices) = Quantize(img, decW * decH, paletteLen);
@@ -299,11 +302,15 @@ public static class Rh2Encoder
 
     /// True when <paramref name="img"/> (w x h RGBA) is pixel-for-pixel what the donor RH2
     /// decodes to, i.e. the image came out of this template and was never edited.
-    private static bool DecodesTo(ReadOnlySpan<byte> templateRh2, byte[] img, int w, int h)
+    /// The comparison must use the same alpha treatment the caller decoded with (the texture
+    /// editor forces alpha opaque on the MRGs the game draws opaque), or an untouched image
+    /// looks edited and gets re-quantised, renumbering the CLUT and every index.
+    private static bool DecodesTo(ReadOnlySpan<byte> templateRh2, byte[] img, int w, int h,
+        Rh2Decoder.AlphaTreat alpha)
     {
         try
         {
-            var dec = Rh2Decoder.Decode(templateRh2, 0);
+            var dec = Rh2Decoder.Decode(templateRh2, 0, alpha);
             return dec.Width == w && dec.Height == h && dec.Rgba.AsSpan().SequenceEqual(img);
         }
         catch

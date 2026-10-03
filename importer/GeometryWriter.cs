@@ -184,6 +184,7 @@ public static class GeometryWriter
         // record on colour/alpha change (matches retail page streams).
         int lastTex = -1;
         (int R, int G, int B, float A, (int, int, int) C0, (int, int, int) C2) lastMat = (-1, -1, -1, -1, (-1, -1, -1), (-1, -1, -1));
+        var lastBinds = new List<(int VuAddr, int Slot, uint VifEcho)>(); // sticky bind state
         uint secTag = isAlt ? 0x40000000u : 0x20000000u;
 
         foreach (var page in pages)
@@ -212,10 +213,20 @@ public static class GeometryWriter
                 WriteMaterial(sec1, page.Color0, curR, curG, curB, page.Alpha, page.Color2);
                 lastMat = (curR, curG, curB, curA, page.Color0, page.Color2);
             }
-            foreach (var bb in page.BoneBinds)
+            // Bone-binds are sticky, exactly like the texture and material records above: a
+            // bind DMAs a matrix into VU memory and nothing between two consecutive pages of
+            // the same chain overwrites it, so retail re-emits the set only when it changes
+            // (3 repeats in 638 retail pages; we used to repeat on 318 of 565, +16 B a page -
+            // the whole residual that kept 19 MODEL.MRG models 16-120 B over their slot).
+            var binds = page.BoneBinds.Select(b => (b.VuAddr, b.Slot, b.VifEcho)).ToList();
+            if (!binds.SequenceEqual(lastBinds))
             {
-                bindOffsets.Add((int)sec1.Length);
-                WriteBoneBind(sec1, bb, isAlt);
+                foreach (var bb in page.BoneBinds)
+                {
+                    bindOffsets.Add((int)sec1.Length);
+                    WriteBoneBind(sec1, bb, isAlt);
+                }
+                lastBinds = binds;
             }
 
             // terminator (16B): term0, term1, 0, 0 ; walkOff points at term1

@@ -141,7 +141,8 @@ public static class RebuildPipeline
     public static Result Build(ImportedModel im, float templateAnimTransScale = 0f,
         int templateTexCount = 0, float warnMinRatio = 0.125f, float warnMaxRatio = 2.0f,
         TemplateFrame? templateFrame = null,
-        bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false)
+        bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false,
+        float templateRootScale = 0f)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
         LastClampedValues = 0;
@@ -304,6 +305,7 @@ public static class RebuildPipeline
             fitReport.Reason = null;
         }
 
+        float keepTemplateAts = 0f; // >0: write the template's own animTransScale, not 1/S
         float S = anyPlainJoint ? (float)(maxLocal / S16Fit) : 1f;
         if (S <= 0f || float.IsNaN(S) || float.IsInfinity(S)) S = 1f;
 
@@ -333,9 +335,21 @@ public static class RebuildPipeline
         if (mayAdoptTemplateScale && templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
             !float.IsInfinity(templateAnimTransScale))
         {
-            float templS = 1f / templateAnimTransScale;
+            // The template's own stored root scale is the authority; 1/animTransScale is only
+            // its monster-MRG shorthand. MODEL.MRG's STAGE7/00 and /03 store a root scale ten
+            // times 1/ats, so taking the reciprocal rebuilt them at a tenth of retail size.
+            float templS = templateRootScale > 1e-9f ? templateRootScale : 1f / templateAnimTransScale;
             // adopt template scale only when requested/safe
-            if (!anyPlainJoint || maxLocal / templS <= 32700.0) S = templS;
+            if (!anyPlainJoint || maxLocal / templS <= 32700.0)
+            {
+                S = templS;
+                // When the template really does break `ats == 1/rootScale`, keep ITS ats in the
+                // rebuilt header: the scale and the motion-translation unit are independent
+                // there, and 1/S would divide every external motion's translations by 10.
+                // Monsters hold the contract, so they keep the derived value and stay as they were.
+                if (Math.Abs(templS * templateAnimTransScale - 1f) > 1e-3f)
+                    keepTemplateAts = templateAnimTransScale;
+            }
         }
 
         // ---- 3. mesh-slot assignment ----
@@ -626,7 +640,7 @@ public static class RebuildPipeline
         // GetGNode(1).pos / animTransScale — converting node-tree units back to world units —
         // and the motion interpolator multiplies non-root position keys by it at runtime
         // (lRhModel_SetupFloatMotionRecursive); root keys are used as they are.
-        float AnimTransScale = 1f / S;
+        float AnimTransScale = keepTemplateAts > 0f ? keepTemplateAts : 1f / S;
         var encGlb = new int[nodes.Count];
         Array.Fill(encGlb, -1);
         foreach (var (g, e) in encIndexOf) encGlb[e] = g;

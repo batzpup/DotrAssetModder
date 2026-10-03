@@ -132,6 +132,12 @@ public static class Rh0Assembler
     /// each with the slot its pages were drawn from instead (the wrong texture).
     [ThreadStatic] public static List<(int Slot, int Onto)>? LastShedTexSlots;
 
+    /// How far the last Assemble()'s finished block overshot its budget, in bytes (0 = it fits),
+    /// and the section/payload that first crossed the line. Assemble() never throws on overflow:
+    /// it returns the complete block so the caller can report "over by N B" and decide.
+    [ThreadStatic] public static int LastOverflowBytes;
+    [ThreadStatic] public static string? LastOverflowLabel;
+
     public static byte[] Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
         IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
         bool rebuildNative = false, int maxTexDim = 512,
@@ -139,6 +145,8 @@ public static class Rh0Assembler
         bool trimToContent = false, ConfirmReduction? confirmReduction = null)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
+        LastOverflowBytes = 0;
+        LastOverflowLabel = null;
 
         // ---- regenerate blocks ----
         byte[] nodeTree = NodeTreeWriter.Write(rebuilt.Nodes,
@@ -174,6 +182,12 @@ public static class Rh0Assembler
         // end up with a non-empty RH2.
         int origTt = (int)U32(originalMrg, 0x38);
         int origCount = (int)U32(originalMrg, origTt);
+        // Not every block's header+0x38 really points at a texture table: MODEL.MRG's
+        // EVENT2/31 (model id 65) reads 0x20000004 there, a tagged pointer, not a count. The
+        // extractor already treats a count outside 1..256 as "no texture table"
+        // (ModelExtractor.ParseTexTableForModel), so the assembler must agree, or OrigRh2
+        // walks 500 million slots of someone else's data.
+        if (origTt <= 0 || origCount < 0 || origCount > 256) origCount = 0;
         // The table is sized to EXACTLY the slots the new model dispatches to - it shrinks
         // as well as grows. A 6-texture template hosting a 4-texture model keeps 4 blocks:
         // the two surplus template RH2 payloads (and their ANM entries) are dropped, which
@@ -509,10 +523,23 @@ public static class Rh0Assembler
                 if (ti_ >= texCount && t >= 0 && !shed.Contains((ti_, t))) shed.Add((ti_, t));
             }
             if (t < 0)
-                throw new InvalidOperationException(
-                    "the template model carries no RH2 texture payloads, so there is no donor " +
-                    "block to encode the import's textures into (RH2 synthesis from scratch is " +
-                    "not supported) - inject over a template that has at least one texture");
+            {
+                // No donor RH2 at all. MODEL.MRG's EVENT2/31 (model id 65) is such a block:
+                // header+0x38 holds a tagged pointer, not a texture table, so it has neither a
+                // table nor a payload. A textureless import belongs on it and must pass
+                // straight through with no table and no dispatch entry, exactly like retail;
+                // only an import that actually brings pixels needs a donor to encode into.
+                bool suppliesPixels = false;
+                foreach (var kv in byTex)
+                    if (kv.Value.Rgba != null) { suppliesPixels = true; break; }
+                if (suppliesPixels)
+                    throw new InvalidOperationException(
+                        "this template model carries no texture table and no RH2 texture payload, " +
+                        "so there is no donor block to encode the import's textures into (RH2 " +
+                        "synthesis from scratch is not supported) - import a glb with no textures " +
+                        "over it, or pick a template that has at least one texture");
+                continue;
+            }
             dispatch.Add((t, entry));
         }
 
@@ -526,10 +553,19 @@ public static class Rh0Assembler
         {
             int o = Align16(cursor);
             cursor = o + data.Length;
-            if (cursor > blockSize)
-                throw new InvalidOperationException(
-                    $"RH0 exceeds 1 MiB block (overflowed while placing '{label}', len=0x{data.Length:X}, " +
-                    $"cursor would be 0x{cursor:X}, budget=0x{blockSize:X})");
+            if (cursor > outBuf.Length)
+            {
+                // Report, never throw. The budget is the monster MRG's 1 MiB slot for a monster
+                // import, but a MODEL.MRG sub-model's own slot (a few KB upwards) for a pack
+                // import, and a pack model that misses its slot by a few bytes must come back as
+                // a complete block with a clean "over by N B" (the slot check in
+                // ModelMrgCodec.Build / the caller's own size compare) instead of dying here
+                // with a half-assembled buffer. Grow and keep going; LastOverflowBytes and
+                // LastOverflowLabel record how far over the budget the finished block is.
+                Array.Resize(ref outBuf, cursor);
+                if (LastOverflowBytes == 0) LastOverflowLabel = label;
+                LastOverflowBytes = cursor - blockSize;
+            }
             Array.Copy(data, 0, outBuf, o, data.Length);
             return o;
         }

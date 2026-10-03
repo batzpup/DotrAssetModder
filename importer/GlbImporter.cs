@@ -522,7 +522,21 @@ public static class GlbImporter
                 foreach (var (a, b, c) in prim.GetTriangleIndices())
                     ip.Triangles.Add((a, b, c));
 
-                WrapPrimitiveUvs(ip);   // fold out-of-[0,1] UVs into tiles (REPEAT semantics)
+                // Fold out-of-[0,1] UVs into tiles only on axes the GS really clamps. The
+                // extractor writes the page's GS CLAMP byte into the material name as "_cN"
+                // (ModelExtractor's matName), and a stage model's pages are usually REPEAT on
+                // both axes: there, tiling UVs reproduce exactly (4.12 UV reaches +-8), so
+                // folding them would both change the picture and duplicate every vertex that
+                // straddles a tile - which destroys the adjacency the stripifier needs and
+                // blew section 2/4 up to one strip per triangle on MODEL.MRG scenery. A glb
+                // with no such tag (an outside authoring tool) keeps the old fold on both axes.
+                bool foldS = true, foldT = true;
+                if (ParseGsClampTag(prim.Material?.Name, out int clampTag))
+                {
+                    foldS = (clampTag & 0x3) == 1;
+                    foldT = ((clampTag >> 2) & 0x3) == 1;
+                }
+                WrapPrimitiveUvs(ip, foldS, foldT);
 
                 im.Primitives.Add(ip);
             }
@@ -979,6 +993,23 @@ public static class GlbImporter
         return end > start && int.TryParse(name.AsSpan(start, end - start), out tex);
     }
 
+    /// The GS CLAMP byte the extractor encodes in a material name as "_c<hex>" (see
+    /// ModelExtractor's matName: "..._gsXX_tXXXXX_cN[_rgb..][_k..]"). Bits 0-1 are WMS and
+    /// bits 2-3 WMT; 1 means CLAMP, 0 REPEAT. False when the name carries no such tag.
+    private static bool ParseGsClampTag(string? name, out int clamp)
+    {
+        clamp = 0;
+        if (string.IsNullOrEmpty(name)) return false;
+        int p = name.IndexOf("_c", StringComparison.Ordinal);
+        if (p < 0) return false;
+        int start = p + 2, end = start;
+        while (end < name.Length && Uri.IsHexDigit(name[end])) end++;
+        if (end == start || end - start > 2) return false;
+        if (end < name.Length && name[end] != '_') return false;
+        clamp = Convert.ToInt32(name.Substring(start, end - start), 16);
+        return true;
+    }
+
     private static Vector3 SafeNormalize(Vector3 v)
     {
         float len = v.Length();
@@ -991,12 +1022,13 @@ public static class GlbImporter
     /// of the triangle's UV centroid, so all three corners shift by the same whole-tile
     /// offset and the texture never swims across a face. Vertices shared between triangles
     /// that land in different tiles are duplicated, because they need different shifts.
-    private static void WrapPrimitiveUvs(ImportedPrimitive ip)
+    private static void WrapPrimitiveUvs(ImportedPrimitive ip, bool foldS = true, bool foldT = true)
     {
-        // quick out: nothing outside [0,1)
+        if (!foldS && !foldT) return;
+        // quick out: nothing outside [0,1) on an axis that is being folded
         bool any = false;
         foreach (var v in ip.Vertices)
-            if (v.Uv.X < 0f || v.Uv.X >= 1f || v.Uv.Y < 0f || v.Uv.Y >= 1f) { any = true; break; }
+            if ((foldS && (v.Uv.X < 0f || v.Uv.X >= 1f)) || (foldT && (v.Uv.Y < 0f || v.Uv.Y >= 1f))) { any = true; break; }
         if (!any) return;
 
         var newTris = new List<(int A, int B, int C)>(ip.Triangles.Count);
@@ -1033,7 +1065,7 @@ public static class GlbImporter
             var ua = ip.Vertices[a].Uv; var ub = ip.Vertices[b].Uv; var uc = ip.Vertices[c].Uv;
             float cx = (ua.X + ub.X + uc.X) / 3f;
             float cy = (ua.Y + ub.Y + uc.Y) / 3f;
-            int tx = (int)MathF.Floor(cx), ty = (int)MathF.Floor(cy);
+            int tx = foldS ? (int)MathF.Floor(cx) : 0, ty = foldT ? (int)MathF.Floor(cy) : 0;
             newTris.Add((Resolve(a, tx, ty), Resolve(b, tx, ty), Resolve(c, tx, ty)));
         }
         ip.Triangles = newTris;
@@ -1042,10 +1074,17 @@ public static class GlbImporter
         // exactly 1.0, or one only ever used by tile-(0,0) tris but authored at 1.x)
         foreach (var v in ip.Vertices)
         {
-            float wx = v.Uv.X - MathF.Floor(v.Uv.X);
-            float wy = v.Uv.Y - MathF.Floor(v.Uv.Y);
-            if (wx == 0f && v.Uv.X != 0f) wx = 1f;
-            if (wy == 0f && v.Uv.Y != 0f) wy = 1f;
+            float wx = v.Uv.X, wy = v.Uv.Y;
+            if (foldS)
+            {
+                wx = v.Uv.X - MathF.Floor(v.Uv.X);
+                if (wx == 0f && v.Uv.X != 0f) wx = 1f;
+            }
+            if (foldT)
+            {
+                wy = v.Uv.Y - MathF.Floor(v.Uv.Y);
+                if (wy == 0f && v.Uv.Y != 0f) wy = 1f;
+            }
             v.Uv = new Vector2(wx, wy);
         }
     }

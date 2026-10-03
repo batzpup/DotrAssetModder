@@ -6,3 +6,5 @@ riderModule.iml
 .idea/**/workspace.xml
 *.DotSettings.user
 /docs/model-pipeline-status.md
+/docs/asset-types-plan.md
+/docs/

@@ -17,10 +17,13 @@ public sealed class TextureSlot
     public int Height;
     public TextureMrgKind Kind;
     public int IconIndex;
-    internal Rh2Decoder.AlphaTreat Alpha;
+    // Offset of this slot inside the MRG. Slots whose decode is empty or throws are skipped,
+    // so the slot index is not the index of its RH2 match - PatchMrg must use this.
+    public int Offset;
+    public Rh2Decoder.AlphaTreat Alpha;
 
-    internal TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1,
-        Rh2Decoder.AlphaTreat alpha = Rh2Decoder.AlphaTreat.Keep)
+    public TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1,
+        Rh2Decoder.AlphaTreat alpha = Rh2Decoder.AlphaTreat.Keep, int offset = 0)
     {
         Bytes = bytes;
         Thumbnail = thumbnail;
@@ -29,6 +32,7 @@ public sealed class TextureSlot
         Kind = kind;
         IconIndex = iconIndex;
         Alpha = alpha;
+        Offset = offset;
     }
 }
 
@@ -83,24 +87,32 @@ public static class TextureSlotManager
         return drawnOpaque ? Rh2Decoder.AlphaTreat.ForceOpaque : Rh2Decoder.AlphaTreat.Keep;
     }
 
-    public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes, string mrgName)
+    // withThumbnails = false skips the Raylib upload, for callers without a window (the harness).
+    public static List<TextureSlot> LoadRh2Slots(byte[] mrgBytes, string mrgName, bool withThumbnails = true)
     {
         var alpha = AlphaTreatFor(mrgName);
         var slots = new List<TextureSlot>();
         var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
-        foreach (uint off in offsets)
+        for (int i = 0; i < offsets.Count; i++)
         {
+            uint off = offsets[i];
             try
             {
                 var dec = Rh2Decoder.Decode(mrgBytes, (int)off, alpha);
                 if (dec.IsEmpty)
                     continue;
-                var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
-                var thumbnail = BitmapToTexture(bmp);
-                bmp.Dispose();
-                int next = offsets.Count > slots.Count + 1 ? (int)offsets[slots.Count + 1] : mrgBytes.Length;
+                var thumbnail = default(Texture2D);
+                if (withThumbnails)
+                {
+                    var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
+                    thumbnail = BitmapToTexture(bmp);
+                    bmp.Dispose();
+                }
+                // the gap to the next RH2 match, not to the next kept slot
+                int next = i + 1 < offsets.Count ? (int)offsets[i + 1] : mrgBytes.Length;
                 var slotBytes = mrgBytes.AsSpan((int)off, next - (int)off).ToArray();
-                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2, alpha: alpha));
+                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2,
+                    alpha: alpha, offset: (int)off));
             }
             catch (Exception ex)
             {
@@ -166,7 +178,7 @@ public static class TextureSlotManager
             return PS2Icon.SaveIconToByte(slot.Bytes, bitmap);
         }
         byte[] rgba = BitmapToRgba(bitmap);
-        return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height);
+        return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height, slot.Alpha);
     }
 
     public static byte[] EncodeSlotOctree(TextureSlot slot, SKBitmap bitmap)
@@ -178,7 +190,7 @@ public static class TextureSlotManager
 
         byte[] rgba = BitmapToRgba(bitmap);
         rgba = OctreePreQuantise(rgba, bitmap.Width * bitmap.Height);
-        return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height);
+        return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height, slot.Alpha);
     }
 
     public static void PatchMrg(byte[] mrgBytes, List<TextureSlot> slots, int index, byte[] newSlotBytes)
@@ -186,13 +198,9 @@ public static class TextureSlotManager
         var slot = slots[index];
         if (slot.Kind == TextureMrgKind.Rh2)
         {
-            var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
-            if (index < offsets.Count)
-            {
-                int off = (int)offsets[index];
-                int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
-                Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
-            }
+            int off = slot.Offset;
+            int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
+            Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
         }
         else if (slot.Kind == TextureMrgKind.Icon)
         {
