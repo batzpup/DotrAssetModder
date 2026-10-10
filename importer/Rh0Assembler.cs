@@ -47,17 +47,15 @@ public static class Rh0Assembler
 
         // --- optional custom flipbook animation (see GlbImporter.TryParseAnimImageName /
         // ImportedModel.TextureAnimFrames for how these get populated from a glb) ---
-        // When AnimFrameCount > 1, Rgba/Width/Height above hold the PACKED SPRITE-SHEET
-        // (all frames laid out left-to-right, single row), and these fields describe how
-        // to read it back as a flipbook, matching the real on-disk TexAnm entry format.
-        // The 7 ANM modes confirmed via lSzModel_TexAnimConv string table (0x2cfa44):
-        //   mode 0 = LOOP2, mode 1 = LOOP, mode 2 = REVERSE2, mode 3 = REVERSE,
-        //   mode 4 = SHOT3, mode 5 = SHOT2, mode 6 = SHOT
-        // All are flipbook cell-selection modes. There is NO scroll/UV-scroll mode.
-        // flags=0x1B (previously misidentified as "scroll") is REVERSE mode (mode 3).
-        // We synthesize LOOP mode (flags=0x8F, mode 1) matching the confirmed working
-        // retail flipbook sample (electromagnetic_bagworm.mrg tex[1]).
+        // When AnimFrameCount > 1, Rgba/Width/Height above hold the PACKED SPRITE SHEET: frame f
+        // in cell (f % AnimCols, f / AnimCols) of a grid of AnimBlockW x AnimBlockH cells, frame 0
+        // at (0, 0), which is also where the faces sample (GlbImporter.DecodeGlbTextures).
+        // The 7 ANM modes (flags bits 2-4), names from lSzModel_TexAnimConv's table:
+        //   0 LOOP2, 1 LOOP, 2 REVERSE2, 3 REVERSE (ping-pong), 4 SHOT3 (window),
+        //   5 SHOT2 (one shot), 6 SHOT (blink). All are flipbook cell copies; there is NO
+        //   UV-scroll mode. See BuildCustomTexAnimEntry.
         public int AnimFrameCount;       // 0 or 1 = static texture, no ANM entry written
+        public int AnimCols, AnimRows;   // grid; 0 = one row of AnimFrameCount cells
         public int AnimBlockW, AnimBlockH;
         public int AnimTicksPerFrame = 5; // default matches the one real flipbook sample (aux0=aux1=5)
 
@@ -66,6 +64,11 @@ public static class Rh0Assembler
         /// "DOTR_texAnimRecords" material extras). The entries hold no pointers, so they are
         /// placed verbatim and only TexTable's postOff has to point at them.
         public byte[]? AnimRecords;
+
+        /// AnimRecords were authored against Rgba's own Width x Height (a custom glb, e.g. a
+        /// DoD export's blink records), not against a retail RH2. The slot is then encoded
+        /// natively and the records' rectangles are scaled to the final texture size.
+        public bool AnimRecordsInImagePixels;
     }
 
     /// True when a valid RH0 magic sits at <paramref name="off"/> in <paramref name="src"/>.
@@ -85,42 +88,6 @@ public static class Rh0Assembler
             throw new Exception(label + " is not a valid 1 MiB RH0 block");
     }
 
-    /// Extracts a fixed 1 MiB RH0 block for monster-MRG-style import, from a user-selected
-    /// "clean template" file that could be any of: a standalone 1 MiB RH0 block, a full
-    /// data file using the indexed fixed-slot layout (block = modelIndex * 1 MiB), or a
-    /// full data file where the caller already knows the model's current byte offset
-    /// (currentBlockOff). Tries each interpretation in turn; throws if none match.
-    public static byte[] ExtractTemplateBlock(byte[] src, int modelIndex, long currentBlockOff)
-    {
-        var block = new byte[0x100000];
-
-        // A standalone RH0/MRG block.
-        if (src.Length == 0x100000)
-        {
-            if (!LooksLikeRh0(src, 0))
-                throw new Exception("selected template file is not an RH0 block");
-            Array.Copy(src, 0, block, 0, 0x100000);
-            return block;
-        }
-
-        // A full data file matching the current indexed archive layout.
-        long byIndex = (long)modelIndex * 0x100000;
-        if (byIndex >= 0 && byIndex + 0x100000 <= src.Length && LooksLikeRh0(src, byIndex))
-        {
-            Array.Copy(src, byIndex, block, 0, 0x100000);
-            return block;
-        }
-
-        // A full data file matching the current byte offset within the selected data file.
-        if (currentBlockOff >= 0 && currentBlockOff + 0x100000 <= src.Length && LooksLikeRh0(src, currentBlockOff))
-        {
-            Array.Copy(src, currentBlockOff, block, 0, 0x100000);
-            return block;
-        }
-
-        throw new Exception("selected clean template does not contain an RH0 block at index 0 or the selected model index");
-    }
-
     /// (category, categoryBytes, totalBytes, budget) -> true to apply that category's
     /// fidelity-reduction fallback, false to decline and let Place() throw normally.
     /// Called at most once, only for whichever category is the larger byte share of an
@@ -135,6 +102,12 @@ public static class Rh0Assembler
     /// How far the last Assemble()'s finished block overshot its budget, in bytes (0 = it fits),
     /// and the section/payload that first crossed the line. Assemble() never throws on overflow:
     /// it returns the complete block so the caller can report "over by N B" and decide.
+    /// GS pages the textures of the last Assemble take (one per RH2 section), and how many
+    /// halvings the page cap made. See the page cap in Assemble.
+    public const int MaxModelTexturePages = 31;
+    [ThreadStatic] public static int LastTexturePages;
+    [ThreadStatic] public static int LastHalvedForPages;
+
     [ThreadStatic] public static int LastOverflowBytes;
     [ThreadStatic] public static string? LastOverflowLabel;
 
@@ -142,7 +115,8 @@ public static class Rh0Assembler
         IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
         bool rebuildNative = false, int maxTexDim = 512,
         bool neutralMissingTextures = true, bool preserveTemplateAnm = false,
-        bool trimToContent = false, ConfirmReduction? confirmReduction = null)
+        bool trimToContent = false, ConfirmReduction? confirmReduction = null,
+        bool ownSizeTextures = false)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
         LastOverflowBytes = 0;
@@ -296,10 +270,19 @@ public static class Rh0Assembler
                     rh2[i] = Rh2Encoder.BuildNative(ti.Rgba, ti.Width, ti.Height, ti.Width, ti.Height);
                     usedNative[i] = true;
                 }
+                else if (ti.AnimRecords is { Length: > 0 } && ti.AnimRecordsInImagePixels)
+                {
+                    // Image-space records: a native PSMT8 build, never the donor's size or
+                    // format, so ScaleTexAnimRecords below knows the texel grid they land on.
+                    var (tw, th) = Rh2Encoder.ChooseTarget(ti.Width, ti.Height, maxTexDim);
+                    rh2[i] = Rh2Encoder.BuildNative(ti.Rgba, ti.Width, ti.Height, tw, th);
+                    usedNative[i] = true;
+                }
                 else
                 {
                     // Normal single static texture - regular donor-fit/native encode path.
-                    rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, rebuildNative, maxTexDim, out usedNative[i]);
+                    rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, rebuildNative, maxTexDim,
+                        ownSizeTextures, out usedNative[i]);
                 }
             }
             else if (neutralMissingTextures)
@@ -321,8 +304,8 @@ public static class Rh0Assembler
             // previous-slot ANM bleeding into an unrelated GLB).
             if (byTex.TryGetValue(i, out var anmTi) && anmTi.AnimFrameCount > 1)
             {
-                anm[i] = BuildCustomTexAnimEntry(anmTi.AnimFrameCount, anmTi.AnimBlockW, anmTi.AnimBlockH,
-                    anmTi.AnimTicksPerFrame);
+                anm[i] = BuildCustomTexAnimEntry(anmTi.AnimFrameCount, anmTi.AnimCols, anmTi.AnimRows,
+                    anmTi.AnimBlockW, anmTi.AnimBlockH, anmTi.AnimTicksPerFrame);
             }
             else if (anmTi?.AnimRecords is { Length: > 0 } records)
             {
@@ -339,6 +322,39 @@ public static class Rh0Assembler
                 anm[i] = postOff > 0 ? TexAnmWriter.ExtractEntries(originalMrg, postOff) : Array.Empty<byte>();
             }
         }
+
+        // ---- GS page cap (custom models) ----
+        // SzModel_LoadTexture_Pipe @ 0x1EA2A0 uploads every texture of the model on each draw,
+        // back to back from RhBase_GetUserGsAddress, one 8 KB page per RH2 section, with no limit
+        // check: too many pages overwrite the GS memory past them and the screen flashes when the
+        // model is drawn (45 pages did). The most a playable retail monster uses is 31
+        // (Electromagnetic Bagworm; Summoned Lord Exodia's 35 is not a playable card), so halve
+        // the largest supplied texture until the model fits that.
+        LastHalvedForPages = 0;
+        if (ownSizeTextures)
+        {
+            var pageFloor = new bool[texCount];
+            while (TexturePages(rh2, texCount) > MaxModelTexturePages)
+            {
+                int big = -1;
+                for (int i = 0; i < texCount; i++)
+                    if (!pageFloor[i] && byTex.TryGetValue(i, out var t) && t.Rgba != null && t.AnimFrameCount <= 1 &&
+                        !(t.AnimRecordsInImagePixels && t.AnimRecords != null) &&
+                        (big < 0 || Rh2Pages(rh2[i]) > Rh2Pages(rh2[big])))
+                        big = i;
+                if (big < 0) break; // every supplied texture is at the minimum
+                var src = byTex[big];
+                var (w, h) = DonorDecodedDims(rh2[big]);
+                int tw = Math.Max(MinTexW, Rh2Encoder.NextPot(w) / 2);
+                int th = Math.Max(MinTexH, Rh2Encoder.NextPot(h) / 2);
+                var smaller = Rh2Encoder.BuildNative(src.Rgba!, src.Width, src.Height, tw, th);
+                if (Rh2Pages(smaller) >= Rh2Pages(rh2[big])) { pageFloor[big] = true; continue; }
+                rh2[big] = smaller;
+                usedNative[big] = true;
+                LastHalvedForPages++;
+            }
+        }
+        LastTexturePages = TexturePages(rh2, texCount);
 
         // ---- aux lists ----
         // aux0/aux1 are LAYOUT-DEPENDENT: per-frame fixup lists for lRhModel_DynamicAddressBind
@@ -455,7 +471,8 @@ public static class Rh0Assembler
             {
                 int big = -1, bigLen = -1;
                 for (int i = 0; i < texCount; i++)
-                    if (usedNative[i] && rh2[i].Length > bigLen)
+                    if (usedNative[i] && rh2[i].Length > bigLen &&
+                        !(byTex.TryGetValue(i, out var ri) && ri.AnimRecordsInImagePixels && ri.AnimRecords != null))
                     {
                         bigLen = rh2[i].Length;
                         big = i;
@@ -494,6 +511,15 @@ public static class Rh0Assembler
                 rh2[big] = smaller;
             }
         }
+
+        // image-space records follow their texture to its final (possibly halved) size
+        for (int i = 0; i < texCount; i++)
+            if (byTex.TryGetValue(i, out var rt) && rt.AnimRecordsInImagePixels &&
+                rt.AnimRecords != null && ReferenceEquals(anm[i], rt.AnimRecords) && rh2[i].Length > 0)
+            {
+                var (fw, fh) = DonorDecodedDims(rh2[i]);
+                anm[i] = ScaleTexAnimRecords(rt.AnimRecords, rt.Width, rt.Height, fw, fh);
+            }
 
         while (texCount > origCount && EstimateTotal(texCount) > blockSize) texCount--;
         var shed = new List<(int Slot, int Onto)>();
@@ -559,7 +585,7 @@ public static class Rh0Assembler
                 // import, but a MODEL.MRG sub-model's own slot (a few KB upwards) for a pack
                 // import, and a pack model that misses its slot by a few bytes must come back as
                 // a complete block with a clean "over by N B" (the slot check in
-                // ModelMrgCodec.Build / the caller's own size compare) instead of dying here
+                // ModelMrg.Build / the caller's own size compare) instead of dying here
                 // with a half-assembled buffer. Grow and keep going; LastOverflowBytes and
                 // LastOverflowLabel record how far over the budget the finished block is.
                 Array.Resize(ref outBuf, cursor);
@@ -624,9 +650,8 @@ public static class Rh0Assembler
         // chain content, header[0x0C] must instead hold the cursor's current value - the
         // real, already-placed end of the block (node tree + geometry + textures) - exactly
         // like the motBlocks.Length>0 branch's `motOff = Place(motBlocks)` does for a
-        // non-empty chain. This was corrupting ModelPackIndex.Scan (and the engine itself)
-        // for every assembled model with zero embedded motion and zero trailing chain data,
-        // i.e. most freshly-imported custom GLBs.
+        // non-empty chain. Without it the block end is wrong for every assembled model with
+        // zero embedded motion and zero trailing chain data, i.e. most custom GLBs.
         byte[] postMot = postMotEarly;
         int motOff;
         if (motBlocks.Length > 0)
@@ -691,9 +716,8 @@ public static class Rh0Assembler
     /// Computes the true end (one-past-last-byte) of the RH0 block starting at
     /// <paramref name="blockBase"/> within <paramref name="data"/>, by walking the exact
     /// same header[0x0C]-rooted chain CapturePostMotChain decodes for in-place rebuilds.
-    /// Shared so the MODEL.MRG pack indexer (ModelPackIndex.cs) and the single-block
-    /// extractor agree on block boundaries by construction, rather than via two
-    /// independently-maintained copies of this logic. <paramref name="postMotStart"/>
+    /// Shared so the MODEL.MRG archive (disc/ModelMrg.cs) and the single-block extractor
+    /// agree on block boundaries by construction. <paramref name="postMotStart"/>
     /// receives the offset where the post-mot-chain regions begin (right after the
     /// original embedded MOTs, bits 0-7) - this is CapturePostMotChain's capture start.
     /// Returns -1 if this doesn't look like a valid RH0 header (caller should treat the
@@ -894,64 +918,65 @@ public static class Rh0Assembler
         return rgba;
     }
 
-    // Real on-disk TexAnm entry format (24 bytes), confirmed by reading a genuine retail
-    // flipbook entry (electromagnetic_bagworm.mrg tex slot 1) AND by disassembling its
-    // runtime consumer, SzModel_LoadTexAnim_Pipe@0x1e80a0 (called every frame from
-    // SzModel_LoadTexture_Pipe, gated on TexBlock.postOff != 0): flags=0x8F (bit0=last=1;
-    // bits 3-5 select one of 7 sub-mode handlers via a jump table at 0x2cb440 - mode 0,
-    // the flipbook case here, is reached when src==dst on both axes, confirmed by the
-    // disassembly explicitly comparing srcX/dstX and srcY/dstY and short-circuiting to
-    // the simple path when equal), slotMask=0xFF (bitmask of which SzModel_GetAnim()
-    // states this entry is active for), grid=0x42 (LOW nibble=cols=2, HIGH nibble=
-    // rows=4 - confirmed via the disassembly's `grid & 0xF` for cols and `grid >> 4` for
-    // rows; I originally had this backwards), aux0=aux1=5 (tick hold time), blockW=64
-    // blockH=16 (one cell's size - the STORED RH2 TEXTURE for this retail sample is only
-    // 128x64 total, i.e. cols*blockW=2*64=128, rows*blockH=4*16=64 - frames are small
-    // grid cells cut from one modest texture, NOT full-resolution copies of a large
-    // source image laid out in a strip). The engine genuinely animates this per frame:
-    // `+0x14` (counter) increments every tick via SzModel_LoadTexAnim_Pipe, and the cell
-    // offset is computed live from it (confirmed in the disassembly: a real division/
-    // modulo against cols, not a precomputed constant) - this is not a one-shot blit.
+    // TexAnm entry (24 bytes), checked against SzModel_LoadTexAnim_Pipe @ 0x1EA410 (US) and its
+    // caller SzModel_LoadTexture_Pipe @ 0x1EA2A0 (DotR-PC NOTES/models.md, "Texture animation"):
+    //   +00 flags: bit 0 last entry, bit 1 own clock (+14) instead of the motion frame,
+    //       bits 2-4 mode, bits 5-7 direction (2 and 3 negate the cell index)
+    //   +01 motion mask (bit k = active while motion slot k plays; 0xFF always)
+    //   +02 grid: low nibble cols, high nibble rows (0 in either = entry skipped)
+    //   +03 state: mode 0/1 current cell (signed byte); modes 2/3 cell << 2 | step, where the
+    //       2-bit step must start at +1 or the ping-pong never moves
+    //   +04 p0, +06 p1 (u16): modes 0-3 hold ticks per cell (p1 = ping-pong backwards)
+    //   +08/+0A cell w/h, +0C/+0E src (sheet origin), +10/+12 dst, +14 own clock (runtime)
+    // Every draw, cell c is copied with a GS local->local transfer from
+    // src + (w * (c % cols), h * (c / cols)) onto dst inside the texture's own VRAM. The texture
+    // itself is re-uploaded on every draw first, so a copy never outlives its frame: src == dst
+    // == (0, 0) is fine, cell 0 needs no copy (the game skips it) and keeps frame 0's pixels.
+    // Paused or stoned models get no copies at all, i.e. frame 0.
     //
-    // This builds a SINGLE-ROW flipbook (rows=1, cols=frameCount) for any custom imported
-    // animation - a strict subset of what the format supports (multi-row grids exist too,
-    // per the real sample above) but simpler to pack and fully sufficient for any frame
-    // count, since a sprite sheet doesn't need to be square. Per-cell size should stay
-    // small and close to retail's own scale (tens of pixels, not hundreds+) - see
-    // GlbImporter.DecodeGlbTextures' maxDim handling for animated slots.
-    private static byte[] BuildCustomTexAnimEntry(int frameCount, int blockW, int blockH, int ticksPerFrame)
+    // Custom imports get mode 1 LOOP on the own clock: flags 0x07 (last | own clock | 1 << 2),
+    // state 0, the cell advancing every ticksPerFrame draws. (The old 0x8F was mode 3,
+    // ping-pong, with an unused direction 4: a scroll would have run back and forth.)
+    // Limits: cols and rows are nibbles (15 x 15 cells), and the loop's cell index is a signed
+    // byte, so at most 127 frames.
+    public const int MaxAnimFrames = 127;
+
+    private static byte[] BuildCustomTexAnimEntry(int frameCount, int cols, int rows, int blockW, int blockH,
+        int ticksPerFrame)
     {
         const int EntrySize = 0x18;
-        frameCount = Math.Clamp(frameCount, 1, 15); // grid nibble is 4 bits; 15 is the real ceiling
+        frameCount = Math.Clamp(frameCount, 1, MaxAnimFrames);
+        if (cols <= 0 || rows <= 0)
+        {
+            cols = frameCount;
+            rows = 1;
+        }
+        cols = Math.Clamp(cols, 1, 15);
+        rows = Math.Clamp(rows, 1, 15);
         var e = new byte[EntrySize];
-        e[0] = 0x8F;          // flags: bit0=last(1) + the other bits a confirmed-working real entry carried
-        e[1] = 0xFF;          // slotMask: matches every real sample seen so far
-        e[2] = (byte)(0x10 | (frameCount & 0xF)); // grid: low nibble=cols, high nibble=rows. NOTE: the
-                              // only real retail sample decoded used cols=2,rows=4 (0x42) - a single-
-                              // row cols=N,rows=1 layout (this line) has NEVER been confirmed against
-                              // real working data and may hit a code path retail never exercises.
-        e[3] = 1;             // state: the real retail sample has this =1, not 0 - corrected after
-                              // confirming via disassembly that SzModel_LoadTexAnim_Pipe never actually
-                              // reads offset +3 at all, so this field's true role is still unconfirmed,
-                              // but copying the one known-working value is safer than an unverified 0.
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(4), (ushort)Math.Clamp(ticksPerFrame, 1, ushort.MaxValue));  // aux0
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(6), (ushort)Math.Clamp(ticksPerFrame, 1, ushort.MaxValue));  // aux1 (mirrors aux0)
+        e[0] = 0x07;          // last | own clock | mode 1 (LOOP)
+        e[1] = 0xFF;          // every motion
+        // the loop runs over all cols * rows cells, so the grid holds exactly the frames when they
+        // fill it; spare cells of a partial last row repeat the last frame (DecodeGlbTextures)
+        e[2] = (byte)((cols & 0xF) | ((rows & 0xF) << 4));
+        e[3] = 0;             // start on cell 0
+        ushort ticks = (ushort)Math.Clamp(ticksPerFrame, 1, ushort.MaxValue);
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(4), ticks);   // p0
+        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(6), ticks);   // p1 (unused by LOOP)
         BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(8), (ushort)Math.Clamp(blockW, 1, ushort.MaxValue));
         BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(0xA), (ushort)Math.Clamp(blockH, 1, ushort.MaxValue));
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(0xC), 0);  // srcX
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(0xE), 0);  // srcY
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(0x10), 0); // dstX
-        BinaryPrimitives.WriteUInt16LittleEndian(e.AsSpan(0x12), 0); // dstY
-        // +0x14 counter: runtime, already 0 from `new byte[]`
+        // src and dst (0, 0): the sheet starts at the cell the faces sample
         return e;
     }
 
+    // ownSize (custom models): never take the donor's size, which scaled a 64x64 image up to the
+    // donor's 256x128 and cost 5 GS pages for 1 (Alpha the Magnet Warrior over card 0: 45 pages).
     private static byte[] EncodeTexture(ReadOnlySpan<byte> donor, byte[] rgba, int w, int h,
-        bool allowNative, int maxDim, out bool wentNative)
+        bool allowNative, int maxDim, bool ownSize, out bool wentNative)
     {
         wentNative = false;
         bool haveDonor = !donor.IsEmpty && donor.Length >= 0x60;
-        if (haveDonor)
+        if (haveDonor && !(allowNative && ownSize))
         {
             var (decW, decH) = DonorDecodedDims(donor);
             if (!allowNative || (w <= decW && h <= decH))
@@ -967,6 +992,23 @@ public static class Rh0Assembler
         return Rh2Encoder.BuildNative(rgba, w, h, tw, th);
     }
 
+    // Scale every record's size/src/dst (u16 pairs at +8, +0xC, +0x10) from a w x h image
+    // to the fw x fh texture it was encoded as. Same size: the records come back as they are.
+    private static byte[] ScaleTexAnimRecords(byte[] recs, int w, int h, int fw, int fh)
+    {
+        if (w == fw && h == fh) return recs;
+        var o = (byte[])recs.Clone();
+        for (int b = 0; b + 0x18 <= o.Length; b += 0x18)
+            for (int at = 0x08; at <= 0x12; at += 2)
+            {
+                bool x = (at & 2) == 0; // +8/+C/+10 are x, +A/+E/+12 are y
+                int v = BinaryPrimitives.ReadUInt16LittleEndian(o.AsSpan(b + at));
+                int s = (int)Math.Round(v * (double)(x ? fw : fh) / (x ? w : h));
+                BinaryPrimitives.WriteUInt16LittleEndian(o.AsSpan(b + at), (ushort)Math.Clamp(s, 0, 0xFFFF));
+            }
+        return o;
+    }
+
     // Decoded image dimensions a donor RH2 represents (PSMT4 decodes to half size).
     private static (int W, int H) DonorDecodedDims(ReadOnlySpan<byte> donor)
     {
@@ -977,6 +1019,26 @@ public static class Rh0Assembler
 
     private static int Align16(int v) => (v + (Align - 1)) & ~(Align - 1);
     private static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o));
+
+    // An RH2's section count (+0x58): SzText_Load_Pipe uploads one 8 KB GS page per section.
+    private static int Rh2Pages(byte[] rh2)
+    {
+        if (rh2 == null || rh2.Length < 0x5A)
+        {
+            return 0;
+        }
+        return BinaryPrimitives.ReadUInt16LittleEndian(rh2.AsSpan(0x58));
+    }
+
+    private static int TexturePages(byte[][] rh2, int count)
+    {
+        int pages = 0;
+        for (int i = 0; i < count; i++)
+        {
+            pages += Rh2Pages(rh2[i]);
+        }
+        return pages;
+    }
     private static int U16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt16LittleEndian(d.Slice(o));
     private static void W32(byte[] d, int o, uint v) => BinaryPrimitives.WriteUInt32LittleEndian(d.AsSpan(o), v);
 }

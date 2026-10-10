@@ -140,7 +140,7 @@ public static class MotWriter
         {
             if (source.ContainsKey(slot)) continue;
             if (templateSlotsByte != 0 && (templateSlotsByte & (1 << slot)) == 0) continue;
-            var donor = CloneSource(slot, source) ?? ordered[0];
+            var donor = CloneSource(source) ?? ordered[0];
             ordered.Add(CloneMotion(donor, slot, cloneKeyStride));
             clones.Add((slot, donor.SlotId));
         }
@@ -149,17 +149,10 @@ public static class MotWriter
         return ordered;
     }
 
-    /// Which supplied motion stands in for a missing one: death prefers damage (a flinch is
-    /// closer to a fall than standing idle); everything else, damage included, takes idle.
-    private static EncMotion? CloneSource(int slot, Dictionary<int, EncMotion> present)
+    /// Which supplied motion stands in for a missing one: idle, for every slot.
+    private static EncMotion? CloneSource(Dictionary<int, EncMotion> present)
     {
-        int[] pref = slot switch
-        {
-            4 => new[] { 6, 0 },
-            _ => new[] { 0 },
-        };
-        foreach (int p in pref)
-            if (present.TryGetValue(p, out var m)) return m;
+        if (present.TryGetValue(0, out var m)) return m;
         return null;
     }
 

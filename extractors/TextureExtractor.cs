@@ -1,6 +1,5 @@
 ﻿using System.Buffers.Binary;
 using System.Collections.Concurrent;
-using System.IO.Compression;
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
@@ -454,92 +453,23 @@ public static class Rh2Decoder
     }
 }
 
+// RGBA (straight alpha) -> PNG, by SkiaSharp.
 static class PngEncoder
 {
-    static ReadOnlySpan<byte> Signature => new byte[] { 0x89, (byte)'P', (byte)'N', (byte)'G', 0x0D, 0x0A, 0x1A, 0x0A };
-
     public static byte[] Encode(int width, int height, byte[] rgba)
     {
         if (rgba.Length < width * height * 4)
         {
             throw new ArgumentException("rgba buffer too small for given dimensions");
         }
-
-
-        int stride = width * 4;
-        var raw = new byte[(stride + 1) * height];
+        var info = new SkiaSharp.SKImageInfo(width, height, SkiaSharp.SKColorType.Rgba8888, SkiaSharp.SKAlphaType.Unpremul);
+        using var bmp = new SkiaSharp.SKBitmap(info);
+        IntPtr dst = bmp.GetPixels();
         for (int y = 0; y < height; y++)
         {
-            int dst = y * (stride + 1);
-            raw[dst] = 0;
-            Buffer.BlockCopy(rgba, y * stride, raw, dst + 1, stride);
+            System.Runtime.InteropServices.Marshal.Copy(rgba, y * width * 4, dst + y * bmp.RowBytes, width * 4);
         }
-
-        byte[] idat;
-        using (var ms = new MemoryStream())
-        {
-            using (var z = new ZLibStream(ms, CompressionLevel.Fastest, leaveOpen: true))
-                z.Write(raw, 0, raw.Length);
-            idat = ms.ToArray();
-        }
-
-        var ihdr = new byte[13];
-        BinaryPrimitives.WriteUInt32BigEndian(ihdr.AsSpan(0, 4), (uint)width);
-        BinaryPrimitives.WriteUInt32BigEndian(ihdr.AsSpan(4, 4), (uint)height);
-        ihdr[8] = 8;
-        ihdr[9] = 6;
-        ihdr[10] = 0;
-        ihdr[11] = 0;
-        ihdr[12] = 0;
-
-        int outSize = Signature.Length + 12 + ihdr.Length + 12 + idat.Length + 12;
-        var outArr = new byte[outSize];
-        int pos = 0;
-        Signature.CopyTo(outArr.AsSpan(pos));
-        pos += Signature.Length;
-        WriteChunk(outArr, ref pos, "IHDR"u8, ihdr);
-        WriteChunk(outArr, ref pos, "IDAT"u8, idat);
-        WriteChunk(outArr, ref pos, "IEND"u8, ReadOnlySpan<byte>.Empty);
-        return outArr;
-    }
-
-    static void WriteChunk(byte[] dst, ref int pos, ReadOnlySpan<byte> tag, ReadOnlySpan<byte> body)
-    {
-        BinaryPrimitives.WriteUInt32BigEndian(dst.AsSpan(pos, 4), (uint)body.Length);
-        pos += 4;
-        tag.CopyTo(dst.AsSpan(pos));
-        pos += 4;
-        body.CopyTo(dst.AsSpan(pos));
-        pos += body.Length;
-
-        uint crc = 0xFFFFFFFFu;
-        crc = Crc32Update(crc, tag);
-        crc = Crc32Update(crc, body);
-        crc ^= 0xFFFFFFFFu;
-        BinaryPrimitives.WriteUInt32BigEndian(dst.AsSpan(pos, 4), crc);
-        pos += 4;
-    }
-
-    static readonly Lazy<uint[]> crcTable = new(() =>
-    {
-        var t = new uint[256];
-        for (uint n = 0; n < 256; n++)
-        {
-            uint c = n;
-            for (int k = 0; k < 8; k++)
-                c = ((c & 1) != 0) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            t[n] = c;
-        }
-        return t;
-    });
-
-    static uint Crc32Update(uint crc, ReadOnlySpan<byte> data)
-    {
-        var tbl = crcTable.Value;
-        for (int i = 0; i < data.Length; i++)
-        {
-            crc = tbl[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
-        }
-        return crc;
+        using var data = bmp.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+        return data.ToArray();
     }
 }

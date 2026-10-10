@@ -960,10 +960,12 @@ public class TextureEditorWindow : IDisposable
 
         try
         {
-            long fileBase = FileLoader.Instance.GetStartOfFile(TextureSlotManager.IsoPath(selectedMrgName));
-            if (fileBase >= 0)
+            var changes = new ChangeSet();
+            changes.AddWholeFile(TextureSlotManager.IsoPath(selectedMrgName), mrgBytes, $"{selectedMrgName} slot {currentIndex}");
+            var plan = changes.Write(FileLoader.Instance);
+            if (!plan.Ok)
             {
-                FileLoader.Instance.WriteBytes(fileBase, mrgBytes);
+                foreach (string err in plan.Errors) Console.Error.WriteLine($"Write to ISO refused: {err}");
             }
         }
         catch (Exception ex)

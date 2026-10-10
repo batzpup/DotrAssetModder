@@ -8,11 +8,10 @@ using NativeFileDialogSharp;
 
 public class ModelViewerWindow
 {
-    Camera3D camera;
-
     AnimatedGltfModel model;
     bool modelLoaded = false;
     string loadError = null;
+    string loadedPath = string.Empty;
 
 
     string[] modelFiles = Array.Empty<string>();
@@ -35,38 +34,38 @@ public class ModelViewerWindow
     int viewportWidth = 1280;
     int viewportHeight = 720;
 
-    float orbitYaw = 0f;
-    float orbitPitch = 0.3f;
-    float orbitDistance = 6f;
-    Vector3 orbitTarget = Vector3.Zero;
-
+    OrbitCamera orbit = new OrbitCamera();
     Vector2 savedMousePos;
     bool freeLooking = false;
     int flySpeed = 50;
-    float lookSensitivity = 0.0035f;
 
 
-    float clipNear = 0.01f;
-    float clipFar = 1000f;
     bool resetPressed;
     bool showgrid = true;
 
+    // View: Feet on grid / Duel board / Map leader, as the game places a model (ViewScene). The
+    // board and map come from the loaded ISO; a file has no card, so the map height's card is
+    // picked, and no radius, so it is measured (the farthest point from the origin).
+    ViewScene viewScene = new ViewScene();
+    ModelMrg viewSceneMrg;
+    string viewSceneIso = string.Empty;
+    int mapCard;
+    float viewLowest;                                 // the idle animation's extent (MeasureStanding)
+    float viewHeight;
+    float viewLeft;
+    float viewRight;
+    float viewBack;
+    float viewFront;
+    float viewRadius = 1f;
+
     public ModelViewerWindow()
     {
-        camera = new Camera3D {
-            Position = new Vector3(0, 2, 6),
-            Target = Vector3.Zero,
-            Up = Vector3.UnitY,
-            FovY = 60,
-            Projection = CameraProjection.Perspective
-        };
-
         sceneTexture = Raylib.LoadRenderTexture(viewportWidth, viewportHeight);
     }
 
     void ButtonLoadModel()
     {
-        DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf"));
+        DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf,fbx,dae"));
         if (!dialogResult.IsOk)
         {
             return;
@@ -94,7 +93,9 @@ public class ModelViewerWindow
         {
             files = Directory.GetFiles(folderPath, "*.*")
                 .Where(f => f.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)
-                            || f.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase))
+                            || f.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)
+                            || f.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)
+                            || f.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
                 .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
@@ -118,6 +119,16 @@ public class ModelViewerWindow
         LoadModel(modelFiles[0]);
     }
 
+    // The shown model's file name; empty when it was loaded by itself, not from a folder.
+    string CurrentName()
+    {
+        if (currentModelIndex >= 0 && currentModelIndex < modelFiles.Length)
+        {
+            return modelFiles[currentModelIndex];
+        }
+        return loadedPath;
+    }
+
     void GoToModelIndex(int index)
     {
         if (modelFiles.Length == 0) return;
@@ -127,10 +138,25 @@ public class ModelViewerWindow
 
     public void LoadModel(string path)
     {
+        loadedPath = path;
         AnimatedGltfModel newModel;
+        ImportedModel imported;
         try
         {
-            newModel = AnimatedGltfModel.Load(path);
+            string ext = Path.GetExtension(path).ToLowerInvariant();
+            if (ext == ".fbx" || ext == ".dae")
+            {
+                ConvertOptions options = new ConvertOptions();
+                options.AnimsFrom = ModelConverter.FindMotionFiles(path);
+                ConvertResult converted = ModelConverter.ConvertFile(path, options, message => { });
+                newModel = AnimatedGltfModel.Load(converted.Glb);
+                imported = GlbImporter.LoadFromBytes(converted.Glb);
+            }
+            else
+            {
+                newModel = AnimatedGltfModel.Load(path);
+                imported = GlbImporter.Load(path);
+            }
         }
         catch (Exception e)
         {
@@ -147,14 +173,19 @@ public class ModelViewerWindow
         animTime = 0f;
         animPlaying = !staticPose && model.AnimationCount > 0;
 
-        orbitTarget = Vector3.Zero;
-        orbitYaw = 0f;
-        orbitPitch = 0.3f;
-
-        float radius = model.Radius;
-        orbitDistance = MathF.Max(radius * 2.5f, 0.5f);
-        clipNear = MathF.Max(radius * 0.05f, 0.01f);
-        clipFar = MathF.Max(radius * 20f, 100f);
+        model.MeasureStanding(ModelImporterWindow.IdleAnimIndex(model), out viewLowest, out viewHeight,
+            out viewLeft, out viewRight, out viewBack, out viewFront);
+        // the radius an import of this model writes (the importer's own measure), so the board
+        // and map show it at the size the game will; 0 (real size) if the importer cannot take it
+        try
+        {
+            viewRadius = Rebuilder.MeasureRadius(imported, Array.Empty<byte>());
+        }
+        catch (Exception)
+        {
+            viewRadius = 0f;
+        }
+        FrameStanding();
 
 
         int initAnim = (!staticPose && model.AnimationCount > 0) ? currentAnim : -1;
@@ -164,11 +195,64 @@ public class ModelViewerWindow
         resetPressed = true;
     }
 
-    Vector3 OrbitForward()
+    // Fits the camera to the model where View puts it.
+    void FrameStanding()
     {
-        float cp = MathF.Cos(orbitPitch);
-        Vector3 offset = new Vector3(cp * MathF.Sin(orbitYaw), MathF.Sin(orbitPitch), cp * MathF.Cos(orbitYaw));
-        return -offset;
+        if (!modelLoaded)
+        {
+            orbit.Yaw = 0f;
+            orbit.Pitch = 0.3f;
+            orbit.Target = Vector3.Zero;
+            return;
+        }
+        float s = viewScene.ModelScale(viewRadius);
+        Vector3 shift = viewScene.StandShift(model, s);
+        float bottom = viewScene.StandY(viewLowest, mapCard) + shift.Y + s * viewLowest;
+        float top = bottom + s * viewHeight;
+        float left = shift.X + s * viewLeft;
+        float right = shift.X + s * viewRight;
+        bottom = MathF.Min(bottom, 0f);                // keep the grid in view
+        orbit.Frame(left, right, bottom, top, 0.3f);
+    }
+
+    // Opens the loaded ISO's MODEL.MRG for the board and map the first time View needs them,
+    // and again when another ISO is loaded.
+    void UpdateViewSceneSource()
+    {
+        if (viewScene.Placement == ViewScene.PlaceFeet)
+        {
+            return;
+        }
+        FileLoader fl = FileLoader.Instance;
+        string iso = string.Empty;
+        if (fl.IsIsoLoaded && !string.IsNullOrEmpty(fl.CurrentIsoPath))
+        {
+            iso = fl.CurrentIsoPath;
+        }
+        if (iso == viewSceneIso)
+        {
+            return;
+        }
+        viewSceneIso = iso;
+        viewScene.SetSource(null);
+        if (viewSceneMrg != null)
+        {
+            viewSceneMrg.Dispose();
+            viewSceneMrg = null;
+        }
+        if (iso.Length == 0)
+        {
+            return;
+        }
+        try
+        {
+            viewSceneMrg = ModelMrg.Open(iso);
+            viewScene.SetSource(viewSceneMrg);
+        }
+        catch (Exception e)
+        {
+            loadError = "Could not read the ISO's MODEL.MRG: " + e.Message;
+        }
     }
 
     void UpdateCamera()
@@ -192,39 +276,27 @@ public class ModelViewerWindow
             freeLooking = false;
         }
 
-        Vector3 cameraPos = orbitTarget - OrbitForward() * orbitDistance;
-        float wheel = Raylib.GetMouseWheelMove();
-        if (wheel != 0)
-            orbitDistance = Math.Clamp(orbitDistance - wheel * (orbitDistance * 0.1f), 0.1f, 5000f);
-
+        Vector3 cameraPos = orbit.Position;
+        orbit.Zoom(Raylib.GetMouseWheelMove());
         if (Raylib.IsMouseButtonDown(MouseButton.Left))
         {
-            Vector2 delta = Raylib.GetMouseDelta();
-            orbitYaw -= delta.X * lookSensitivity;
-            orbitPitch += delta.Y * lookSensitivity;
-            orbitPitch = Math.Clamp(orbitPitch, -1.5f, 1.5f);
+            orbit.Turn(Raylib.GetMouseDelta());
         }
 
+        // free-look: turn in place, the camera stays where it is and the target swings round it
         if (Raylib.IsMouseButtonDown(MouseButton.Right) && !rightPressed)
         {
-            Vector2 delta = Raylib.GetMouseDelta();
-            orbitYaw -= delta.X * lookSensitivity;
-            orbitPitch += delta.Y * lookSensitivity;
-            orbitPitch = Math.Clamp(orbitPitch, -1.5f, 1.5f);
-            orbitTarget = cameraPos + OrbitForward() * orbitDistance;
+            orbit.Turn(Raylib.GetMouseDelta());
+            orbit.Target = cameraPos + orbit.Forward * orbit.Distance;
             Raylib.SetMousePosition(Raylib.GetScreenWidth() / 2, Raylib.GetScreenHeight() / 2);
         }
 
-        Vector3 forward = OrbitForward();
-        Vector3 right = Vector3.Normalize(Vector3.Cross(forward, Vector3.UnitY));
-        Vector3 up = Vector3.Normalize(Vector3.Cross(right, forward));
-
         if (Raylib.IsMouseButtonDown(MouseButton.Middle))
         {
-            Vector2 delta = Raylib.GetMouseDelta();
-            float panSpeed = orbitDistance * 0.0015f;
-            orbitTarget += (-right * delta.X + up * delta.Y) * panSpeed;
+            orbit.Pan(Raylib.GetMouseDelta());
         }
+        Vector3 forward = orbit.Forward;
+        Vector3 right = orbit.Right;
 
         float dt = Raylib.GetFrameTime();
         float moveSpeed = flySpeed * dt;
@@ -239,10 +311,9 @@ public class ModelViewerWindow
         if (Raylib.IsKeyDown(KeyboardKey.LeftControl)) move -= Vector3.UnitY;
 
         if (move != Vector3.Zero)
-            orbitTarget += Vector3.Normalize(move) * moveSpeed;
+            orbit.Target += Vector3.Normalize(move) * moveSpeed;
 
-        camera.Position = orbitTarget - forward * orbitDistance;
-        camera.Target = orbitTarget;
+        orbit.Apply();
     }
 
     void AdvanceAnimation()
@@ -341,12 +412,9 @@ public class ModelViewerWindow
 
         if (ImGui.Button("Reset View"))
         {
-            orbitTarget = Vector3.Zero;
-            orbitYaw = 0f;
-            orbitPitch = 0.3f;
+            FrameStanding();
             if (modelLoaded)
             {
-                orbitDistance = MathF.Max(model.Radius * 2.5f, 0.5f);
                 resetPressed = true;
             }
         }
@@ -358,6 +426,32 @@ public class ModelViewerWindow
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip("WASD to move, space and left Ctrl to go up and down\nleft click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
+        }
+
+        FileLoader isoLoader = FileLoader.Instance;
+        bool isoLoaded = isoLoader.IsIsoLoaded && !string.IsNullOrEmpty(isoLoader.CurrentIsoPath);
+        if (modelLoaded && !isoLoaded && viewScene.Placement != ViewScene.PlaceFeet)
+        {
+            // the board and map come from the ISO: without one only the grid is offered
+            viewScene.Placement = ViewScene.PlaceFeet;
+            FrameStanding();
+            resetPressed = true;
+        }
+        if (modelLoaded && isoLoaded)
+        {
+            UpdateViewSceneSource();
+            if (viewScene.DrawControls(true, ref mapCard, true,
+                "\nThe radius is measured from the model: the farthest point from its origin."))
+            {
+                FrameStanding();
+                resetPressed = true;
+            }
+            viewScene.Update();
+            if (viewScene.Error != null)
+            {
+                loadError = viewScene.Error;
+                viewScene.Error = null;
+            }
         }
 
         bool hasSkel = modelLoaded && model.AnimationCount > 0;
@@ -458,17 +552,41 @@ public class ModelViewerWindow
         Raylib.BeginTextureMode(sceneTexture);
         Raylib.ClearBackground(Color.DarkGray);
 
-        Raylib.BeginMode3D(camera);
-        Rlgl.SetClipPlanes(clipNear, clipFar);
-        if (showgrid)
+        viewScene.SetClipPlanes(orbit.Camera, modelLoaded ? viewScene.ModelScale(viewRadius) * viewRadius : 0f);
+        Raylib.BeginMode3D(orbit.Camera);
+        bool scenery = modelLoaded && viewScene.SceneryShown;
+        if (showgrid && !scenery)
         {
-            Raylib.DrawGrid(200, 10f);   
+            if (modelLoaded)
+            {
+                float s = viewScene.ModelScale(viewRadius);
+                ViewScene.DrawFloorGrid(s * viewLeft, s * viewRight, s * MathF.Max(viewRight - viewLeft, viewHeight));
+            }
+            else
+            {
+                Raylib.DrawGrid(200, 10f);
+            }
         }
-         
 
         if (modelLoaded)
         {
-            model.Draw();
+            if (scenery)
+            {
+                viewScene.DrawScenery();
+            }
+            viewScene.DrawStanding(model, 0f, viewLowest, mapCard, viewRadius);
+#if DEBUG
+            if (viewScene.DebugLines && viewScene.Placement == ViewScene.PlaceBoard)
+            {
+                Rlgl.DrawRenderBatchActive();
+                Rlgl.DisableDepthTest();
+                viewScene.DrawDebugViewLines(model, 0f, viewLowest, mapCard, viewRadius,
+                    new Vector3(viewLeft, viewLowest, viewBack),
+                    new Vector3(viewRight, viewLowest + viewHeight, viewFront));
+                Rlgl.DrawRenderBatchActive();
+                Rlgl.EnableDepthTest();
+            }
+#endif
         }
 
         Raylib.EndMode3D();

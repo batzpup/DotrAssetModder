@@ -61,13 +61,14 @@ internal readonly struct TexAnimEntry
     public readonly int DstX, DstY;
     public readonly int OnTicks;   // mode-6 on-duration (byte +6)
     public readonly bool Last;
+    public readonly int Clock;     // starting counter (+0x14): 0 in retail, a blink's phase in DoD imports
 
     public TexAnimEntry(int mode, int slotMask, int cols, int rows, int aux0, int aux1,
-        int bw, int bh, int sx, int sy, int dx, int dy, int onTicks, bool last)
+        int bw, int bh, int sx, int sy, int dx, int dy, int onTicks, bool last, int clock = 0)
     {
         Mode = mode; SlotMask = slotMask; Cols = cols; Rows = rows; Aux0 = aux0; Aux1 = aux1;
         BlockW = bw; BlockH = bh; SrcX = sx; SrcY = sy; DstX = dx; DstY = dy;
-        OnTicks = onTicks; Last = last;
+        OnTicks = onTicks; Last = last; Clock = clock;
     }
 
     public int FrameCount => Cols * Rows;
@@ -153,10 +154,11 @@ internal static class TexAnim
             int dy = U16(data, o + 0x12);
             int onTicks = data[o + 0x06];   // byte +6 (mode-6 on-duration)
             bool last = (f0 & 1) != 0;
+            int clock = (int)Math.Min(BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(o + 0x14)), int.MaxValue);
 
             if (bw > 2048 || bh > 2048) break;
             list.Add(new TexAnimEntry(mode, slotMask, cols, rows, aux0, aux1,
-                bw, bh, sx, sy, dx, dy, onTicks, last));
+                bw, bh, sx, sy, dx, dy, onTicks, last, clock));
             if (last) break;
             o += 0x18;
         }
@@ -259,7 +261,8 @@ internal static class TexAnim
         var e = s.E;
         if (e.IsFlash)
         {
-            int tc = (int)(t % s.Period);
+            // the game copies when (starting clock + t) % Aux0 == 0
+            int tc = (int)((t + (long)e.Clock * s.Scale) % s.Period);
             return tc < s.OnTicks ? 0 : -1;
         }
         int n = Math.Max(1, e.FrameCount);
@@ -284,7 +287,7 @@ internal static class TexAnim
         if (baseRgba.Length < w * h * 4) return null;
 
         var sims = new List<Sim>();
-        var seen = new HashSet<(bool, bool, int, int, int, int, int, int, int, int)>();
+        var seen = new HashSet<(bool, bool, int, int, int, int, int, int, int, int, int)>();
         for (int ei = 0; ei < entries.Count; ei++)
         {
             var e = entries[ei];
@@ -298,7 +301,8 @@ internal static class TexAnim
             // De-dupe slot-mask variants: the same patch is often repeated once
             // per model-animation slot with different speeds. Only one plays at
             // a time in game, so collapse by geometry and keep the first speed.
-            var key = (e.IsFlash, e.IsPingPong, e.Cols, e.Rows, e.BlockW, e.BlockH, e.SrcX, e.SrcY, e.DstX, e.DstY);
+            // (A phased blink is a different patch: same rectangles, another moment in the loop.)
+            var key = (e.IsFlash, e.IsPingPong, e.Cols, e.Rows, e.BlockW, e.BlockH, e.SrcX, e.SrcY, e.DstX, e.DstY, e.Clock);
             if (!seen.Add(key)) continue;
             var sim = MakeSim(e);
             sim.Index = ei;

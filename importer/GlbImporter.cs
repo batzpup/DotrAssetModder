@@ -63,6 +63,11 @@ public sealed class ImportedVertex
     public Vector3 Normal;                  // normal used by the geometry encoder
     public Vector2 Uv;
     public List<ImportedInfluence> Influences = new(); // 0 => rigid to the prim's mesh node
+
+    /// Extracted glbs: the vertex's influences as RH0 stored them (ModelExtractor's
+    /// VertexTexture1Game; Bone = the joint's glb node), in the game's order with zero weights
+    /// kept, while they still match the vertex; null = derive them from Pos as for any glb.
+    internal List<StripWeight>? Game;
 }
 
 public sealed class ImportedPrimitive
@@ -72,6 +77,11 @@ public sealed class ImportedPrimitive
     public int NodeIndex = -1;
     public int TexIdx;
     public bool IsAlt;
+    /// GS ALPHA_1 low byte: 0x44 normal (Cs-Cd)*As+Cd, 0x48 additive Cs*As+Cd, 0x42 subtract.
+    public byte GsAlpha = 0x44;
+    /// GS TEST_1 low 20 bits from an extracted name ("_t703FD": the AREF 63 cutout); 0 = the
+    /// chain's default (0x7000C opaque, 0x7000D alpha).
+    public uint GsTest;
     public Vector4 BaseColor = Vector4.One; // RGBA 0..1
     /// The material record's c0 and c2 rows (+0x10 / +0x30), which a glb has no field for;
     /// an extracted glb carries them in DOTR_blend, anything else gets the retail defaults.
@@ -143,6 +153,13 @@ public sealed class ImportedModel
     /// retail sample) for any texIdx with no explicit suffix found.
     public Dictionary<int, int> TextureAnimTicks = new();
 
+    /// UV scale of each packed flipbook slot (DecodeGlbTextures): its faces sample only cell 0 of
+    /// the sprite sheet, so RebuildPipeline.ApplyTexAnimUv squeezes their [0,1] UVs into it.
+    public Dictionary<int, Vector2> TextureAnimUvScale = new();
+
+    /// Set once RebuildPipeline.ApplyTexAnimUv has rewritten the UVs (Build may run twice).
+    public bool AppliedTexAnimUv;
+
     /// Auto-assigned texture index per glb material (LogicalIndex), used when a material is
     /// not explicitly named "mat_texN". Pre-assigned deterministically in material
     /// (LogicalIndex) order, skipping slots taken by explicit mat_texN names — so the
@@ -160,6 +177,19 @@ public sealed class ImportedModel
     /// material extras). They hold no pointers, so they are written back verbatim.
     public Dictionary<int, byte[]> TextureAnimRecords = new();
 
+    /// Texture slots whose image alpha is not coverage (a custom glb's additive material keeps
+    /// its glow strength there for glTF viewers): encoded with alpha forced to 255, since the
+    /// 1-bit-alpha CLUT would otherwise turn every texel under half alpha transparent black.
+    public HashSet<int> OpaqueAlphaSlots = new();
+
+    /// Texture slots of a custom glb's translucent (BLEND/MASK) materials: encoded with alpha cut
+    /// to coverage (texel alpha >= 8 -> opaque, else a hole) instead of at half alpha, because the
+    /// strength now comes from the page's c1.w (see ParsePlainAlpha).
+    public HashSet<int> CoverageAlphaSlots = new();
+
+    /// Decoded alpha planes of base-colour images, by glb image index (ParsePlainAlpha).
+    internal Dictionary<int, (int W, int H, byte[] A)?> AlphaPlanes = new();
+
     /// The named frame images of an EXTRACTED glb's animated slot ("tex{N}_anim{frame}",
     /// written by ModelExtractor.InjectTextureAnimations), kept apart from
     /// TextureAnimFrames: this slot's animation is already carried by TextureAnimRecords,
@@ -176,6 +206,11 @@ public sealed class ImportedModel
     /// Duplicate or out-of-range "mat_texN" slots seen by the texture-slot pre-pass, one line
     /// each (also echoed to stderr). Reported rather than silently mishandled.
     public List<string> TexSlotWarnings = new();
+
+    /// Skinned vertices of an extracted glb that kept their game influences, and those that
+    /// carried them but no longer matched (edited elsewhere) and were derived from Pos.
+    public int GameVertices;
+    public int GameVerticesDropped;
 
     /// Set by RebuildPipeline.ApplyTexMerges after it rewrites primitive UVs/TexIdx for
     /// UV-atlas slot merging; guards against double-applying when Build runs twice on the
@@ -290,6 +325,13 @@ public static class GlbImporter
                 // scale 0 at rest is not the rest pose: take the bind from the skin.
                 if (idx != joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out var bindWorld))
                     im.JointBind[idx] = bindWorld;
+                // Any other joint whose bind pose is not its rest pose (DoD exports: every
+                // joint is bound away from the node rest values) must encode its vertices
+                // against the bind, or the mesh is skinned with the wrong offsets and limbs
+                // stretch once the motion moves them.
+                else if (idx == joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out bindWorld) &&
+                         !NearlyEqual(bindWorld, joint.WorldMatrix))
+                    im.JointBind[idx] = bindWorld;
             }
         }
 
@@ -299,6 +341,8 @@ public static class GlbImporter
         // which must never be read as keys), and lets RebuildPipeline fit the game's key
         // lists (per-axis Euler lerp, a list under 3 keys plays key 0 only) to the motion
         // rather than copying glTF keys one for one.
+        // CreateCurveSampler(true) copies the keys out once; without it every sample re-reads
+        // the accessors (card 60: 1 s instead of 17 ms).
         foreach (var anim in model.LogicalAnimations)
         {
             int frames = (int)MathF.Round(anim.Duration * AnimFps) + 1;
@@ -311,16 +355,18 @@ public static class GlbImporter
                 switch (ch.TargetNodePath)
                 {
                     case PropertyPath.translation:
-                        c.Translation = Resample(ch.GetTranslationSampler()?.CreateCurveSampler(), frames);
+                        c.Translation = Resample(ch.GetTranslationSampler()?.CreateCurveSampler(true), frames);
                         break;
                     case PropertyPath.rotation:
-                        c.Rotation = Resample(ch.GetRotationSampler()?.CreateCurveSampler(), frames);
+                        c.Rotation = Resample(ch.GetRotationSampler()?.CreateCurveSampler(true), frames);
                         break;
                     case PropertyPath.scale:
-                        c.Scale = Resample(ch.GetScaleSampler()?.CreateCurveSampler(), frames);
+                        c.Scale = Resample(ch.GetScaleSampler()?.CreateCurveSampler(true), frames);
                         break;
                 }
             }
+            // no node channel (e.g. texture-scroll animations through KHR_animation_pointer): not a motion
+            if (ia.Channels.Count == 0) continue;
             im.Animations.Add(ia);
         }
 
@@ -473,6 +519,7 @@ public static class GlbImporter
 
                 bool skinnedPrim = nodeSkinned && jnt != null && wgt != null;
                 int vcount = pos.Count;
+                var game = skinnedPrim && im.IsDotrExtractedGlb ? GameAccessors(prim) : null;
                 for (int v = 0; v < vcount; v++)
                 {
                     var iv = new ImportedVertex();
@@ -516,11 +563,23 @@ public static class GlbImporter
                     {
                         iv.Influences.Add(new ImportedInfluence { JointNode = meshOwner, Weight = 1f });
                     }
+                    if (game != null && game.Jw[0][v].X >= 0)
+                    {
+                        iv.Game = GameInfluences(im, iv, game, v);
+                        if (iv.Game != null) im.GameVertices++;
+                        else im.GameVerticesDropped++;
+                    }
                     ip.Vertices.Add(iv);
                 }
 
                 foreach (var (a, b, c) in prim.GetTriangleIndices())
                     ip.Triangles.Add((a, b, c));
+
+                // KHR_texture_transform on the base colour (an atlas cell picked by scale/offset,
+                // as DoD exports do): the GS samples the UVs as they are, so bake it into them.
+                ApplyBaseTextureTransform(prim.Material, ip);
+                ApplyDotrImageUv(prim.Material, ip);
+                if (!im.IsDotrExtractedGlb) ParsePlainAlpha(prim.Material, ip, im);
 
                 // Fold out-of-[0,1] UVs into tiles only on axes the GS really clamps. The
                 // extractor writes the page's GS CLAMP byte into the material name as "_cN"
@@ -700,6 +759,110 @@ public static class GlbImporter
 
     internal static bool IsAuthoringMarker(string? name) => false;
 
+    // Element-wise compare, tolerance relative to the matrices' largest entry (translations
+    // can be large) so float noise in an inverse bind matrix never counts as a different bind.
+    private static bool NearlyEqual(Matrix4x4 a, Matrix4x4 b)
+    {
+        float mag = 1f, diff = 0f;
+        for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+        {
+            mag = MathF.Max(mag, MathF.Max(MathF.Abs(a[r, c]), MathF.Abs(b[r, c])));
+            diff = MathF.Max(diff, MathF.Abs(a[r, c] - b[r, c]));
+        }
+        return diff <= 1e-4f * mag;
+    }
+
+    internal sealed class GameData
+    {
+        public IList<Vector3> RefPos = null!;
+        public IList<Vector3>[] Pos = null!;
+        public IList<Vector3>[] Nrm = null!;
+        public IList<Vector2>[] Jw = null!;
+    }
+
+    // ModelExtractor's per-influence attributes (VertexTexture1Game), or null without them.
+    // A mesh carries 4 or 8 slots; the slots read are 0.. up to the first absent one.
+    // AnimatedGltfModel skins the preview with them too.
+    internal static GameData? GameAccessors(MeshPrimitive prim)
+    {
+        var refPos = prim.GetVertexAccessor(VertexTexture1Game.RefPosName);
+        if (refPos == null) return null;
+        var pos = new List<IList<Vector3>>();
+        var nrm = new List<IList<Vector3>>();
+        var jws = new List<IList<Vector2>>();
+        for (int k = 0; k < VertexTexture1Game.Slots; k++)
+        {
+            var p = prim.GetVertexAccessor(VertexTexture1Game.PosName + k);
+            var n = prim.GetVertexAccessor(VertexTexture1Game.NrmName + k);
+            var jw = prim.GetVertexAccessor(VertexTexture1Game.JointWeightName + k);
+            if (p == null && n == null && jw == null) break;
+            if (p == null || n == null || jw == null) return null;
+            pos.Add(p.AsVector3Array());
+            nrm.Add(n.AsVector3Array());
+            jws.Add(jw.AsVector2Array());
+        }
+        if (jws.Count == 0) return null;
+        return new GameData { RefPos = refPos.AsVector3Array(), Pos = pos.ToArray(), Nrm = nrm.ToArray(), Jw = jws.ToArray() };
+    }
+
+    // Vertex v's game influences, kept only while they still describe it: every joint a `_bone`
+    // joint (encoded against its bind, so the stored bone-local values are what the importer
+    // would write), the same weight per joint as JOINTS/WEIGHTS, and POSITION still where the
+    // extractor wrote it in the first influence's bone space (an edit made with the bind
+    // matrices, as ExtractedGlbEdit does, keeps that). Otherwise null.
+    private static List<StripWeight>? GameInfluences(ImportedModel im, ImportedVertex iv, GameData g, int v)
+    {
+        var list = new List<StripWeight>();
+        var gameW = new Dictionary<int, float>();
+        int wsum = 0;
+        for (int k = 0; k < g.Jw.Length && g.Jw[k][v].X >= 0; k++)
+        {
+            int j = (int)g.Jw[k][v].X;
+            if (j >= im.JointNodeIndices.Count) return null;
+            int node = im.JointNodeIndices[j];
+            if (!im.JointBind.ContainsKey(node) || im.Nodes[node].ScaleBone < 0) return null;
+            var p = g.Pos[k][v];
+            var n = g.Nrm[k][v];
+            short w = (short)g.Jw[k][v].Y;
+            list.Add(new StripWeight(node, w, ((short)p.X, (short)p.Y, (short)p.Z), ((short)n.X, (short)n.Y, (short)n.Z)));
+            // JOINTS/WEIGHTS hold the positive weights normalised over their sum (retail has a
+            // few negative ones, card 291), so compare against those only.
+            if (w <= 0) continue;
+            gameW[node] = gameW.GetValueOrDefault(node) + w;
+            wsum += w;
+        }
+        var glbW = new Dictionary<int, float>();
+        foreach (var inf in iv.Influences)
+        {
+            glbW[inf.JointNode] = glbW.GetValueOrDefault(inf.JointNode) + inf.Weight;
+        }
+        if (!GameWeightsMatch(gameW, wsum, glbW)) return null;
+        if (!Matrix4x4.Invert(im.JointBind[list[0].Bone], out var inv)) return null;
+        if (!GameRefPosMatches(Vector3.Transform(iv.Pos, inv), g.RefPos[v])) return null;
+        return list;
+    }
+
+    // The stored influences' positive raw weights (summing to wsum) per joint, against the
+    // glb's JOINTS/WEIGHTS per joint: the same joints, each weight within 1e-3.
+    internal static bool GameWeightsMatch(Dictionary<int, float> gameW, int wsum, Dictionary<int, float> glbW)
+    {
+        if (wsum <= 0) return false;
+        foreach (var (joint, w) in gameW)
+        {
+            if (w > 0 && !glbW.ContainsKey(joint)) return false;
+        }
+        foreach (var (joint, w) in glbW)
+        {
+            if (MathF.Abs(w - gameW.GetValueOrDefault(joint) / wsum) > 1e-3f) return false;
+        }
+        return true;
+    }
+
+    // POSITION taken into the first influence's bone space, still where the extractor wrote it.
+    internal static bool GameRefPosMatches(Vector3 inBone, Vector3 refPos) =>
+        Vector3.Distance(inBone, refPos) <= 0.01f + 1e-5f * refPos.Length();
+
     // JOINTS_0 holds skin-joint indices; map to the actual glb node index via the skin order.
     private static void AddInfluence(ImportedVertex iv, ImportedModel im, int skinJointIndex, float weight)
     {
@@ -791,6 +954,8 @@ public static class GlbImporter
         }
         catch { }
         RestoreColourBlock(mat, ip);
+        if (!im.IsDotrExtractedGlb) ParseDotrColors(mat, ip);
+        ParseBlend(mat, name, ip, im, untextured);
 
         // Harvest the material's base-colour image for texture reimport (best-effort;
         // first material seen per texture slot wins - slots are deduped by image upstream).
@@ -828,6 +993,16 @@ public static class GlbImporter
             }
         }
         catch { /* texture harvest must never break geometry import */ }
+
+        // A DotR-only copy of the texture (DoD exporter: animated mask positions baked into extra
+        // cells, which the slot's records copy from): it replaces the base-colour image as the slot's
+        // picture, whichever material of the slot was seen first.
+        try
+        {
+            if (ip.TexIdx >= 0 && !untextured && DotrImage(mat) is { } di && di.Content.IsValid)
+                im.TextureImages[ip.TexIdx] = di.Content;
+        }
+        catch { }
 
         // The slot's retail texture animation, carried on the extracted glb's material
         // (ModelExtractor.InjectTextureAnimationRecords). Re-embedded verbatim by the
@@ -867,6 +1042,57 @@ public static class GlbImporter
         catch { /* a malformed extras block just means no write-back */ }
     }
 
+    /// uv' = offset + R(rotation) * (scale * uv), the KHR_texture_transform matrix, when the base
+    /// colour texture has one and samples TEXCOORD_0 (the only set the importer reads).
+    private static void ApplyBaseTextureTransform(Material? mat, ImportedPrimitive ip)
+    {
+        try
+        {
+            var ch = mat?.FindChannel("BaseColor");
+            if (ch is not { } c || c.Texture == null || c.TextureCoordinate != 0) return;
+            var tt = c.TextureTransform;
+            if (tt == null || (tt.TextureCoordinateOverride ?? 0) != 0) return;
+            var s = tt.Scale; var o = tt.Offset; float r = tt.Rotation;
+            if (s == Vector2.One && o == Vector2.Zero && r == 0f) return;
+            float cs = MathF.Cos(r), sn = MathF.Sin(r);
+            foreach (var v in ip.Vertices)
+            {
+                float u = v.Uv.X * s.X, w = v.Uv.Y * s.Y;
+                v.Uv = new Vector2(cs * u + sn * w + o.X, -sn * u + cs * w + o.Y);
+            }
+        }
+        catch { /* a malformed transform just leaves the UVs as they are */ }
+    }
+
+    /// The material's "DOTR_image" extras: a glb image to encode for its slot instead of the base colour.
+    private static SharpGLTF.Schema2.Image? DotrImage(Material? mat)
+    {
+        if (mat?.Extras is not System.Text.Json.Nodes.JsonObject ex
+            || ex["DOTR_image"] is not System.Text.Json.Nodes.JsonObject di
+            || di["image"] is not { } idx) return null;
+        int i = idx.GetValue<int>();
+        var imgs = mat.LogicalParent.LogicalImages;
+        return i >= 0 && i < imgs.Count ? imgs[i] : null;
+    }
+
+    /// With a DOTR_image the base-colour texture sits at the top left of a larger image: its
+    /// "uvScale" (base size / image size) maps the faces' UVs onto it, and an optional "uvOffset"
+    /// (image UV) moves them to their own cell there (an atlas flipbook's display cell).
+    private static void ApplyDotrImageUv(Material? mat, ImportedPrimitive ip)
+    {
+        try
+        {
+            if (DotrImage(mat) == null
+                || mat!.Extras is not System.Text.Json.Nodes.JsonObject ex
+                || ex["DOTR_image"]?["uvScale"] is not System.Text.Json.Nodes.JsonArray s || s.Count != 2) return;
+            var k = new Vector2(s[0]!.GetValue<float>(), s[1]!.GetValue<float>());
+            var o = ex["DOTR_image"]?["uvOffset"] is System.Text.Json.Nodes.JsonArray oa && oa.Count == 2
+                ? new Vector2(oa[0]!.GetValue<float>(), oa[1]!.GetValue<float>()) : Vector2.Zero;
+            foreach (var v in ip.Vertices) v.Uv = v.Uv * k + o;
+        }
+        catch { }
+    }
+
     /// True when the material's base-colour channel carries an actual image.
     private static bool HasBaseColorTexture(Material m)
     {
@@ -885,7 +1111,7 @@ public static class GlbImporter
     /// Pack "DOTR_texAnimRecords" back into the 24-byte entries SzModel_LoadTexAnim_Pipe
     /// reads, the inverse of ModelExtractor.TexAnimRecords: flags@0 (bit0 last, bit1 own
     /// clock, bits 2-4 mode, bits 5+ direction), motions@1, cols|rows<<4 @2, state@3,
-    /// p0@4, p1@6, size@8, src@0xC, dst@0x10; the runtime counter @0x14 stays zero.
+    /// p0@4, p1@6, size@8, src@0xC, dst@0x10; own clock @0x14 from "clock" (default zero).
     private static byte[] PackTexAnimRecords(System.Text.Json.Nodes.JsonArray recs)
     {
         const int EntrySize = 0x18;
@@ -912,6 +1138,8 @@ public static class GlbImporter
             W16(0x0E, Pair("src", 1));
             W16(0x10, Pair("dst", 0));
             W16(0x12, Pair("dst", 1));
+            // own clock's starting value: phases a blink record (mode 6 copies when clock % p0 == 0)
+            BinaryPrimitives.WriteUInt32LittleEndian(o.AsSpan(b + 0x14), (uint)I("clock"));
         }
         return o;
     }
@@ -947,6 +1175,154 @@ public static class GlbImporter
                 ip.BaseColor = c with { W = aw.GetValue<float>() / 128f };
         }
         catch { }
+    }
+
+    /// A custom glb's "DOTR_colors" extras {c0, c1}: the material record's c0 (+0x10) and c1 (+0x20)
+    /// rows, 0-255 (the DoD exporter writes DoD's ambient and diffuse: neutral 127 / 178).
+    private static void ParseDotrColors(Material mat, ImportedPrimitive ip)
+    {
+        try
+        {
+            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex
+                || ex["DOTR_colors"] is not System.Text.Json.Nodes.JsonObject col) return;
+            static (int, int, int)? Rgb(System.Text.Json.Nodes.JsonNode? n) =>
+                n is System.Text.Json.Nodes.JsonArray a && a.Count == 3
+                    ? (Math.Clamp(a[0]!.GetValue<int>(), 0, 255), Math.Clamp(a[1]!.GetValue<int>(), 0, 255),
+                       Math.Clamp(a[2]!.GetValue<int>(), 0, 255)) : null;
+            if (Rgb(col["c0"]) is { } c0) ip.Color0 = c0;
+            if (Rgb(col["c1"]) is { } c1) ip.RawColor1 = c1;
+        }
+        catch { }
+    }
+
+    /// The GS blend. An extracted glb names it ("_gs48" = ALPHA_1 0x48, additive). A custom glb
+    /// marks it in DOTR_blend {"mode": "additive"} without the extractor's raw "gsAlpha" (the DoD
+    /// exporter does): drawn in the alpha chain with retail Ameba's additive colour block
+    /// (c1 178, c0 127, full alpha), its texture alpha dropped (see OpaqueAlphaSlots).
+    private static void ParseBlend(Material mat, string name, ImportedPrimitive ip, ImportedModel im, bool untextured)
+    {
+        var tst = System.Text.RegularExpressions.Regex.Match(name, @"_t([0-9A-Fa-f]{5})(?:_|$)");
+        if (tst.Success) ip.GsTest = Convert.ToUInt32(tst.Groups[1].Value, 16);
+        var gs = System.Text.RegularExpressions.Regex.Match(name, @"_gs([0-9A-Fa-f]{2})(?:_|$)");
+        if (gs.Success) { ip.GsAlpha = Convert.ToByte(gs.Groups[1].Value, 16); return; }
+        try
+        {
+            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex
+                || ex["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend
+                || blend["gsAlpha"] != null
+                || blend["mode"]?.GetValue<string>() != "additive") return;
+            ip.IsAlt = true;
+            ip.GsAlpha = 0x48;
+            ip.RawColor1 ??= (178, 178, 178);
+            ip.BaseColor = ip.BaseColor with { W = 1f };
+            if (!untextured && ip.TexIdx >= 0) im.OpaqueAlphaSlots.Add(ip.TexIdx);
+        }
+        catch { }
+    }
+
+    /// A custom glb's translucent material without a DotR blend of its own (alphaMode BLEND or
+    /// MASK, alpha in the texture and/or the base colour factor). DotR's alpha is one value per
+    /// page (c1.w, 128 = 1.0) times a 1-bit texture alpha, so the texture alpha under this
+    /// primitive's triangles is sampled: no translucent texels -> a cutout (TEST 0x703FD, AREF 63)
+    /// if it has holes, else opaque; otherwise the alpha chain (normal blend) with c1.w = the mean
+    /// alpha of the covered texels and the texture alpha cut to coverage (CoverageAlphaSlots).
+    private static void ParsePlainAlpha(Material? mat, ImportedPrimitive ip, ImportedModel im)
+    {
+        try
+        {
+            if (mat == null || ip.Untextured || ip.IsAlt || ip.GsTest != 0 || ip.GsAlpha != 0x44) return;
+            if (mat.Alpha == AlphaMode.OPAQUE) return;
+            if (mat.Extras is System.Text.Json.Nodes.JsonObject ex
+                && ex["DOTR_blend"] is System.Text.Json.Nodes.JsonObject blend
+                && (blend["gsAlpha"] != null || blend["mode"]?.GetValue<string>() is "additive" or "multiply")) return;
+            float factor = Math.Clamp(ip.BaseColor.W, 0f, 1f);
+            var plane = AlphaPlane(mat, im);
+            long n = 0, holes = 0; double sum = 0;
+            if (plane is { } pl)
+                foreach (byte a in SampleAlpha(ip, pl.W, pl.H, pl.A))
+                {
+                    n++;
+                    if (a < 8) holes++; else sum += a / 255.0;
+                }
+            float mean = n > holes ? (float)(sum / (n - holes)) : 1f;
+            if (mat.Alpha == AlphaMode.MASK) mean = 1f;   // a cutout: coverage only
+            float eff = mean * factor;
+            if (eff >= 0.97f)
+            {
+                ip.BaseColor = ip.BaseColor with { W = 1f };
+                if (holes == 0) return;
+                ip.GsTest = 0x703FD;
+            }
+            else
+            {
+                ip.IsAlt = true;
+                // retail's alpha-chain pages keep the neutral c1 (178); MatKey gives alt pages full range
+                if (ip.BaseColor.X >= 0.9999f && ip.BaseColor.Y >= 0.9999f && ip.BaseColor.Z >= 0.9999f)
+                    ip.RawColor1 ??= (178, 178, 178);
+                ip.BaseColor = ip.BaseColor with { W = MathF.Max(eff, 1f / 128f) };
+            }
+            if (ip.TexIdx >= 0) im.CoverageAlphaSlots.Add(ip.TexIdx);
+        }
+        catch { /* leave the page opaque */ }
+    }
+
+    /// The alpha plane of the material's base-colour image (null: no image or undecodable).
+    private static (int W, int H, byte[] A)? AlphaPlane(Material mat, ImportedModel im)
+    {
+        // a DOTR_image replaces the base colour for the slot, and the faces' UVs already point into it
+        var gi = DotrImage(mat) ?? mat.FindChannel("BaseColor")?.Texture?.PrimaryImage;
+        if (gi == null) return null;
+        if (im.AlphaPlanes.TryGetValue(gi.LogicalIndex, out var cached)) return cached;
+        (int, int, byte[])? res = null;
+        var img = gi.Content;
+        if (img.IsValid)
+        {
+            Image cpu = DecodeRgba(img);
+            if (cpu.Width > 0 && cpu.Height > 0)
+            {
+                var rgba = Pixels(cpu);
+                var a = new byte[cpu.Width * cpu.Height];
+                for (int i = 0; i < a.Length; i++) a[i] = rgba[i * 4 + 3];
+                res = (cpu.Width, cpu.Height, a);
+            }
+            Raylib.UnloadImage(cpu);
+        }
+        im.AlphaPlanes[gi.LogicalIndex] = res;
+        return res;
+    }
+
+    /// Texel alphas under the primitive's triangles (repeat-wrapped UVs, about 1k samples per
+    /// triangle at most, its centroid when it covers no texel centre).
+    private static IEnumerable<byte> SampleAlpha(ImportedPrimitive ip, int w, int h, byte[] a)
+    {
+        byte At(float x, float y)
+        {
+            int ix = ((int)MathF.Floor(x) % w + w) % w, iy = ((int)MathF.Floor(y) % h + h) % h;
+            return a[iy * w + ix];
+        }
+        foreach (var (i0, i1, i2) in ip.Triangles)
+        {
+            Vector2 p0 = ip.Vertices[i0].Uv * new Vector2(w, h), p1 = ip.Vertices[i1].Uv * new Vector2(w, h),
+                    p2 = ip.Vertices[i2].Uv * new Vector2(w, h);
+            float x0 = MathF.Min(p0.X, MathF.Min(p1.X, p2.X)), x1 = MathF.Max(p0.X, MathF.Max(p1.X, p2.X));
+            float y0 = MathF.Min(p0.Y, MathF.Min(p1.Y, p2.Y)), y1 = MathF.Max(p0.Y, MathF.Max(p1.Y, p2.Y));
+            float area = (p1.X - p0.X) * (p2.Y - p0.Y) - (p2.X - p0.X) * (p1.Y - p0.Y);
+            bool any = false;
+            if (MathF.Abs(area) > 1e-6f && (x1 - x0) * (y1 - y0) < 1e8f)
+            {
+                float step = MathF.Max(1f, MathF.Sqrt((x1 - x0) * (y1 - y0) / 1024f));
+                for (float y = MathF.Floor(y0) + 0.5f; y <= y1; y += step)
+                for (float x = MathF.Floor(x0) + 0.5f; x <= x1; x += step)
+                {
+                    float b1 = ((x - p0.X) * (p2.Y - p0.Y) - (p2.X - p0.X) * (y - p0.Y)) / area;
+                    float b2 = ((p1.X - p0.X) * (y - p0.Y) - (x - p0.X) * (p1.Y - p0.Y)) / area;
+                    if (b1 < 0 || b2 < 0 || b1 + b2 > 1) continue;
+                    any = true;
+                    yield return At(x, y);
+                }
+            }
+            if (!any) { var c = (p0 + p1 + p2) / 3f; yield return At(c.X, c.Y); }
+        }
     }
 
     /// 8x8 single-colour PNG wrapped as a glTF MemoryImage (for textureless materials).
@@ -1049,9 +1425,10 @@ public static class GlbImporter
             {
                 var dup = new ImportedVertex
                 {
-                    Pos = src.Pos, Normal = src.Normal,
+                    Pos = src.Pos, FramePos = src.FramePos, Normal = src.Normal,
                     Uv = new Vector2(src.Uv.X - tx, src.Uv.Y - ty),
                     Influences = src.Influences,   // share (read-only downstream)
+                    Game = src.Game,
                 };
                 outIdx = ip.Vertices.Count;
                 ip.Vertices.Add(dup);
@@ -1090,8 +1467,8 @@ public static class GlbImporter
     }
 
     /// Decode the glb's embedded base-colour images (per "mat_texN" texture index) into raw
-    /// RGBA TextureInputs for the RH2 re-encoder. Uses the same SaveToFile -> Raylib.LoadImage
-    /// path as the model viewer (version-safe across SharpGLTF releases). Best-effort: a
+    /// RGBA TextureInputs for the RH2 re-encoder. Decoded by LoadRgba, the same stb_image
+    /// decode as the model viewer. Best-effort: a
     /// texture that fails to decode is skipped and keeps the template's original RH2.
     /// `maxDim`: same per-axis cap used everywhere else native textures get built (see
     /// Rh2Encoder.ChooseTarget / Rh0Assembler's maxTexDim) - default 512, matching the
@@ -1111,29 +1488,23 @@ public static class GlbImporter
         foreach (var (texIdx, img) in model.TextureImages)
         {
             if (animSlots.Contains(texIdx)) continue; // handled by the anim branch below instead
-            string tmp = null;
             try
             {
-                string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
-                tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_" + Guid.NewGuid().ToString("N") + "." + ext);
-                img.SaveToFile(tmp);
-
-                Image cpu = Raylib.LoadImage(tmp);
+                Image cpu = DecodeRgba(img);
                 if (cpu.Width <= 0 || cpu.Height <= 0) continue;
-                Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
-
-                byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
-                unsafe
-                {
-                    System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length);
-                }
+                byte[] rgba = Pixels(cpu);
                 ApplyEditedAnimFrames(model, texIdx, rgba, cpu.Width, cpu.Height);
+                if (model.OpaqueAlphaSlots.Contains(texIdx))
+                    for (int a = 3; a < rgba.Length; a += 4) rgba[a] = 255;
+                else if (model.CoverageAlphaSlots.Contains(texIdx))
+                    for (int a = 3; a < rgba.Length; a += 4) rgba[a] = rgba[a] >= 8 ? (byte)255 : (byte)0;
                 inputs.Add(new Rh0Assembler.TextureInput {
                     TexIdx = texIdx,
                     Rgba = rgba,
                     Width = cpu.Width,
                     Height = cpu.Height,
                     AnimRecords = model.TextureAnimRecords.TryGetValue(texIdx, out var ar) ? ar : null,
+                    AnimRecordsInImagePixels = !model.IsDotrExtractedGlb,
                 });
                 Raylib.UnloadImage(cpu);
             }
@@ -1141,105 +1512,76 @@ public static class GlbImporter
             {
                 /* skip this texture; the template RH2 stays */
             }
-            finally
-            {
-                try
-                {
-                    if (tmp != null && File.Exists(tmp)) File.Delete(tmp);
-                }
-                catch
-                {
-                }
-            }
         }
 
         // --- animated slots: decode every frame, pack into one sprite sheet ---
+        // The game plays a flipbook by copying cell i of a cols x rows grid onto cell 0 every draw
+        // (Rh0Assembler.BuildCustomTexAnimEntry), so the sheet is that grid with frame 0 in cell 0,
+        // and the faces must sample cell 0 only: TextureAnimUvScale tells RebuildPipeline how far to
+        // squeeze their UVs. Every frame is resized to frame 0's size (clamped to maxDim), then
+        // halved until a grid of at most 15 x 15 cells fits MaxAnimSheetPixels (TryAnimSheetLayout).
         foreach (var (texIdx, frames) in model.TextureAnimFrames)
         {
+            var images = new List<Image>();
             try
             {
-                var decoded = new List<(byte[] rgba, int w, int h)>();
                 foreach (var f in frames)
                 {
-                    string tmp = null;
-                    try
+                    if (images.Count == Rh0Assembler.MaxAnimFrames)
                     {
-                        string ext = string.IsNullOrEmpty(f.FileExtension) ? "png" : f.FileExtension;
-                        tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_anim_" + Guid.NewGuid().ToString("N") + "." + ext);
-                        f.SaveToFile(tmp);
-                        Image cpu = Raylib.LoadImage(tmp);
-                        if (cpu.Width <= 0 || cpu.Height <= 0) continue;
-
-                        // Clamp BEFORE extracting bytes - a flipbook sheet's width grows
-                        // with frame count (cols*blockW), so an unclamped per-frame size
-                        // multiplies directly into the final sheet. Retail's own flipbook
-                        // sample is tiny (128x64 stored for 8 frames, ~32x16 px/cell) -
-                        // animated cells are meant to be small, not full-resolution copies
-                        // of the source art. Resize (not crop/pad) so the whole frame's
-                        // content survives, just at a lower resolution.
-                        if (cpu.Width > maxDim || cpu.Height > maxDim)
-                        {
-                            float scale = Math.Min((float)maxDim / cpu.Width, (float)maxDim / cpu.Height);
-                            int nw = Math.Max(1, (int)Math.Round(cpu.Width * scale));
-                            int nh = Math.Max(1, (int)Math.Round(cpu.Height * scale));
-                            Raylib.ImageResize(ref cpu, nw, nh);
-                        }
-
-                        Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
-                        byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
-                        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length); }
-                        decoded.Add((rgba, cpu.Width, cpu.Height));
-                        Raylib.UnloadImage(cpu);
+                        model.TexSlotWarnings.Add($"texture slot {texIdx}: {frames.Count} animation frames, " +
+                            $"only the first {Rh0Assembler.MaxAnimFrames} are used");
+                        break;
                     }
-                    finally
-                    {
-                        try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { }
-                    }
+                    Image cpu = DecodeRgba(f);
+                    if (cpu.Width <= 0 || cpu.Height <= 0) continue;
+                    images.Add(cpu);
                 }
-                if (decoded.Count < 2) continue; // matches TextureAnimFrames' own >=2 rule
+                if (images.Count < 2) continue; // matches TextureAnimFrames' own >=2 rule
 
-                // All frames must share one size for a flipbook (the engine's "grid" entry
-                // is one fixed blockW/blockH for every cell). Mismatched frame sizes most
-                // likely mean the Blender export wasn't set up consistently (or rounded
-                // differently during the maxDim resize above); rather than silently
-                // distort frames, fall back to treating this slot as static (frame 0
-                // only) so the import doesn't fail outright.
-                int rawW = decoded[0].w, rawH = decoded[0].h;
-                bool uniform = decoded.All(d => d.w == rawW && d.h == rawH);
-                if (!uniform)
+                int n = images.Count;
+                int fw = images[0].Width, fh = images[0].Height;
+                if (fw > maxDim || fh > maxDim)
                 {
-                    inputs.Add(new Rh0Assembler.TextureInput { TexIdx = texIdx, Rgba = decoded[0].rgba, Width = rawW, Height = rawH });
+                    float scale = Math.Min((float)maxDim / fw, (float)maxDim / fh);
+                    fw = Math.Max(1, (int)Math.Round(fw * scale));
+                    fh = Math.Max(1, (int)Math.Round(fh * scale));
+                }
+                AnimSheetLayout layout;
+                while (!TryAnimSheetLayout(n, fw, fh, out layout))
+                {
+                    if (fw == 1 && fh == 1) break;
+                    fw = Math.Max(1, fw / 2);
+                    fh = Math.Max(1, fh / 2);
+                }
+                if (layout.Cols == 0)
+                {
+                    model.TexSlotWarnings.Add($"texture slot {texIdx}: {n} animation frames do not fit one texture; not animated");
                     continue;
                 }
+                if (images.Any(i => i.Width != images[0].Width || i.Height != images[0].Height))
+                    model.TexSlotWarnings.Add($"texture slot {texIdx}: animation frames differ in size; all resized to frame 0's");
 
-                // Pad each (already maxDim-clamped) cell up to a power-of-two, then pad
-                // the FULL sheet (bw*n, bh) up to Rh2Encoder.BuildNative's real
-                // requirement - width a POT multiple of 128, height a POT multiple of 64
-                // - so it can be passed in as an exact target with no resampling at all
-                // (Resample's sw==dw&&sh==dh short-circuit). This keeps every frame's
-                // cell boundary on an exact texel grid.
-                int n = decoded.Count;
-                int bw = Math.Max(1, Rh2Encoder.NextPot(rawW));
-                int bh = Math.Max(1, Rh2Encoder.NextPot(rawH));
-
-                int sheetW = Rh2Encoder.NextPot(bw * n);
-                sheetW = ((sheetW + 127) / 128) * 128;
-                if (!IsPow2Local(sheetW)) sheetW = Rh2Encoder.NextPot(sheetW);
-                int sheetH = Rh2Encoder.NextPot(bh);
-                sheetH = ((sheetH + 63) / 64) * 64;
-                if (!IsPow2Local(sheetH)) sheetH = Rh2Encoder.NextPot(sheetH);
-                sheetW = Math.Max(sheetW, 128);
-                sheetH = Math.Max(sheetH, 64);
-
+                // Cells (POT, like retail's) hold the frame at their top-left; the loop runs over all
+                // cols * rows cells, so cells past the last frame repeat it.
+                int sheetW = layout.SheetW, sheetH = layout.SheetH, bw = layout.CellW, bh = layout.CellH;
                 byte[] sheet = new byte[sheetW * sheetH * 4];
-                for (int f = 0; f < n; f++)
+                byte[] cell = new byte[fw * fh * 4];
+                for (int c = 0; c < layout.Cols * layout.Rows; c++)
                 {
-                    var (rgba, w, h) = decoded[f];
-                    int cellX = f * bw;
-                    if (cellX >= sheetW) break; // shouldn't happen given the rounding above, but stay safe
-                    for (int y = 0; y < h && y < bh && y < sheetH; y++)
-                        Buffer.BlockCopy(rgba, y * w * 4, sheet, ((y * sheetW) + cellX) * 4, Math.Min(w, sheetW - cellX) * 4);
-                    // any remaining padding bytes stay transparent-black (default array init)
+                    if (c < n)
+                    {
+                        Image img = images[c];
+                        if (img.Width != fw || img.Height != fh)
+                        {
+                            Raylib.ImageResize(ref img, fw, fh);
+                            images[c] = img;
+                        }
+                        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)img.Data, cell, 0, cell.Length); }
+                    }
+                    int cx = (c % layout.Cols) * bw, cy = (c / layout.Cols) * bh;
+                    for (int y = 0; y < fh; y++)
+                        Buffer.BlockCopy(cell, y * fw * 4, sheet, ((cy + y) * sheetW + cx) * 4, fw * 4);
                 }
 
                 inputs.Add(new Rh0Assembler.TextureInput {
@@ -1247,22 +1589,67 @@ public static class GlbImporter
                     Rgba = sheet,
                     Width = sheetW,
                     Height = sheetH,
-                    AnimFrameCount = n,
+                    AnimFrameCount = layout.Cols * layout.Rows,
+                    AnimCols = layout.Cols,
+                    AnimRows = layout.Rows,
                     AnimBlockW = bw,
                     AnimBlockH = bh,
                     AnimTicksPerFrame = model.TextureAnimTicks.TryGetValue(texIdx, out int customTicks)
                         ? customTicks
                         : 5, // default matches the one real retail sample (see TextureInput remarks)
                 });
+                model.TextureAnimUvScale[texIdx] = new Vector2((float)fw / sheetW, (float)fh / sheetH);
             }
             catch
             {
                 /* skip this texture's animation; falls through with no TextureInput for
                    this slot, so the template's existing texture/anim is kept untouched */
             }
+            finally
+            {
+                foreach (var img in images) Raylib.UnloadImage(img);
+            }
         }
 
         return inputs;
+    }
+
+    private struct AnimSheetLayout
+    {
+        public int Cols, Rows, CellW, CellH, SheetW, SheetH;
+    }
+
+    /// A sprite sheet is encoded at exactly its packed size (Rh0Assembler never reduces it), so it
+    /// has to fit the 1 MiB block on its own terms: 512 x 512 texels, 256 KB at 8 bpp, the same
+    /// ceiling as the default maxDim of a static texture. (A 512 x 1024 sheet overflowed a monster
+    /// slot by 13 KB.)
+    private const long MaxAnimSheetPixels = 512 * 512;
+
+    /// Smallest grid of POT cells for n frames of fw x fh: at most 15 x 15 cells (the entry's
+    /// nibbles), the sheet POT with width >= 128 and height >= 64 (Rh2Encoder.BuildNative), at
+    /// most 1024 on either side (the GS limit) and MaxAnimSheetPixels in all. Cols = 0 when
+    /// nothing fits.
+    private static bool TryAnimSheetLayout(int n, int fw, int fh, out AnimSheetLayout best)
+    {
+        best = default;
+        int bw = Rh2Encoder.NextPot(fw), bh = Rh2Encoder.NextPot(fh);
+        long bestArea = long.MaxValue;
+        for (int cols = 1; cols <= 15; cols++)
+        {
+            int rows = (n + cols - 1) / cols;
+            if (rows > 15) continue;
+            int w = Rh2Encoder.NextPot(Math.Max(bw * cols, 128));
+            int h = Rh2Encoder.NextPot(Math.Max(bh * rows, 64));
+            if (w > 1024 || h > 1024 || (long)w * h > MaxAnimSheetPixels) continue;
+            // fewer spare cells first (they repeat the last frame), then the smaller sheet
+            long area = (long)(cols * rows - n) << 32 | (long)w * h;
+            if (area < bestArea)
+            {
+                bestArea = area;
+                best = new AnimSheetLayout { Cols = cols, Rows = rows, CellW = bw, CellH = bh, SheetW = w, SheetH = h };
+            }
+        }
+        return best.Cols > 0;
     }
 
     /// Fold an edited animation frame of an extracted glb back into the base image.
@@ -1286,21 +1673,15 @@ public static class GlbImporter
         foreach (var (frame, img) in frames)
         {
             if (!stampsByFrame.TryGetValue(frame, out var stamps)) continue;
-            string tmp = null;
             try
             {
-                string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
-                tmp = Path.Combine(Path.GetTempPath(), "dotr_imp_animedit_" + Guid.NewGuid().ToString("N") + "." + ext);
-                img.SaveToFile(tmp);
-                Image cpu = Raylib.LoadImage(tmp);
+                Image cpu = DecodeRgba(img);
                 try
                 {
                     // The records' rectangles are in the retail texture's pixel space, so a
                     // frame that is no longer the base image's size cannot be mapped back.
                     if (cpu.Width != w || cpu.Height != h) continue;
-                    Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
-                    byte[] fr = new byte[w * h * 4];
-                    unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, fr, 0, fr.Length); }
+                    byte[] fr = Pixels(cpu);
 
                     for (int k = 0; k < stamps.Count; k++)
                     {
@@ -1313,7 +1694,7 @@ public static class GlbImporter
                         int sy = U16L(recs, o + 0x0E) + bh * (cell / cols);
                         int dx = U16L(recs, o + 0x10), dy = U16L(recs, o + 0x12);
                         if (bw <= 0 || bh <= 0) continue;
-                        if (RectHash(fr, w, h, dx, dy, bw, bh) == hash) continue;  // frame untouched
+                        if (ModelExtractor.RectHash(fr, w, h, dx, dy, bw, bh) == hash) continue;  // frame untouched
 
                         for (int y = 0; y < bh; y++)
                         {
@@ -1336,12 +1717,9 @@ public static class GlbImporter
                 finally { Raylib.UnloadImage(cpu); }
             }
             catch { /* a frame that will not decode just means no write-back for it */ }
-            finally
-            {
-                try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { }
-            }
         }
     }
+
 
     /// Is (x,y) inside the destination rectangle of a stamp after index k of this frame?
     private static bool CoveredLater(byte[] recs, List<(int Rec, int Cell, uint Hash)> stamps, int k, int x, int y)
@@ -1359,25 +1737,31 @@ public static class GlbImporter
 
     private static int U16L(byte[] b, int o) => b[o] | (b[o + 1] << 8);
 
-    /// FNV-1a over one rectangle of an RGBA image; the same walk as
-    /// ModelExtractor.RectHash, which produced the hashes in the extras.
-    private static uint RectHash(byte[] rgba, int w, int h, int x0, int y0, int rw, int rh)
+    private static bool IsPow2Local(int v) => v > 0 && (v & (v - 1)) == 0;
+
+    /// A glTF image decoded by Raylib (stb_image), in its own pixel format; Width is 0 when it
+    /// does not decode. The viewer uploads these and the importer encodes them, so both see the
+    /// same pixels. The caller unloads it.
+    public static Image DecodeImage(SharpGLTF.Memory.MemoryImage img)
     {
-        uint hash = 2166136261u;
-        for (int y = 0; y < rh; y++)
-        {
-            int yy = y0 + y;
-            if ((uint)yy >= (uint)h) continue;
-            for (int x = 0; x < rw; x++)
-            {
-                int xx = x0 + x;
-                if ((uint)xx >= (uint)w) continue;
-                int o = (yy * w + xx) * 4;
-                for (int c = 0; c < 4; c++) hash = (hash ^ rgba[o + c]) * 16777619u;
-            }
-        }
-        return hash;
+        string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
+        return Raylib.LoadImageFromMemory("." + ext, img.Content.ToArray());
     }
 
-    private static bool IsPow2Local(int v) => v > 0 && (v & (v - 1)) == 0;
+    /// DecodeImage converted to RGBA8.
+    private static Image DecodeRgba(SharpGLTF.Memory.MemoryImage img)
+    {
+        Image cpu = DecodeImage(img);
+        if (cpu.Width > 0 && cpu.Height > 0)
+            Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
+        return cpu;
+    }
+
+    /// A copy of an RGBA8 image's pixels.
+    private static byte[] Pixels(Image cpu)
+    {
+        byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
+        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length); }
+        return rgba;
+    }
 }

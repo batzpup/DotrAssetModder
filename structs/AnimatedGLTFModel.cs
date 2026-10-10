@@ -1,6 +1,7 @@
 ﻿using System.Numerics;
 using System.Text.Json.Nodes;
 using Raylib_cs;
+using DotrAssetModder;
 using SharpGLTF.Schema2;
 using SharpGLTF.Runtime;
 using SharpGLTF.Materials;
@@ -52,10 +53,16 @@ public sealed class AnimatedGltfModel : IDisposable
         public unsafe float* Pos;   // GPU-side position buffer (RL_MALLOC, freed by UnloadMesh)
 
         public Vector3[] LocalPos;  // bind-space positions
-        public Vector4[] Joints;    // per-vertex joint indices (null => rigid)
-        public Vector4[] Weights;   // per-vertex weights
-        public Vector4[] Joints1;   // JOINTS_1/WEIGHTS_1: influences 5-8 (null => none)
-        public Vector4[] Weights1;
+        // Skinned like the game (lRhModelCpu_CalcSharedPoint): each influence has its own copy
+        // of the vertex in its joint's space, moved by that joint and summed by weight. Vertex v's
+        // influences are InfStart[v] .. InfStart[v + 1] (none: drawn at LocalPos). null => rigid.
+        public int[] InfStart;
+        public int[] InfJoint;      // skin joint index
+        public float[] InfWeight;
+        public Vector3[] InfPos;    // the copy in its joint's space
+        public Vector3[]? InfNrm;   // its normal (renderables with LocalNrm only)
+        public Matrix4x4[] IbmInv;  // per skin joint: inverse of its inverse bind
+        public Matrix4x4[] JointWorld; // per skin joint, this frame (scratch)
         public int[] Tri;           // flat triangle indices into LocalPos (len 3*TriCount)
 
         public int MaterialIndex = -1;
@@ -75,10 +82,80 @@ public sealed class AnimatedGltfModel : IDisposable
         public Texture2D[] AnimFrames = Array.Empty<Texture2D>();
         public float[] AnimTimes = Array.Empty<float>();
         public float AnimDuration;
+
+        // UV transform (KHR_texture_transform offset/scale, animated by "dod_uv_anim" extras) and
+        // a second MODULATE mask texture ("dod_modulate" extras, Dawn of Destiny _nuki maps).
+        public bool HasUvXform;
+        public Vector2 Uv0Scale = Vector2.One, Uv0Offset = Vector2.Zero;
+        public UvTrack? Uv0Track;
+        public bool HasMask;
+        public Texture2D MaskTexture;
+        public UvTrack? Uv1Track;
+        public bool Multiply;       // DoD blend (DST_COLOR, ZERO): dst * src
+
+        // DoD specular term t1 * v1 ("dod_specular" extras): mask x colour x headlight Phong.
+        public bool HasSpec;
+        public Texture2D SpecTexture;
+        public Vector3 SpecColor;
+        public float SpecShininess = 32f;
+        public UvTrack? Uv2Track;
+        // DoD sphere-mapped reflection t2 * v0 ("dod_reflect" extras, the ref_map textures).
+        public bool HasRef;
+        public Texture2D RefTexture;
+        // DoD vertex lighting v0 = emission + ambient + diffuse * N.L ("dod_light" extras).
+        public bool HasLight;
+        public Vector3 LightAmbient, LightDiffuse, LightEmission;
+        public bool NeedsNormals => HasSpec || HasRef || HasLight;
+        public Vector3[]? LocalNrm;         // bind-space normals (renderables with NeedsNormals only)
+        public unsafe float* Nrm;           // GPU-side normal buffer
+        public unsafe float* Uv2;           // GPU-side TEXCOORD_1 (unit-1 mask / specular UVs)
+    }
+
+    // Stepped UV offset/scale keys looping over LoopSeconds (DoD igUvAnimeShader, see dod_export.py).
+    sealed class UvTrack
+    {
+        public float LoopSeconds;
+        public float[] Times = Array.Empty<float>();
+        public Vector2[] Offset = Array.Empty<Vector2>();
+        public Vector2[] Scale = Array.Empty<Vector2>();
+
+        public Vector4 Eval(float time)
+        {
+            if (Times.Length == 0) return new Vector4(1, 1, 0, 0);
+            float t = LoopSeconds > 0f ? time % LoopSeconds : 0f;
+            if (t < 0f) t += LoopSeconds;
+            int idx = 0;
+            for (int i = 0; i < Times.Length; i++)
+            {
+                if (Times[i] <= t) idx = i; else break;
+            }
+            return new Vector4(Scale[idx].X, Scale[idx].Y, Offset[idx].X, Offset[idx].Y);
+        }
+
+        public static UvTrack? Parse(JsonObject o)
+        {
+            if (o["times"] is not JsonArray ts || o["offset"] is not JsonArray os || o["scale"] is not JsonArray ss) return null;
+            int n = Math.Min(ts.Count, Math.Min(os.Count, ss.Count));
+            if (n == 0) return null;
+            var tr = new UvTrack
+            {
+                LoopSeconds = o["loop_seconds"]?.GetValue<float>() ?? 0f,
+                Times = new float[n], Offset = new Vector2[n], Scale = new Vector2[n],
+            };
+            for (int i = 0; i < n; i++)
+            {
+                tr.Times[i] = ts[i]!.GetValue<float>();
+                tr.Offset[i] = new Vector2(os[i]![0]!.GetValue<float>(), os[i]![1]!.GetValue<float>());
+                tr.Scale[i] = new Vector2(ss[i]![0]!.GetValue<float>(), ss[i]![1]!.GetValue<float>());
+            }
+            return tr;
+        }
     }
 
     ModelRoot _gltf;
     SceneInstance _instance;
+    Vector3 _restPivot;                                 // node 1 / node 0 in the rest pose
+    Vector3 _restNodeZero;
     readonly List<List<Renderable>> _byDrawable = new(); // aligned to DrawableInstances order
     readonly List<Renderable> _all = new();
     // First renderable built for each glTF material. Rigid models split one material
@@ -92,6 +169,146 @@ public sealed class AnimatedGltfModel : IDisposable
     bool _hasDrawMaterial;
     bool _hasAlphaMaskShader;
     int _alphaCutoffLoc = -1;
+    sealed class UvShaderLocs
+    {
+        public Raylib_cs.Shader Shader;
+        public int Xform0 = -1, Xform1 = -1, Xform2 = -1, UseMask = -1, AlphaCutoff = -1, SpecColor = -1, Shininess = -1;
+        public int UseSpec = -1, UseRef = -1, UseLight = -1, MatAmbient = -1, MatDiffuse = -1, MatEmission = -1,
+            LightDir = -1, LightColor = -1, LightAmbient = -1;
+
+        public static unsafe UvShaderLocs? Load(string? vs, string fs)
+        {
+            var sh = Raylib.LoadShaderFromMemory(vs, fs);
+            if (sh.Id == 0) return null;
+            // raylib binds only texture0..2 by name; the reflection map is MaterialMapIndex.Roughness -> "texture3"
+            sh.Locs[(int)ShaderLocationIndex.MapRoughness] = Raylib.GetShaderLocation(sh, "texture3");
+            return new UvShaderLocs
+            {
+                Shader = sh,
+                Xform0 = Raylib.GetShaderLocation(sh, "uvXform0"),
+                Xform1 = Raylib.GetShaderLocation(sh, "uvXform1"),
+                Xform2 = Raylib.GetShaderLocation(sh, "uvXform2"),
+                UseMask = Raylib.GetShaderLocation(sh, "useMask"),
+                AlphaCutoff = Raylib.GetShaderLocation(sh, "alphaCutoff"),
+                SpecColor = Raylib.GetShaderLocation(sh, "specColor"),
+                Shininess = Raylib.GetShaderLocation(sh, "shininess"),
+                UseSpec = Raylib.GetShaderLocation(sh, "useSpec"),
+                UseRef = Raylib.GetShaderLocation(sh, "useRef"),
+                UseLight = Raylib.GetShaderLocation(sh, "useLight"),
+                MatAmbient = Raylib.GetShaderLocation(sh, "matAmbient"),
+                MatDiffuse = Raylib.GetShaderLocation(sh, "matDiffuse"),
+                MatEmission = Raylib.GetShaderLocation(sh, "matEmission"),
+                LightDir = Raylib.GetShaderLocation(sh, "lightDir"),
+                LightColor = Raylib.GetShaderLocation(sh, "lightColor"),
+                LightAmbient = Raylib.GetShaderLocation(sh, "lightAmbient"),
+            };
+        }
+    }
+    UvShaderLocs? _uvShader;    // UV transform + modulate mask
+    UvShaderLocs? _specShader;  // ... plus the normal-based DoD terms: specular, reflection, lighting
+
+    // DoD scene light, approximated (the game sets it at runtime; it is not in the model files).
+    // Direction is in view space (towards the light), so the light follows the camera like the headlight specular.
+    public static Vector3 DodLightDir = Vector3.Normalize(new Vector3(-0.3f, 0.5f, 0.8f));
+    public static Vector3 DodLightColor = new(1f, 1f, 1f);
+    public static Vector3 DodAmbientColor = new(1f, 1f, 1f);
+    Vector3[] _scratchN = Array.Empty<Vector3>();
+
+    // Passes both UV sets (DoD unit-1 textures read TEXCOORD_1); the SPEC variant adds view-space
+    // position/normal for a headlight Phong term.
+    private const string UvVertexShader = @"
+        in vec3 vertexPosition;
+        in vec2 vertexTexCoord;
+        in vec2 vertexTexCoord2;
+        in vec4 vertexColor;
+        uniform mat4 mvp;
+        out vec2 fragTexCoord;
+        out vec2 fragTexCoord2;
+        out vec4 fragColor;
+    #ifdef SPEC
+        in vec3 vertexNormal;
+        uniform mat4 matView;
+        out vec3 fragViewPos;
+        out vec3 fragViewNormal;
+    #endif
+
+        void main()
+        {
+            fragTexCoord = vertexTexCoord;
+            fragTexCoord2 = vertexTexCoord2;
+            fragColor = vertexColor;
+    #ifdef SPEC
+            fragViewPos = (matView * vec4(vertexPosition, 1.0)).xyz;
+            fragViewNormal = mat3(matView) * vertexNormal;
+    #endif
+            gl_Position = mvp * vec4(vertexPosition, 1.0);
+        }";
+
+    // Used only for renderables with a UV transform or a modulate mask; everything else keeps
+    // the default / alpha-mask shaders. alphaCutoff < 0 disables the alpha test.
+    private const string UvFragmentShader = @"
+        in vec2 fragTexCoord;
+        in vec2 fragTexCoord2;
+        in vec4 fragColor;
+        out vec4 finalColor;
+
+        uniform sampler2D texture0;
+        uniform sampler2D texture1;
+        uniform vec4 colDiffuse;
+        uniform vec4 uvXform0;   // xy = scale, zw = offset (KHR_texture_transform)
+        uniform vec4 uvXform1;
+        uniform int useMask;
+        uniform float alphaCutoff;
+    #ifdef SPEC
+        in vec3 fragViewPos;
+        in vec3 fragViewNormal;
+        uniform sampler2D texture2;
+        uniform vec4 uvXform2;
+        uniform vec3 specColor;
+        uniform float shininess;
+        uniform sampler2D texture3;
+        uniform int useSpec;
+        uniform int useRef;
+        uniform int useLight;
+        uniform vec3 matAmbient;
+        uniform vec3 matDiffuse;
+        uniform vec3 matEmission;
+        uniform vec3 lightDir;
+        uniform vec3 lightColor;
+        uniform vec3 lightAmbient;
+    #endif
+
+        void main()
+        {
+            vec4 color = texture(texture0, fragTexCoord * uvXform0.xy + uvXform0.zw) * colDiffuse * fragColor;
+            if (useMask == 1) color.rgb *= texture(texture1, fragTexCoord2 * uvXform1.xy + uvXform1.zw).r;
+    #ifdef SPEC
+            vec3 n = normalize(fragViewNormal);
+            if (!gl_FrontFacing) n = -n;
+            // game pixel programs: t0*v0 (*t1 mask) + t1*v1 (specular) + t2*v0 (sphere-mapped ref_map)
+            vec3 v0 = vec3(1.0);
+            if (useLight == 1)
+                v0 = clamp(matEmission + matAmbient * lightAmbient + matDiffuse * lightColor * max(dot(n, lightDir), 0.0), 0.0, 1.0);
+            color.rgb *= v0;
+            if (useRef == 1)
+            {
+                // game vertex program: R = reflect(eye->vertex, N) in view space, uv = 0.5 * R.xy + 0.5
+                vec3 r = reflect(normalize(fragViewPos), n);
+                color.rgb += texture(texture3, r.xy * 0.5 + 0.5).rgb * v0;
+            }
+            if (useSpec == 1)
+            {
+                float s = pow(max(dot(n, normalize(-fragViewPos)), 0.0), shininess);
+                color.rgb += texture(texture2, fragTexCoord2 * uvXform2.xy + uvXform2.zw).r * specColor * s;
+            }
+    #endif
+            if (alphaCutoff >= 0.0)
+            {
+                if (color.a < alphaCutoff) discard;
+                color.a = 1.0;
+            }
+            finalColor = color;
+        }";
 
     private const string AlphaMaskFragmentShader = @"#version 330
         in vec2 fragTexCoord;
@@ -113,7 +330,6 @@ public sealed class AnimatedGltfModel : IDisposable
     Vector3 _center;
 
     public Vector3 Center => _center;
-    public float Radius { get; private set; } = 1f;
 
     public int AnimationCount { get; private set; }
     public string[] AnimationNames { get; private set; } = Array.Empty<string>();
@@ -122,20 +338,54 @@ public sealed class AnimatedGltfModel : IDisposable
 
     public static AnimatedGltfModel Load(string path)
     {
+        var settings = new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix };
+        return Load(new Parsed(ModelRoot.Load(path, settings)));
+    }
+
+    // A glb that is only in memory (a model straight out of an archive).
+    public static AnimatedGltfModel Load(byte[] glb)
+    {
+        return Load(Parse(glb));
+    }
+
+    // A glb read and its scene built (SharpGLTF only, no GPU): most of a load's time (Blue-Eyes:
+    // ~150 of ~160 ms), so a worker thread can do it and the draw thread finishes with Load.
+    public sealed class Parsed
+    {
+        internal readonly ModelRoot Gltf;
+        internal readonly SceneInstance Instance;
+
+        internal Parsed(ModelRoot gltf)
+        {
+            Gltf = gltf;
+            var scene = gltf.DefaultScene ?? (gltf.LogicalScenes.Count > 0 ? gltf.LogicalScenes[0] : null);
+            if (scene == null) throw new InvalidOperationException("glTF has no scene to render.");
+            // IsolateMemory: the animation keys are copied once. Without it SharpGLTF re-reads the
+            // accessors on every sample (3x slower per frame, ~0.2-0.7 MB of garbage per frame).
+            Instance = SceneTemplate.Create(scene, new RuntimeOptions { IsolateMemory = true }).CreateInstance();
+        }
+    }
+
+    public static Parsed Parse(byte[] glb)
+    {
+        var settings = new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix };
+        return new Parsed(ModelRoot.ReadGLB(new MemoryStream(glb), settings));
+    }
+
+    // The GPU half: meshes, textures and shaders (draw thread only).
+    public static AnimatedGltfModel Load(Parsed parsed)
+    {
         var m = new AnimatedGltfModel();
-        m.Build(path);
+        m.Build(parsed);
         return m;
     }
 
-    void Build(string path)
+    void Build(Parsed parsed)
     {
-        var settings = new ReadSettings { Validation = SharpGLTF.Validation.ValidationMode.TryFix };
-        _gltf = ModelRoot.Load(path, settings);
-
-        var scene = _gltf.DefaultScene ?? (_gltf.LogicalScenes.Count > 0 ? _gltf.LogicalScenes[0] : null);
-        if (scene == null) throw new InvalidOperationException("glTF has no scene to render.");
-
-        _instance = SceneTemplate.Create(scene).CreateInstance();
+        _gltf = parsed.Gltf;
+        _instance = parsed.Instance;
+        _restPivot = RestNodePosition("PivotCamera_", "dotr_pivot");
+        _restNodeZero = RestNodePosition("Root_node_0", "dotr_world");
 
         AnimationCount = _gltf.LogicalAnimations.Count;
         AnimationNames = new string[AnimationCount];
@@ -155,9 +405,10 @@ public sealed class AnimatedGltfModel : IDisposable
             _byDrawable.Add(bucket);
 
             var mesh = _gltf.LogicalMeshes[d.Template.LogicalMeshIndex]; // SharpGLTF.Schema2.Mesh
+            var skin = _gltf.LogicalNodes.FirstOrDefault(n => n.Mesh == mesh && n.Skin != null)?.Skin;
             foreach (var prim in mesh.Primitives)                        // SharpGLTF.Schema2.MeshPrimitive
             {
-                var r = MakeRenderable(prim);
+                var r = MakeRenderable(prim, skin);
                 if (r == null) continue;
                 bucket.Add(r);
                 _all.Add(r);
@@ -180,13 +431,14 @@ public sealed class AnimatedGltfModel : IDisposable
         });
         if (min.X > max.X) { min = Vector3.Zero; max = Vector3.Zero; }
         _center = (min + max) * 0.5f;
-        Radius = MathF.Max((max - min).Length() * 0.5f, 0.01f);
 
         // ---- Fill bind-pose positions and upload meshes ----
+        _scratchN = new Vector3[maxV];
         EnumerateDrawables((r, xform) =>
         {
             FillUnique(r, xform, _scratch);
             WritePositions(r, _scratch);
+            WriteNormals(r, xform);
         });
         unsafe
         {
@@ -203,11 +455,15 @@ public sealed class AnimatedGltfModel : IDisposable
         _hasAlphaMaskShader = _alphaMaskShader.Id != 0;
         if (_hasAlphaMaskShader)
             _alphaCutoffLoc = Raylib.GetShaderLocation(_alphaMaskShader, "alphaCutoff");
+        if (_all.Any(r => (r.HasUvXform || r.HasMask) && !r.NeedsNormals))
+            _uvShader = UvShaderLocs.Load("#version 330\n" + UvVertexShader, "#version 330\n" + UvFragmentShader);
+        if (_all.Any(r => r.NeedsNormals))
+            _specShader = UvShaderLocs.Load("#version 330\n#define SPEC\n" + UvVertexShader, "#version 330\n#define SPEC\n" + UvFragmentShader);
         _hasDrawMaterial = true;
         unsafe { _whiteTex = _drawMaterial.Maps[(int)MaterialMapIndex.Albedo].Texture; }
     }
 
-    unsafe Renderable MakeRenderable(MeshPrimitive prim)
+    unsafe Renderable MakeRenderable(MeshPrimitive prim, Skin? skin)
     {
         var posAcc = prim.GetVertexAccessor("POSITION");
         if (posAcc == null) return null;
@@ -245,19 +501,6 @@ public sealed class AnimatedGltfModel : IDisposable
         r.LocalPos = new Vector3[V];
         for (int i = 0; i < V; i++) r.LocalPos[i] = positions[i];
 
-        if (joints != null && weights != null && joints.Count == V)
-        {
-            r.Joints = new Vector4[V];
-            r.Weights = new Vector4[V];
-            for (int i = 0; i < V; i++) { r.Joints[i] = joints[i]; r.Weights[i] = weights[i]; }
-            if (joints1 != null && weights1 != null && joints1.Count == V)
-            {
-                r.Joints1 = new Vector4[V];
-                r.Weights1 = new Vector4[V];
-                for (int i = 0; i < V; i++) { r.Joints1[i] = joints1[i]; r.Weights1[i] = weights1[i]; }
-            }
-        }
-
         // Material tint + base color texture.
         if (r.MaterialIndex >= 0 && _materialOwners.TryGetValue(r.MaterialIndex, out Renderable? owner))
         {
@@ -272,11 +515,48 @@ public sealed class AnimatedGltfModel : IDisposable
             r.AnimFrames = owner.AnimFrames;
             r.AnimTimes = owner.AnimTimes;
             r.AnimDuration = owner.AnimDuration;
+            r.HasUvXform = owner.HasUvXform;
+            r.Uv0Scale = owner.Uv0Scale;
+            r.Uv0Offset = owner.Uv0Offset;
+            r.Uv0Track = owner.Uv0Track;
+            r.HasMask = owner.HasMask;
+            r.MaskTexture = owner.MaskTexture;
+            r.Uv1Track = owner.Uv1Track;
+            r.Multiply = owner.Multiply;
+            r.HasSpec = owner.HasSpec;
+            r.SpecTexture = owner.SpecTexture;
+            r.SpecColor = owner.SpecColor;
+            r.SpecShininess = owner.SpecShininess;
+            r.Uv2Track = owner.Uv2Track;
+            r.HasRef = owner.HasRef;
+            r.RefTexture = owner.RefTexture;
+            r.HasLight = owner.HasLight;
+            r.LightAmbient = owner.LightAmbient;
+            r.LightDiffuse = owner.LightDiffuse;
+            r.LightEmission = owner.LightEmission;
         }
         else
         {
             BuildMaterial(prim.Material, r);
             if (r.MaterialIndex >= 0) _materialOwners[r.MaterialIndex] = r;
+        }
+
+        // the specular / reflection / lighting terms need normals; a primitive without them draws without
+        if (r.NeedsNormals)
+        {
+            var nrm = prim.GetVertexAccessor("NORMAL")?.AsVector3Array();
+            if (nrm != null && nrm.Count == V)
+            {
+                r.LocalNrm = new Vector3[V];
+                for (int i = 0; i < V; i++) r.LocalNrm[i] = nrm[i];
+            }
+            else r.HasSpec = r.HasRef = r.HasLight = false;
+        }
+
+        if (skin != null && joints != null && weights != null && joints.Count == V)
+        {
+            if (joints1 == null || weights1 == null || joints1.Count != V) joints1 = weights1 = null;
+            BuildInfluences(r, prim, skin, joints, weights, joints1, weights1);
         }
 
         // Allocate GPU buffers (RL_MALLOC so UnloadMesh frees them) and fill static channels.
@@ -311,6 +591,26 @@ public sealed class AnimatedGltfModel : IDisposable
         r.Mesh.Vertices = r.Pos;
         r.Mesh.TexCoords = uv;
         r.Uv = uv;
+        if (r.NeedsNormals)
+        {
+            r.Nrm = (float*)Raylib.MemAlloc((uint)(gpuVerts * 3 * sizeof(float)));
+            r.Mesh.Normals = r.Nrm;
+        }
+        if (r.NeedsNormals || r.HasMask || r.HasUvXform)
+        {
+            // the custom vertex shader reads vertexTexCoord2; without TEXCOORD_1 it gets set 0
+            var uvs1 = prim.GetVertexAccessor("TEXCOORD_1")?.AsVector2Array();
+            if (uvs1 == null || uvs1.Count != V) uvs1 = uvs;
+            float* uv2 = (float*)Raylib.MemAlloc((uint)(gpuVerts * 2 * sizeof(float)));
+            for (int k = 0; k < gpuVerts; k++)
+            {
+                int vi = r.Indexed ? k : r.Tri[k];
+                Vector2 t = uvs1 != null ? uvs1[vi] : Vector2.Zero;
+                uv2[k * 2 + 0] = t.X; uv2[k * 2 + 1] = t.Y;
+            }
+            r.Mesh.TexCoords2 = uv2;
+            r.Uv2 = uv2;
+        }
         return r;
     }
 
@@ -328,6 +628,7 @@ public sealed class AnimatedGltfModel : IDisposable
             r.Additive = string.Equals(dotrBlend, "additive", StringComparison.OrdinalIgnoreCase);
             r.AlphaBlend = string.Equals(dotrBlend, "alpha", StringComparison.OrdinalIgnoreCase);
             r.AlphaMask = string.Equals(dotrBlend, "mask", StringComparison.OrdinalIgnoreCase);
+            r.Multiply = string.Equals(dotrBlend, "multiply", StringComparison.OrdinalIgnoreCase);
         }
         else
         {
@@ -363,6 +664,10 @@ public sealed class AnimatedGltfModel : IDisposable
             (byte)(Math.Clamp(color.Y, 0f, 1f) * 255f),
             (byte)(Math.Clamp(color.Z, 0f, 1f) * 255f),
             (byte)(Math.Clamp(color.W, 0f, 1f) * 255f));
+        if (IsBlackUntextured(mat))
+        {
+            r.Tint = new Color((byte)0, (byte)0, (byte)0, r.Tint.A);
+        }
 
         try
         {
@@ -372,8 +677,7 @@ public sealed class AnimatedGltfModel : IDisposable
                 var img = ch.Value.Texture.PrimaryImage.Content;
                 if (img.IsValid)
                 {
-                    string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
-                    RlImage cpu = Raylib.LoadImageFromMemory("." + ext, img.Content.ToArray());
+                    RlImage cpu = GlbImporter.DecodeImage(img);
                     if (cpu.Width > 0 && cpu.Height > 0)
                     {
                         if (!hasDotrBlend && (r.AlphaBlend || r.AlphaMask) && !ImageHasAlpha(cpu))
@@ -395,7 +699,112 @@ public sealed class AnimatedGltfModel : IDisposable
         }
         catch { }
 
+        LoadUvAnimation(mat, r);
         LoadTextureAnimation(mat, r);
+    }
+
+    // KHR_texture_transform on the base color (offset/scale; rotation is not used by the DoD
+    // exporter), the "dod_uv_anim" extras tracks and the "dod_modulate" base + mask pair.
+    void LoadUvAnimation(GltfMaterial? mat, Renderable r)
+    {
+        try
+        {
+            var tt = mat?.FindChannel("BaseColor")?.TextureTransform;
+            if (tt != null && (tt.Offset != Vector2.Zero || tt.Scale != Vector2.One))
+            {
+                r.Uv0Offset = tt.Offset;
+                r.Uv0Scale = tt.Scale;
+                r.HasUvXform = true;
+            }
+        }
+        catch { }
+        try
+        {
+            if (mat?.Extras is not JsonObject ex) return;
+            if (ex["dod_uv_anim"] is JsonArray tracks)
+            {
+                foreach (var node in tracks)
+                {
+                    if (node is not JsonObject to) continue;
+                    string? target = to["target"]?.GetValue<string>();
+                    var tr = UvTrack.Parse(to);
+                    if (tr == null) continue;
+                    if (target == "baseColorTexture") { r.Uv0Track = tr; r.HasUvXform = true; }
+                    else if (target == "dod_modulate") r.Uv1Track = tr;
+                    else if (target == "KHR_materials_specular/specularTexture") r.Uv2Track = tr;
+                }
+            }
+            if (ex["dod_modulate"] is JsonObject mod)
+            {
+                // "base" replaces the base color (which has the mask baked in statically, or is the
+                // black/alpha stand-in of a multiply material); "mask" is optional
+                int bi = mod["base"]?.GetValue<int>() ?? -1;
+                int mi = mod["mask"]?.GetValue<int>() ?? -1;
+                Texture2D baseTex = LoadGltfTexture(mat, bi);
+                if (baseTex.Id != 0)
+                {
+                    Texture2D mask = mi >= 0 ? LoadGltfTexture(mat, mi) : default;
+                    if (mi < 0 || mask.Id != 0)
+                    {
+                        if (r.HasTexture && r.Texture.Id != 0) Raylib.UnloadTexture(r.Texture);
+                        r.Texture = baseTex;
+                        r.HasTexture = true;
+                        r.MaskTexture = mask;
+                        r.HasMask = mask.Id != 0;
+                    }
+                    else Raylib.UnloadTexture(baseTex);
+                }
+            }
+            if (ex["dod_specular"] is JsonObject spec && spec["color"] is JsonArray sc && sc.Count >= 3)
+            {
+                var col = new Vector3(sc[0]!.GetValue<float>(), sc[1]!.GetValue<float>(), sc[2]!.GetValue<float>());
+                int si = spec["texture"]?.GetValue<int>() ?? -1;
+                if (col != Vector3.Zero && si >= 0)
+                {
+                    Texture2D st = LoadGltfTexture(mat, si);
+                    if (st.Id != 0)
+                    {
+                        r.SpecTexture = st;
+                        r.SpecColor = col;
+                        r.SpecShininess = MathF.Max(spec["shininess"]?.GetValue<float>() ?? 32f, 1f);
+                        r.HasSpec = true;
+                    }
+                }
+            }
+            if (ex["dod_reflect"] is JsonObject refl)
+            {
+                Texture2D rt = LoadGltfTexture(mat, refl["texture"]?.GetValue<int>() ?? -1);
+                if (rt.Id != 0)
+                {
+                    Raylib.SetTextureWrap(rt, TextureWrap.Clamp);
+                    r.RefTexture = rt;
+                    r.HasRef = true;
+                }
+            }
+            if (ex["dod_light"] is JsonObject li)
+            {
+                static Vector3 V3(JsonNode? n) => n is JsonArray a && a.Count >= 3
+                    ? new Vector3(a[0]!.GetValue<float>(), a[1]!.GetValue<float>(), a[2]!.GetValue<float>()) : Vector3.Zero;
+                r.LightAmbient = V3(li["ambient"]);
+                r.LightDiffuse = V3(li["diffuse"]);
+                r.LightEmission = V3(li["emission"]);
+                r.HasLight = true;
+            }
+        }
+        catch { }
+    }
+
+    Texture2D LoadGltfTexture(GltfMaterial? mat, int textureIndex)
+    {
+        if (textureIndex < 0 || textureIndex >= _gltf.LogicalTextures.Count) return default;
+        var img = _gltf.LogicalTextures[textureIndex].PrimaryImage?.Content;
+        if (img == null || !img.Value.IsValid) return default;
+        RlImage cpu = GlbImporter.DecodeImage(img.Value);
+        if (cpu.Width <= 0 || cpu.Height <= 0) return default;
+        Texture2D t = Raylib.LoadTextureFromImage(cpu);
+        Raylib.UnloadImage(cpu);
+        if (t.Id != 0) ApplySampler(mat, t);
+        return t;
     }
 
     // Applies the material's glTF sampler (written by the extractor from the GS
@@ -457,6 +866,31 @@ public sealed class AnimatedGltfModel : IDisposable
         }
     }
 
+    // An untextured page whose colour row is (0,0,0) draws black in the game (the black plane
+    // under the map's sea). The extractor writes white for a zero row, which is right for a
+    // textured page (booKoo's book) but turned this plane, and the additive sea over it, white.
+    static bool IsBlackUntextured(GltfMaterial? mat)
+    {
+        try
+        {
+            if (mat?.Extras is not JsonObject extras || extras["DOTR_blend"] is not JsonObject blend)
+            {
+                return false;
+            }
+            if (blend["textured"]?.GetValue<bool>() != false)
+            {
+                return false;
+            }
+            return blend["materialColorR"]?.GetValue<int>() == 0 &&
+                   blend["materialColorG"]?.GetValue<int>() == 0 &&
+                   blend["materialColorB"]?.GetValue<int>() == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     static bool TryReadDotrBlendInfo(GltfMaterial? mat, out string? mode, out float alphaCutoff)
     {
         mode = null;
@@ -511,8 +945,7 @@ public sealed class AnimatedGltfModel : IDisposable
 
                 var content = _gltf.LogicalImages[imgIdx].Content;
                 if (!content.IsValid) continue;
-                string ext = string.IsNullOrEmpty(content.FileExtension) ? "png" : content.FileExtension;
-                RlImage cpu = Raylib.LoadImageFromMemory("." + ext, content.Content.ToArray());
+                RlImage cpu = GlbImporter.DecodeImage(content);
                 if (cpu.Width > 0 && cpu.Height > 0)
                 {
                     Texture2D t2d = Raylib.LoadTextureFromImage(cpu);
@@ -564,13 +997,18 @@ public sealed class AnimatedGltfModel : IDisposable
     // Computes world-space positions of all unique vertices into 'outv' (no recenter).
     void FillUnique(Renderable r, object xform, Vector3[] outv)
     {
-        if (xform is SharpGLTF.Transforms.SkinnedTransform st && r.Joints != null)
+        if (xform is SharpGLTF.Transforms.SkinnedTransform st && r.InfStart != null)
         {
-            IReadOnlyList<Matrix4x4> skin = st.SkinMatrices; // already jointWorld * inverseBind
+            SetJointWorld(r, st.SkinMatrices);
             for (int v = 0; v < r.V; v++)
-                outv[v] = Vector3.Transform(r.LocalPos[v], r.Joints1 == null
-                    ? Blend(skin, r.Joints[v], r.Weights[v])
-                    : Blend(skin, r.Joints[v], r.Weights[v], r.Joints1[v], r.Weights1![v]));
+            {
+                int s = r.InfStart[v], e = r.InfStart[v + 1];
+                if (s == e) { outv[v] = r.LocalPos[v]; continue; }
+                Vector3 p = default;
+                for (int k = s; k < e; k++)
+                    p += r.InfWeight[k] * Vector3.Transform(r.InfPos[k], r.JointWorld[r.InfJoint[k]]);
+                outv[v] = p;
+            }
         }
         else if (xform is SharpGLTF.Transforms.RigidTransform rt)
         {
@@ -584,38 +1022,138 @@ public sealed class AnimatedGltfModel : IDisposable
         }
     }
 
-    static Matrix4x4 Blend(IReadOnlyList<Matrix4x4> skin, Vector4 j, Vector4 w)
+    // Each skin joint's world matrix this frame: SkinMatrices are inverseBind * jointWorld.
+    static void SetJointWorld(Renderable r, IReadOnlyList<Matrix4x4> skin)
     {
-        Matrix4x4 m = default; // all zeros
-        m = Add(m, skin, (int)j.X, w.X);
-        m = Add(m, skin, (int)j.Y, w.Y);
-        m = Add(m, skin, (int)j.Z, w.Z);
-        m = Add(m, skin, (int)j.W, w.W);
-        float tw = w.X + w.Y + w.Z + w.W;
-        if (tw < 1e-5f) return Matrix4x4.Identity; // avoid collapsing unweighted verts
-        return m;
+        int n = Math.Min(r.JointWorld.Length, skin.Count);
+        for (int j = 0; j < n; j++) r.JointWorld[j] = r.IbmInv[j] * skin[j];
     }
 
-    static Matrix4x4 Blend(IReadOnlyList<Matrix4x4> skin, Vector4 j, Vector4 w, Vector4 j1, Vector4 w1)
+    // The influences FillUnique sums. A vertex whose ModelExtractor copies (GlbImporter.GameAccessors)
+    // still describe it, by the importer's rule, uses them as stored (weight raw/4096, normal
+    // raw/32767, zero weights left out). Any other vertex (a converted import, or one moved or
+    // reweighted outside the app) gets one copy per JOINTS/WEIGHTS influence from POSITION and
+    // NORMAL, which skins exactly as the glTF blended matrix would; none when its weights sum to
+    // ~0 (drawn where it is).
+    static void BuildInfluences(Renderable r, MeshPrimitive prim, Skin skin, IList<Vector4> joints,
+        IList<Vector4> weights, IList<Vector4>? joints1, IList<Vector4>? weights1)
     {
-        Matrix4x4 m = default; // all zeros
-        m = Add(m, skin, (int)j.X, w.X);
-        m = Add(m, skin, (int)j.Y, w.Y);
-        m = Add(m, skin, (int)j.Z, w.Z);
-        m = Add(m, skin, (int)j.W, w.W);
-        m = Add(m, skin, (int)j1.X, w1.X);
-        m = Add(m, skin, (int)j1.Y, w1.Y);
-        m = Add(m, skin, (int)j1.Z, w1.Z);
-        m = Add(m, skin, (int)j1.W, w1.W);
-        float tw = w.X + w.Y + w.Z + w.W + w1.X + w1.Y + w1.Z + w1.W;
-        if (tw < 1e-5f) return Matrix4x4.Identity; // avoid collapsing unweighted verts
-        return m;
+        int jc = skin.JointsCount;
+        var ibm = new Matrix4x4[jc];
+        r.IbmInv = new Matrix4x4[jc];
+        r.JointWorld = new Matrix4x4[jc];
+        for (int j = 0; j < jc; j++)
+        {
+            ibm[j] = skin.GetJoint(j).InverseBindMatrix;
+            if (!Matrix4x4.Invert(ibm[j], out r.IbmInv[j])) r.IbmInv[j] = Matrix4x4.Identity;
+        }
+        var game = GlbImporter.GameAccessors(prim);
+        bool nrm = r.LocalNrm != null;
+        var ij = new List<int>(r.V * 2);
+        var iw = new List<float>(r.V * 2);
+        var ip = new List<Vector3>(r.V * 2);
+        var inn = new List<Vector3>(nrm ? r.V * 2 : 0);
+        var gameW = new Dictionary<int, float>();
+        var glbW = new Dictionary<int, float>();
+        r.InfStart = new int[r.V + 1];
+        for (int v = 0; v < r.V; v++)
+        {
+            r.InfStart[v] = ij.Count;
+            Vector4 j0 = joints[v], w0 = weights[v];
+            Vector4 j1 = joints1?[v] ?? default, w1 = weights1?[v] ?? default;
+            if (game != null && game.Jw[0][v].X >= 0)
+            {
+                gameW.Clear();
+                glbW.Clear();
+                int wsum = 0;
+                bool ok = true;
+                for (int k = 0; k < game.Jw.Length && game.Jw[k][v].X >= 0; k++)
+                {
+                    int j = (int)game.Jw[k][v].X;
+                    if (j >= jc) { ok = false; break; }
+                    short w = (short)game.Jw[k][v].Y;
+                    if (w <= 0) continue;
+                    gameW[j] = gameW.GetValueOrDefault(j) + w;
+                    wsum += w;
+                }
+                void Glb(float j, float w)
+                {
+                    if (w > 0f && j >= 0 && j < jc) glbW[(int)j] = glbW.GetValueOrDefault((int)j) + w;
+                }
+                Glb(j0.X, w0.X); Glb(j0.Y, w0.Y); Glb(j0.Z, w0.Z); Glb(j0.W, w0.W);
+                Glb(j1.X, w1.X); Glb(j1.Y, w1.Y); Glb(j1.Z, w1.Z); Glb(j1.W, w1.W);
+                ok = ok && GlbImporter.GameWeightsMatch(gameW, wsum, glbW)
+                    && GlbImporter.GameRefPosMatches(Vector3.Transform(r.LocalPos[v], ibm[(int)game.Jw[0][v].X]), game.RefPos[v]);
+                if (ok)
+                {
+                    for (int k = 0; k < game.Jw.Length && game.Jw[k][v].X >= 0; k++)
+                    {
+                        float w = game.Jw[k][v].Y;
+                        if (w == 0f) continue;
+                        ij.Add((int)game.Jw[k][v].X);
+                        iw.Add(w / 4096f);
+                        ip.Add(game.Pos[k][v]);
+                        if (nrm) inn.Add(game.Nrm[k][v] / 32767f);
+                    }
+                    continue;
+                }
+            }
+            if (w0.X + w0.Y + w0.Z + w0.W + w1.X + w1.Y + w1.Z + w1.W < 1e-5f) continue;
+            void Derived(float j, float w)
+            {
+                if (w == 0f || j < 0 || j >= jc) return;
+                ij.Add((int)j);
+                iw.Add(w);
+                ip.Add(Vector3.Transform(r.LocalPos[v], ibm[(int)j]));
+                if (nrm) inn.Add(Vector3.TransformNormal(r.LocalNrm![v], ibm[(int)j]));
+            }
+            Derived(j0.X, w0.X); Derived(j0.Y, w0.Y); Derived(j0.Z, w0.Z); Derived(j0.W, w0.W);
+            Derived(j1.X, w1.X); Derived(j1.Y, w1.Y); Derived(j1.Z, w1.Z); Derived(j1.W, w1.W);
+        }
+        r.InfStart[r.V] = ij.Count;
+        r.InfJoint = ij.ToArray();
+        r.InfWeight = iw.ToArray();
+        r.InfPos = ip.ToArray();
+        r.InfNrm = nrm ? inn.ToArray() : null;
     }
 
-    static Matrix4x4 Add(Matrix4x4 m, IReadOnlyList<Matrix4x4> skin, int idx, float wt)
+    // Skinned normals for the specular term (the same influences as FillUnique). Returns false
+    // for renderables that carry no normals.
+    unsafe bool WriteNormals(Renderable r, object xform)
     {
-        if (wt == 0f || idx < 0 || idx >= skin.Count) return m;
-        return m + Matrix4x4.Multiply(skin[idx], wt);
+        if (r.LocalNrm == null || r.Nrm == null) return false;
+        var outn = _scratchN;
+        if (xform is SharpGLTF.Transforms.SkinnedTransform st && r.InfStart != null)
+        {
+            SetJointWorld(r, st.SkinMatrices);
+            for (int v = 0; v < r.V; v++)
+            {
+                int s = r.InfStart[v], e = r.InfStart[v + 1];
+                if (s == e) { outn[v] = r.LocalNrm[v]; continue; }
+                Vector3 n = default;
+                for (int k = s; k < e; k++)
+                    n += r.InfWeight[k] * Vector3.TransformNormal(r.InfNrm![k], r.JointWorld[r.InfJoint[k]]);
+                outn[v] = n;
+            }
+        }
+        else if (xform is SharpGLTF.Transforms.RigidTransform rt)
+        {
+            Matrix4x4 m = rt.WorldMatrix;
+            for (int v = 0; v < r.V; v++) outn[v] = Vector3.TransformNormal(r.LocalNrm[v], m);
+        }
+        else
+        {
+            for (int v = 0; v < r.V; v++) outn[v] = r.LocalNrm[v];
+        }
+        int count = r.Indexed ? r.V : r.Tri.Length;
+        for (int k = 0; k < count; k++)
+        {
+            Vector3 n = outn[r.Indexed ? k : r.Tri[k]];
+            float len = n.Length();
+            if (len > 1e-8f) n /= len;
+            r.Nrm[k * 3 + 0] = n.X; r.Nrm[k * 3 + 1] = n.Y; r.Nrm[k * 3 + 2] = n.Z;
+        }
+        return true;
     }
 
     unsafe void WritePositions(Renderable r, Vector3[] world)
@@ -638,6 +1176,137 @@ public sealed class AnimatedGltfModel : IDisposable
         }
     }
 
+    /// <summary>Over up to 16 evenly spaced frames of an animation (animIndex &lt; 0: the bind
+    /// pose), the lowest point, the tallest single frame and the X extent over all frames, in the
+    /// glb's own units (not recentred), the way the converter measures a model. CPU only; the
+    /// armature is left at the last sampled frame, so set the frame again before drawing.</summary>
+    public void MeasureStanding(int animIndex, out float lowest, out float height, out float left, out float right,
+        out float back, out float front)
+    {
+        lowest = 0f;
+        height = 0f;
+        left = 0f;
+        right = 0f;
+        back = 0f;
+        front = 0f;
+        if (_instance == null) return;
+        int frames = 1;
+        float duration = 0f;
+        if (animIndex >= 0 && animIndex < AnimationCount)
+        {
+            duration = _durations[animIndex];
+            frames = 16;
+        }
+        bool first = true;
+        for (int f = 0; f < frames; f++)
+        {
+            if (animIndex >= 0 && animIndex < AnimationCount)
+            {
+                float t = 0f;
+                if (frames > 1)
+                {
+                    t = duration * f / (frames - 1);
+                }
+                _instance.Armature.SetAnimationFrame(animIndex, t);
+            }
+            else
+            {
+                _instance.Armature.SetPoseTransforms();
+            }
+            float lo = float.MaxValue;
+            float hi = float.MinValue;
+            float xlo = float.MaxValue;
+            float xhi = float.MinValue;
+            float zlo = float.MaxValue;
+            float zhi = float.MinValue;
+            EnumerateDrawables((r, xform) =>
+            {
+                FillUnique(r, xform, _scratch);
+                for (int v = 0; v < r.V; v++)
+                {
+                    lo = MathF.Min(lo, _scratch[v].Y);
+                    hi = MathF.Max(hi, _scratch[v].Y);
+                    xlo = MathF.Min(xlo, _scratch[v].X);
+                    xhi = MathF.Max(xhi, _scratch[v].X);
+                    zlo = MathF.Min(zlo, _scratch[v].Z);
+                    zhi = MathF.Max(zhi, _scratch[v].Z);
+                }
+            });
+            if (lo > hi)
+            {
+                continue;
+            }
+            if (first || xlo < left)
+            {
+                left = xlo;
+            }
+            if (first || xhi > right)
+            {
+                right = xhi;
+            }
+            if (first || zlo < back)
+            {
+                back = zlo;
+            }
+            if (first || zhi > front)
+            {
+                front = zhi;
+            }
+            if (first || lo < lowest)
+            {
+                lowest = lo;
+            }
+            if (first || hi - lo > height)
+            {
+                height = hi - lo;
+            }
+            first = false;
+        }
+    }
+
+    /// <summary>Where node 1 (the game's scale pivot) is in the REST pose: the extractor's
+    /// "PivotCamera_" node or the converter's "dotr_pivot"; the origin when there is none. The
+    /// game's board deform pivots on node 1's rest offset (SzModel_DrawWithFunc_Pipe reads it
+    /// from the block's node tree, which the motion never writes), not on the animated node.
+    /// Both kinds of glb have it at the origin; read once at load.</summary>
+    public Vector3 RestPivot => _restPivot;
+
+    /// <summary>Where node 0 (the game's standing point) is in the rest pose: the extractor's
+    /// "Root_node_0" or the converter's "dotr_world"; the origin when there is none. Not always
+    /// the origin: an extracted block's MrgRoot moves node 1 to the origin, so node 0 sits at
+    /// -node 1's rest offset (Blue-Eyes: 9.2 up, 33.4 forward).</summary>
+    public Vector3 RestNodeZero => _restNodeZero;
+
+    Vector3 RestNodePosition(string extractedPrefix, string convertedName)
+    {
+        foreach (var n in _gltf.LogicalNodes)
+        {
+            if (IsNode(n.Name, extractedPrefix, convertedName))
+                return n.WorldMatrix.Translation;
+        }
+        return Vector3.Zero;
+    }
+
+    static bool IsNode(string? name, string extractedPrefix, string convertedName)
+    {
+        name ??= string.Empty;
+        return name.StartsWith(extractedPrefix, StringComparison.Ordinal) || name == convertedName;
+    }
+
+    /// <summary>Where node 1 is in the pose last set (SetAnimationFrame): the point the game's
+    /// board focus and follow cameras aim at (SzModel_GetCenter, node 1's live transform). The
+    /// origin when there is none.</summary>
+    public Vector3 PivotNow()
+    {
+        if (_instance == null) return Vector3.Zero;
+        foreach (var n in _instance.Armature.LogicalNodes)
+        {
+            if (IsNode(n.Name, "PivotCamera_", "dotr_pivot"))
+                return n.ModelMatrix.Translation;
+        }
+        return Vector3.Zero;
+    }
+
     /// <summary>Evaluate animation at the given time (seconds) and push deformed
     /// positions to the GPU. animIndex &lt; 0 => static bind pose.</summary>
     public void SetAnimationFrame(int animIndex, float timeSeconds)
@@ -657,6 +1326,8 @@ public sealed class AnimatedGltfModel : IDisposable
             {
                 int gpuVerts = r.Indexed ? r.V : r.TriCount * 3;
                 Raylib.UpdateMeshBuffer(r.Mesh, 0, r.Pos, gpuVerts * 3 * sizeof(float), 0); // VBO 0 = positions
+                if (WriteNormals(r, xform))
+                    Raylib.UpdateMeshBuffer(r.Mesh, 2, r.Nrm, gpuVerts * 3 * sizeof(float), 0); // VBO 2 = normals
             }
         });
     }
@@ -670,7 +1341,7 @@ public sealed class AnimatedGltfModel : IDisposable
         // Pass 1: explicitly opaque geometry only (writes depth).
         foreach (var r in _all)
         {
-            if (r.Additive || r.AlphaBlend || r.AlphaMask) continue;
+            if (r.Additive || r.AlphaBlend || r.AlphaMask || r.Multiply) continue;
             DrawOne(r);
         }
 
@@ -706,8 +1377,9 @@ public sealed class AnimatedGltfModel : IDisposable
         Rlgl.DisableDepthMask();
         foreach (var r in _all)
         {
-            if (!(r.Additive || r.AlphaBlend)) continue;
-            Raylib.BeginBlendMode(r.Additive ? BlendMode.Additive : BlendMode.Alpha);
+            if (!(r.Additive || r.AlphaBlend || r.Multiply)) continue;
+            // multiplied = DST_COLOR, ONE_MINUS_SRC_ALPHA: exactly dst * src with the base's alpha 1
+            Raylib.BeginBlendMode(r.Additive ? BlendMode.Additive : r.Multiply ? BlendMode.Multiplied : BlendMode.Alpha);
             DrawOne(r);
             Raylib.EndBlendMode();
         }
@@ -722,7 +1394,62 @@ public sealed class AnimatedGltfModel : IDisposable
         _drawMaterial.Maps[albedo].Color = r.Tint;
         Texture2D tex = r.HasAnim ? CurrentAnimFrame(r) : (r.HasTexture ? r.Texture : _whiteTex);
         _drawMaterial.Maps[albedo].Texture = tex;
+        var uvs = r.NeedsNormals ? _specShader : (r.HasUvXform || r.HasMask) ? _uvShader : null;
+        if (uvs != null)
+        {
+            DrawUv(r, uvs);
+            return;
+        }
         Raylib.DrawMesh(r.Mesh, _drawMaterial, Matrix4x4.Identity);
+    }
+
+    // Draws with the UV/modulate shader, keeping the current pass's blend state; inside the
+    // alpha-mask pass the shader does the alpha test itself.
+    unsafe void DrawUv(Renderable r, UvShaderLocs u)
+    {
+        var prev = _drawMaterial.Shader;
+        bool maskPass = _hasAlphaMaskShader && prev.Id == _alphaMaskShader.Id;
+        var sh = u.Shader;
+        _drawMaterial.Shader = sh;
+        Vector4 x0 = r.Uv0Track?.Eval(TexAnimTime) ?? new Vector4(r.Uv0Scale.X, r.Uv0Scale.Y, r.Uv0Offset.X, r.Uv0Offset.Y);
+        Vector4 x1 = r.Uv1Track?.Eval(TexAnimTime) ?? new Vector4(1, 1, 0, 0);
+        Raylib.SetShaderValue(sh, u.Xform0, x0, ShaderUniformDataType.Vec4);
+        Raylib.SetShaderValue(sh, u.Xform1, x1, ShaderUniformDataType.Vec4);
+        Raylib.SetShaderValue(sh, u.UseMask, r.HasMask ? 1 : 0, ShaderUniformDataType.Int);
+        Raylib.SetShaderValue(sh, u.AlphaCutoff, maskPass ? r.AlphaCutoff : -1f, ShaderUniformDataType.Float);
+        int maskMap = (int)MaterialMapIndex.Metalness; // bound to "texture1"
+        int specMap = (int)MaterialMapIndex.Normal;    // bound to "texture2"
+        int refMap = (int)MaterialMapIndex.Roughness;  // bound to "texture3"
+        var prevMask = _drawMaterial.Maps[maskMap].Texture;
+        var prevSpec = _drawMaterial.Maps[specMap].Texture;
+        var prevRef = _drawMaterial.Maps[refMap].Texture;
+        if (r.NeedsNormals)
+        {
+            Raylib.SetShaderValue(sh, u.UseSpec, r.HasSpec ? 1 : 0, ShaderUniformDataType.Int);
+            Raylib.SetShaderValue(sh, u.UseRef, r.HasRef ? 1 : 0, ShaderUniformDataType.Int);
+            Raylib.SetShaderValue(sh, u.UseLight, r.HasLight ? 1 : 0, ShaderUniformDataType.Int);
+            Raylib.SetShaderValue(sh, u.MatAmbient, r.LightAmbient, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.MatDiffuse, r.LightDiffuse, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.MatEmission, r.LightEmission, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.LightDir, DodLightDir, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.LightColor, DodLightColor, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.LightAmbient, DodAmbientColor, ShaderUniformDataType.Vec3);
+            if (r.HasRef) _drawMaterial.Maps[refMap].Texture = r.RefTexture;
+        }
+        if (r.HasMask) _drawMaterial.Maps[maskMap].Texture = r.MaskTexture;
+        if (r.HasSpec)
+        {
+            Vector4 x2 = r.Uv2Track?.Eval(TexAnimTime) ?? new Vector4(1, 1, 0, 0);
+            Raylib.SetShaderValue(sh, u.Xform2, x2, ShaderUniformDataType.Vec4);
+            Raylib.SetShaderValue(sh, u.SpecColor, r.SpecColor, ShaderUniformDataType.Vec3);
+            Raylib.SetShaderValue(sh, u.Shininess, r.SpecShininess, ShaderUniformDataType.Float);
+            _drawMaterial.Maps[specMap].Texture = r.SpecTexture;
+        }
+        Raylib.DrawMesh(r.Mesh, _drawMaterial, Matrix4x4.Identity);
+        _drawMaterial.Maps[maskMap].Texture = prevMask;
+        _drawMaterial.Maps[specMap].Texture = prevSpec;
+        _drawMaterial.Maps[refMap].Texture = prevRef;
+        _drawMaterial.Shader = prev;
     }
 
     // Texture-animation playback clock (seconds). The viewer advances it at the
@@ -769,8 +1496,14 @@ public sealed class AnimatedGltfModel : IDisposable
                 {
                     if (unloaded.Add(r.Texture.Id)) Raylib.UnloadTexture(r.Texture);
                 }
+                if (r.HasMask && unloaded.Add(r.MaskTexture.Id)) Raylib.UnloadTexture(r.MaskTexture);
+                if (r.HasSpec && unloaded.Add(r.SpecTexture.Id)) Raylib.UnloadTexture(r.SpecTexture);
+                if (r.HasRef && unloaded.Add(r.RefTexture.Id)) Raylib.UnloadTexture(r.RefTexture);
             }
         }
+        if (_uvShader != null) Raylib.UnloadShader(_uvShader.Shader);
+        if (_specShader != null) Raylib.UnloadShader(_specShader.Shader);
+        _uvShader = _specShader = null;
         if (_hasAlphaMaskShader)
         {
             Raylib.UnloadShader(_alphaMaskShader);

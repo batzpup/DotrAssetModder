@@ -87,6 +87,8 @@ public struct EncBoneBind
 public sealed class EncPage
 {
     public bool IsAlt;
+    public byte GsAlpha = 0x44;         // ALPHA_1 low byte: 0x44 normal, 0x48 additive, 0x42 subtract
+    public uint GsTest;                 // TEST_1 (0: 0x7000C main / 0x7000D alt)
     public (float R, float G, float B) Color = (178, 178, 178); // retail-neutral +0x20 row
     public float Alpha = 128f;          // 0..128
     public (int R, int G, int B) Color0 = (127, 127, 127); // material record +0x10
@@ -183,6 +185,8 @@ public static class GeometryWriter
         // Sticky state across pages: texture-context record on texture change, material
         // record on colour/alpha change (matches retail page streams).
         int lastTex = -1;
+        byte lastGsAlpha = 0x44;
+        uint lastGsTest = 0;
         (int R, int G, int B, float A, (int, int, int) C0, (int, int, int) C2) lastMat = (-1, -1, -1, -1, (-1, -1, -1), (-1, -1, -1));
         var lastBinds = new List<(int VuAddr, int Slot, uint VifEcho)>(); // sticky bind state
         uint secTag = isAlt ? 0x40000000u : 0x20000000u;
@@ -198,11 +202,14 @@ public static class GeometryWriter
             page.PktSize = packed + pad;
 
             // --- Section1: texture record (on change) + material (on change) + binds + terminator ---
-            if (page.TexIdx != lastTex)
+            // the record also carries ALPHA_1, so a blend change needs one as well
+            if (page.TexIdx != lastTex || page.GsAlpha != lastGsAlpha || page.GsTest != lastGsTest)
             {
                 texDispatch.Add((page.TexIdx, secTag | (uint)(((int)sec1.Length + 0x70) & 0x0FFFFFFF)));
-                WriteTexRecord(sec1, isAlt);
+                WriteTexRecord(sec1, isAlt, page.GsAlpha, page.GsTest);
                 lastTex = page.TexIdx;
+                lastGsAlpha = page.GsAlpha;
+                lastGsTest = page.GsTest;
             }
             int curR = (int)MathF.Round(page.Color.R);
             int curG = (int)MathF.Round(page.Color.G);
@@ -339,16 +346,16 @@ public static class GeometryWriter
     /// ALPHA_1=0x80_00000044, then placeholder TEX0_1 (=0) and TEX1_1 (=0x60) qwords at
     /// +0x70/+0x80 — the +0x70 qword pair is stamped per frame by lRhModel_SetupTexture
     /// with the active texture's registers from its RH2 header (+0x30).
-    private static void WriteTexRecord(MemoryStream s, bool isAlt)
+    private static void WriteTexRecord(MemoryStream s, bool isAlt, byte gsAlpha = 0x44, uint gsTest = 0)
     {
         WriteU32(s, 0x10000008); WriteU32(s, 0x00000000); WriteU32(s, 0x11000000); WriteU32(s, 0x51000008);
         WriteU32(s, 0x00008007); WriteU32(s, 0x10000000); WriteU32(s, 0x0000000E); WriteU32(s, 0x00000000);
         WriteU32(s, 0x00000005); WriteU32(s, 0x00000000); WriteU32(s, 0x00000008); WriteU32(s, 0x00000000); // CLAMP_1
         WriteU32(s, 0x00000000); WriteU32(s, 0x00000000); WriteU32(s, 0x00000034); WriteU32(s, 0x00000000); // MIPTBP1_1
         WriteU32(s, 0x00000000); WriteU32(s, 0x00000000); WriteU32(s, 0x00000036); WriteU32(s, 0x00000000); // MIPTBP2_1
-        WriteU32(s, isAlt ? 0x0007000Du : 0x0007000Cu);
+        WriteU32(s, gsTest != 0 ? gsTest : isAlt ? 0x0007000Du : 0x0007000Cu);
         WriteU32(s, 0x00000000); WriteU32(s, 0x00000047); WriteU32(s, 0x00000000);                          // TEST_1
-        WriteU32(s, 0x00000044); WriteU32(s, 0x00000080); WriteU32(s, 0x00000042); WriteU32(s, 0x00000000); // ALPHA_1
+        WriteU32(s, gsAlpha); WriteU32(s, 0x00000080); WriteU32(s, 0x00000042); WriteU32(s, 0x00000000); // ALPHA_1 (FIX 0x80; 0x44/0x48/0x42 as retail)
         WriteU32(s, 0x00000000); WriteU32(s, 0x00000000); WriteU32(s, 0x00000006); WriteU32(s, 0x00000000); // TEX0_1 (stamped)
         WriteU32(s, 0x00000060); WriteU32(s, 0x00000000); WriteU32(s, 0x00000014); WriteU32(s, 0x00000000); // TEX1_1 (stamped)
     }

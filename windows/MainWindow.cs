@@ -64,6 +64,21 @@ public class MainWindow
                     }
 
                 }
+                else if (ext is ".fbx" or ".dae")
+                {
+                    // Converted to a glb first, by the importer and by the viewer.
+                    if (current_window == Windows.ModelImporter)
+                    {
+                        if (FileLoader.Instance.IsIsoLoaded)
+                        {
+                            import_window.SetupModel(files[0]);
+                        }
+                    }
+                    else if (current_window == Windows.ModelView)
+                    {
+                        model_window.LoadModel(files[0]);
+                    }
+                }
 
             }
         }
@@ -72,7 +87,9 @@ public class MainWindow
         ImGui.SetNextWindowSize(glRD.cur_win_dims);
         ImGui.SetNextWindowPos(Vector2.Zero);
 
-        ImGui.Begin("DOTR Asset Extractor", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoCollapse);
+        // NoBringToFrontOnFocus: the full-screen main window stays behind floating windows (the
+        // importer's preview), so clicking it never buries them
+        ImGui.Begin("DOTR Asset Extractor", ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoMove | ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.NoBringToFrontOnFocus);
 
 
 

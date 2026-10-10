@@ -135,7 +135,14 @@ static class ModelExtractor
         return slots;
     }
 
-    private static void ExtractSingle(byte[] data, string outDir, string slotName)
+    // internal: the Pack Models tab extracts one MODEL.MRG block to show it in the viewer
+    internal static void ExtractSingle(byte[] data, string outDir, string slotName)
+    {
+        File.WriteAllBytes(Path.Combine(outDir, slotName + ".glb"), ExtractGlb(data));
+    }
+
+    // One RH0 block as glb bytes, for the viewer and the importer preview (no file).
+    internal static byte[] ExtractGlb(byte[] data)
     {
         var hdr = new Rh0HeaderFull(data);
         var (nodes, mslotMap) = WalkGNodes(data, (int)hdr.NodeTree);
@@ -257,8 +264,7 @@ static class ModelExtractor
             if (postOffsets[ti] != 0)
                 try { texAnimRecords[ti] = TexAnimRecords(data, (int)postOffsets[ti]); }
                 catch { }
-        string outPath = Path.Combine(outDir, slotName + ".glb");
-        WriteGlb(outPath, nodes, mslotMap, built, bind, textures, texHasAlpha, animations, hdr.AnimTransScale,
+        return BuildGlb(nodes, mslotMap, built, bind, textures, texHasAlpha, animations, hdr.AnimTransScale,
             (int)hdr.NodeTreeSize, texAnims, texAnimRecords);
     }
 
@@ -497,6 +503,25 @@ static class ModelExtractor
         // wherever the group moves rigidly.
         var cur = new Dictionary<int, Matrix4x4>(bind);
         Matrix4x4 B(int m) => cur[m];
+
+        // Error() runs thousands of times per card over the same samples, so each sampled slot
+        // matrix and each vertex's game position per sample is computed once.
+        var slotMats = new Dictionary<int, Matrix4x4[]>();
+        foreach (var n in slotted)
+        {
+            if (slotMats.ContainsKey(n.Mslot))
+            {
+                continue;
+            }
+            var mats = new Matrix4x4[samples.Count];
+            for (int k = 0; k < samples.Count; k++)
+            {
+                mats[k] = samples[k].SlotMatrix(slotNode[n.Mslot]);
+            }
+            slotMats[n.Mslot] = mats;
+        }
+        var gamePos = new Dictionary<(int Slot, float W, Vector3 P)[], Vector3[]>(ReferenceEqualityComparer.Instance);
+
         float Error((int Slot, float W, Vector3 P)[] inf)
         {
             var x = Vector3.Zero;
@@ -508,17 +533,34 @@ static class ModelExtractor
                 local[i] = M.Apply(inv, x.X, x.Y, x.Z);
                 if (!float.IsFinite(local[i].X + local[i].Y + local[i].Z)) return float.PositiveInfinity;
             }
-            float err = 0;
-            foreach (var pose in samples)
+            var mats = new Matrix4x4[inf.Length][];
+            for (int i = 0; i < inf.Length; i++)
             {
-                Vector3 glb = Vector3.Zero, game = Vector3.Zero;
+                mats[i] = slotMats[inf[i].Slot];
+            }
+            if (!gamePos.TryGetValue(inf, out var game))
+            {
+                game = new Vector3[samples.Count];
+                for (int k = 0; k < samples.Count; k++)
+                {
+                    Vector3 g = Vector3.Zero;
+                    for (int i = 0; i < inf.Length; i++)
+                    {
+                        g += inf[i].W * M.Apply(mats[i][k], inf[i].P.X, inf[i].P.Y, inf[i].P.Z);
+                    }
+                    game[k] = g;
+                }
+                gamePos[inf] = game;
+            }
+            float err = 0;
+            for (int k = 0; k < samples.Count; k++)
+            {
+                Vector3 glb = Vector3.Zero;
                 for (int i = 0; i < inf.Length; i++)
                 {
-                    var S = pose.SlotMatrix(slotNode[inf[i].Slot]);
-                    glb += inf[i].W * M.Apply(S, local[i].X, local[i].Y, local[i].Z);
-                    game += inf[i].W * M.Apply(S, inf[i].P.X, inf[i].P.Y, inf[i].P.Z);
+                    glb += inf[i].W * M.Apply(mats[i][k], local[i].X, local[i].Y, local[i].Z);
                 }
-                err += (glb - game).Length();
+                err += (glb - game[k]).Length();
             }
             return err;
         }
@@ -956,6 +998,10 @@ static class ModelExtractor
         ulong curGsTest = state.GsTest;
         ulong curGsClamp = state.GsClamp;
         int curPos = 0;
+        // The state and colour blocks are scanned between consecutive pages, so the pages must be
+        // visited in chain order. Retail's walk list is ascending; an imported block's follows its
+        // texture dispatch order (Kryuel's untextured page came after tex2's and took its colours).
+        walkOffsets = walkOffsets.OrderBy(o => o).ToList();
         for (int wi = 0; wi < walkOffsets.Count; wi++)
         {
             int walkOff = walkOffsets[wi];
@@ -1396,6 +1442,9 @@ static class ModelExtractor
                         bm.VertJoints.Add(jointIdx >= 0
                             ? new List<(int, float)> { (jointIdx, 1.0f) }
                             : new List<(int, float)>());
+                        bm.VertGame.Add(jointIdx >= 0
+                            ? new List<StripWeight> { new StripWeight(jointIdx, 4096, v.Pos, v.Nrm) }
+                            : new List<StripWeight>());
                     }
                 }
                 else
@@ -1407,12 +1456,17 @@ static class ModelExtractor
                         var jlist = new List<(int Joint, float W)>();
                         var infl = new List<(int Slot, float W, Vector3 P)>();
                         var inrm = new List<Vector3>();
+                        var game = new List<StripWeight>();
                         if (v.Weights != null)
                         {
                             foreach (var wt in v.Weights)
                             {
                                 int mslot = pkt.BoneMap.TryGetValue(wt.Bone, out var ms) ? ms : 0;
-                                if (!bind.TryGetValue(mslot, out var bone)) continue;
+                                if (!bind.TryGetValue(mslot, out var bone))
+                                {
+                                    game.Add(new StripWeight(-1, wt.W, wt.Pos, wt.Nrm));
+                                    continue;
+                                }
                                 var p = M.Apply(bone, wt.Pos.X, wt.Pos.Y, wt.Pos.Z);
                                 float ww = wt.W;
                                 wx += p.X * ww;
@@ -1426,6 +1480,7 @@ static class ModelExtractor
                                 wsum += ww;
                                 int jidx = bm.MslotToJoint.TryGetValue(mslot, out var ji) ? ji : -1;
                                 if (jidx >= 0) jlist.Add((jidx, ww));
+                                game.Add(new StripWeight(jidx, wt.W, wt.Pos, wt.Nrm));
                                 infl.Add((mslot, ww, new Vector3(wt.Pos.X, wt.Pos.Y, wt.Pos.Z)));
                                 inrm.Add(new Vector3(wt.Nrm.X, wt.Nrm.Y, wt.Nrm.Z));
                             }
@@ -1444,6 +1499,9 @@ static class ModelExtractor
                         bm.Normals.Add(NSafe(fit.Normal(infl, inrm, NSafe(new Vector3(nx, ny, nz)))));
                         bm.Uvs.Add(new Vector2(v.Uv.U / 4096f, v.Uv.V / 4096f));
                         bm.VertJoints.Add(jlist);
+                        // an influence on a slot with no joint cannot be written back as it was
+                        if (game.Any(g => g.Bone < 0)) game.Clear();
+                        bm.VertGame.Add(game);
                     }
                 }
 
@@ -1489,7 +1547,29 @@ static class ModelExtractor
         return bm;
     }
 
-    private static void WriteGlb(string outPath,
+    // What a node does, by its DFS index and matrix slot. Node 1 is the model centre: every
+    // draw books coordinate 1 (SzModel_DrawWithFunc_Pipe -> BookingGetAnyCoordinate(1)) and
+    // stores that node's world position as the centre SzModel_GetCenter returns (Model +0x80),
+    // and it is the scale / SetRotC pivot of the instance matrix. A node with a matrix slot
+    // is a skin bone; the rest only carry transforms down to their children.
+    private static string ReadableNodeName(int idx, int mslot)
+    {
+        if (idx == 0)
+        {
+            return "Root";
+        }
+        if (idx == 1)
+        {
+            return "PivotCamera";
+        }
+        if (mslot != 0)
+        {
+            return "Bone";
+        }
+        return "Group";
+    }
+
+    private static byte[] BuildGlb(
         List<GNode> nodes,
         Dictionary<int, GNode> mslotMap,
         BuiltMesh built,
@@ -1511,7 +1591,8 @@ static class ModelExtractor
         // range) lets you see in Blender which nodes effects can lock onto. Names are
         // descriptive only — the importer matches nodes by tree position, not by name (it
         // special-cases just "MrgRoot" and the "_bone" scale children), so this is
-        // round-trip-safe.
+        // round-trip-safe. A readable word goes first (ReadableNodeName); the _f and _m
+        // suffixes the importer reads stay at the end.
         int refBoneNum = nodeTreeSize >> 6;
 
         // Node layout (as DotR-PC's tools/gltf.py): one glTF node per RH0 node carrying
@@ -1537,7 +1618,7 @@ static class ModelExtractor
         {
             var n = nodes[i];
             string refTag = n.Idx < refBoneNum ? $"_ref{n.Idx}" : "_refOOR";
-            var nb = new NodeBuilder($"node_{n.Idx}{refTag}_f{n.Flags:X4}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
+            var nb = new NodeBuilder($"{ReadableNodeName(n.Idx, n.Mslot)}_node_{n.Idx}{refTag}_f{n.Flags:X4}" + (n.Mslot != 0 ? $"_m{n.Mslot}" : ""));
             nb.LocalTransform = new SharpGLTF.Transforms.AffineTransform(
                 Vector3.One, rest.LocalR[i], rest.LocalT[i]);
             nodeBuilders[i] = nb;
@@ -1774,34 +1855,51 @@ static class ModelExtractor
         else if (skinnedPrims.Any(p => p.Prim.Faces.Count > 0))
         {
             var skin = joints.Zip(invBind, (j, ib) => (j, ib)).ToArray();
+            // the game's influences take 4 slots unless some vertex has more (zero weights count)
+            bool game8 = built.VertGame.Count > 0 && built.VertGame.Max(g => g.Count) > 4;
             if (maxInfluences > 4)
-                AddSkinnedMesh<VertexJoints8>(scene, built, skinnedPrims, pivot, skin, 8);
+                AddSkinnedMesh<VertexJoints8>(scene, built, skinnedPrims, pivot, skin, 8, game8);
             else
-                AddSkinnedMesh<VertexJoints4>(scene, built, skinnedPrims, pivot, skin, 4);
+                AddSkinnedMesh<VertexJoints4>(scene, built, skinnedPrims, pivot, skin, 4, game8);
         }
 
-        var model = scene.ToGltf2();
+        // one buffer view per attribute: the game's influences (VertexTexture1Game) make an
+        // interleaved vertex wider than glTF's 252-byte stride
+        var settings = SceneBuilderSchema2Settings.Default;
+        settings.UseStridedBuffers = false;
+        var model = scene.ToGltf2(settings);
         InjectBlendMetadata(model, blendStates);
         if (texAnims.Count > 0) InjectTextureAnimations(model, texAnims);
         InjectTextureAnimationRecords(model, texAnimRecords);
-        model.SaveGLB(outPath);
-        ReorderGlbAnimations(outPath);
+        return ReorderGlbAnimations(model.WriteGLB().ToArray());
     }
 
     private static void AddSkinnedMesh<TJ>(SceneBuilder scene, BuiltMesh built,
         List<(MaterialBuilder Mat, Primitive Prim)> prims, Vector3 pivot,
-        (NodeBuilder Joint, Matrix4x4 InverseBind)[] joints, int maxInfluences)
+        (NodeBuilder Joint, Matrix4x4 InverseBind)[] joints, int maxInfluences, bool game8)
         where TJ : struct, IVertexSkinning
     {
-        var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1, TJ>("MrgMesh");
+        if (game8)
+            AddSkinnedMesh<TJ, GameSlots8>(scene, built, prims, pivot, joints, maxInfluences);
+        else
+            AddSkinnedMesh<TJ, GameSlots4>(scene, built, prims, pivot, joints, maxInfluences);
+    }
+
+    private static void AddSkinnedMesh<TJ, TS>(SceneBuilder scene, BuiltMesh built,
+        List<(MaterialBuilder Mat, Primitive Prim)> prims, Vector3 pivot,
+        (NodeBuilder Joint, Matrix4x4 InverseBind)[] joints, int maxInfluences)
+        where TJ : struct, IVertexSkinning
+        where TS : IGameSlots
+    {
+        var mb = new MeshBuilder<VertexPositionNormal, VertexTexture1Game<TS>, TJ>("MrgMesh");
         foreach (var (mat, prim) in prims)
         {
             var pb = mb.UsePrimitive(mat);
             foreach (var (a, b, c) in prim.Faces)
                 pb.AddTriangle(
-                    MakeVertex<TJ>(built, a, pivot, maxInfluences),
-                    MakeVertex<TJ>(built, b, pivot, maxInfluences),
-                    MakeVertex<TJ>(built, c, pivot, maxInfluences));
+                    MakeVertex<TJ, TS>(built, a, pivot, maxInfluences, joints),
+                    MakeVertex<TJ, TS>(built, b, pivot, maxInfluences, joints),
+                    MakeVertex<TJ, TS>(built, c, pivot, maxInfluences, joints));
         }
         scene.AddSkinnedMesh(mb, joints);
     }
@@ -1894,7 +1992,9 @@ static class ModelExtractor
 
         // Alpha-tested pages are cutouts first (TEST 0x703FD: ATE, GREATER, AREF 63), even
         // when they also blend. This is the Bagworm flipbook case.
-        if (alphaTest && textureHasAlpha && !(trivialTest && materialAlpha < 0.999f)) return "mask";
+        // (Retail's alpha chain never has material alpha 1; an imported additive page does, with
+        // the same trivial test, and is still a blend, so ABE alone also rules the cutout out.)
+        if (alphaTest && textureHasAlpha && !(trivialTest && (materialAlpha < 0.999f || abe))) return "mask";
         if (!abe) return "opaque";
 
         bool sourceAlphaAdditive = aSel == 0 && bSel == 2 && cSel == 0 && dSel == 1; // 0x48
@@ -2045,6 +2145,9 @@ static class ModelExtractor
                 ["src"] = new System.Text.Json.Nodes.JsonArray(U16(data, at + 12), U16(data, at + 14)),
                 ["dst"] = new System.Text.Json.Nodes.JsonArray(U16(data, at + 16), U16(data, at + 18)),
             });
+            // starting own clock (a phased blink); written only when set, so retail stays as it was
+            uint clock = U32(data, at + 20);
+            if (clock != 0) ((System.Text.Json.Nodes.JsonObject)recs[^1]!)["clock"] = clock;
             if ((fl & 1) != 0) break;
         }
         return recs;
@@ -2103,29 +2206,20 @@ static class ModelExtractor
         return val == texIdx;
     }
 
-    private static void ReorderGlbAnimations(string glbPath)
+    private static byte[] ReorderGlbAnimations(byte[] glb)
     {
-        byte[] glb;
-        try
-        {
-            glb = File.ReadAllBytes(glbPath);
-        }
-        catch
-        {
-            return;
-        }
-        if (glb.Length < 20) return;
-        if (BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(0, 4)) != 0x46546C67) return;
+        if (glb.Length < 20) return glb;
+        if (BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(0, 4)) != 0x46546C67) return glb;
         uint jsonLen = BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(12, 4));
         uint jsonType = BinaryPrimitives.ReadUInt32LittleEndian(glb.AsSpan(16, 4));
-        if (jsonType != 0x4E4F534A) return;
+        if (jsonType != 0x4E4F534A) return glb;
         int jsonStart = 20;
         int jsonEnd = jsonStart + (int)jsonLen;
-        if (jsonEnd > glb.Length) return;
+        if (jsonEnd > glb.Length) return glb;
         string json = System.Text.Encoding.UTF8.GetString(glb, jsonStart, (int)jsonLen);
 
         var doc = System.Text.Json.Nodes.JsonNode.Parse(json);
-        if (doc?["animations"] is not System.Text.Json.Nodes.JsonArray anims || anims.Count < 2) return;
+        if (doc?["animations"] is not System.Text.Json.Nodes.JsonArray anims || anims.Count < 2) return glb;
 
         var items = new List<System.Text.Json.Nodes.JsonNode?>();
         foreach (var a in anims) items.Add(a);
@@ -2160,8 +2254,8 @@ static class ModelExtractor
         }
 
         int totalLen = 12 + 8 + paddedLen + binChunk.Length;
-        using var fs = new FileStream(glbPath, FileMode.Create, FileAccess.Write);
-        using var bw = new BinaryWriter(fs);
+        var ms = new MemoryStream(totalLen);
+        using var bw = new BinaryWriter(ms);
         bw.Write(0x46546C67u);
         bw.Write(2u);
         bw.Write((uint)totalLen);
@@ -2170,6 +2264,8 @@ static class ModelExtractor
         bw.Write(newJsonBytes);
         for (int i = 0; i < pad; i++) bw.Write((byte)0x20);
         if (binChunk.Length > 0) bw.Write(binChunk);
+        bw.Flush();
+        return ms.ToArray();
     }
 
     // Normalize with a zero guard (Vector3.Normalize(0) yields NaN). Used only for
@@ -2181,9 +2277,11 @@ static class ModelExtractor
     }
 
     // Influences heaviest first, weights normalised across every set together, so a viewer
-    // that reads only JOINTS_0 degrades to the four heaviest.
-    private static (VertexPositionNormal, VertexTexture1, TJ) MakeVertex<TJ>(BuiltMesh bm, int vi, Vector3 pivot,
-        int maxInfluences) where TJ : struct, IVertexSkinning
+    // that reads only JOINTS_0 degrades to the four heaviest. The game's own influences ride
+    // along (VertexTexture1Game).
+    private static (VertexPositionNormal, VertexTexture1Game<TS>, TJ) MakeVertex<TJ, TS>(BuiltMesh bm, int vi, Vector3 pivot,
+        int maxInfluences, (NodeBuilder Joint, Matrix4x4 InverseBind)[] joints)
+        where TJ : struct, IVertexSkinning where TS : IGameSlots
     {
         var pos = bm.Vertices[vi] - pivot;
         var nrm = bm.Normals[vi];
@@ -2197,7 +2295,20 @@ static class ModelExtractor
             for (int k = 0; k < top.Count; k++) top[k] = (top[k].Joint, top[k].W / wsum);
         var jb = new TJ();
         jb.SetBindings(top.Select(x => (x.Joint, x.W)).ToArray());
-        return (new VertexPositionNormal(pos, nrm), new VertexTexture1(uv), jb);
+        var mat = new VertexTexture1Game<TS>(uv);
+        var game = bm.VertGame[vi];
+        if (game.Count > 0 && game.Count <= TS.Count)
+        {
+            mat.RefPos = Vector3.Transform(pos, joints[game[0].Bone].InverseBind);
+            for (int k = 0; k < game.Count; k++)
+            {
+                var g = game[k];
+                mat.Pos[k] = new Vector3(g.Pos.X, g.Pos.Y, g.Pos.Z);
+                mat.Nrm[k] = new Vector3(g.Nrm.X, g.Nrm.Y, g.Nrm.Z);
+                mat.JointWeight[k] = new Vector2(g.Bone, g.W);
+            }
+        }
+        return (new VertexPositionNormal(pos, nrm), mat, jb);
     }
 
     // The single bone a rigid vertex rides; an unbound vertex falls back to joint 0, as
@@ -2216,6 +2327,153 @@ static class ModelExtractor
         var nrm = bm.Normals[vi];
         nrm = nrm == Vector3.Zero ? Vector3.UnitY : NSafe(Vector3.TransformNormal(nrm, invNodeWorld));
         return (new VertexPositionNormal(pos, nrm), new VertexTexture1(bm.Uvs[vi]));
+    }
+}
+
+// The skinned mesh's material vertex: TEXCOORD_0 plus each influence as RH0 stores it, in the
+// game's order with zero weights kept: _DOTR_INFPOS_k / _DOTR_INFNRM_k its own bone-local s16
+// position and normal, _DOTR_INFJW_k (joint index, raw 4.12 weight), joint -1 past the last;
+// floats, which hold s16 values exactly (the toolkit cannot write unnormalised shorts).
+// A glb vertex has one position, so without these an import derives every influence from it
+// (the copies then all agree and zero weights are lost). _DOTR_REFPOS is POSITION in the first
+// influence's bone space: GlbImporter keeps the influences only while POSITION still matches
+// it, so a position edited elsewhere is imported from POSITION as before.
+// A mesh writes 4 slots (GameSlots4) when no vertex has more influences, else 8; GlbImporter
+// reads slots 0.. until the first absent one.
+static class VertexTexture1Game
+{
+    public const int Slots = 8;
+    public const string RefPosName = "_DOTR_REFPOS";
+    public const string PosName = "_DOTR_INFPOS_";
+    public const string NrmName = "_DOTR_INFNRM_";
+    public const string JointWeightName = "_DOTR_INFJW_";
+}
+
+interface IGameSlots { static abstract int Count { get; } }
+struct GameSlots4 : IGameSlots { public static int Count => 4; }
+struct GameSlots8 : IGameSlots { public static int Count => VertexTexture1Game.Slots; }
+
+struct VertexTexture1Game<TS> : IVertexCustom, IEquatable<VertexTexture1Game<TS>> where TS : IGameSlots
+{
+    static readonly int Slots = TS.Count;
+    const string RefPosName = VertexTexture1Game.RefPosName;
+    const string PosName = VertexTexture1Game.PosName;
+    const string NrmName = VertexTexture1Game.NrmName;
+    const string JointWeightName = VertexTexture1Game.JointWeightName;
+
+    public Vector2 TexCoord;
+    public Vector3 RefPos;
+    public Vector3[] Pos;
+    public Vector3[] Nrm;
+    public Vector2[] JointWeight;
+
+    public VertexTexture1Game(Vector2 uv)
+    {
+        TexCoord = uv;
+        RefPos = Vector3.Zero;
+        Pos = new Vector3[Slots];
+        Nrm = new Vector3[Slots];
+        JointWeight = new Vector2[Slots];
+        for (int k = 0; k < Slots; k++) JointWeight[k] = new Vector2(-1, 0);
+    }
+
+    public int MaxColors => 0;
+    public int MaxTextCoords => 1;
+
+    IEnumerable<KeyValuePair<string, AttributeFormat>> IVertexReflection.GetEncodingAttributes()
+    {
+        yield return new("TEXCOORD_0", new AttributeFormat(DimensionType.VEC2));
+        yield return new(RefPosName, new AttributeFormat(DimensionType.VEC3));
+        for (int k = 0; k < Slots; k++)
+        {
+            yield return new(PosName + k, new AttributeFormat(DimensionType.VEC3));
+            yield return new(NrmName + k, new AttributeFormat(DimensionType.VEC3));
+            yield return new(JointWeightName + k, new AttributeFormat(DimensionType.VEC2));
+        }
+    }
+
+    public IEnumerable<string> CustomAttributes
+    {
+        get
+        {
+            yield return RefPosName;
+            for (int k = 0; k < Slots; k++)
+            {
+                yield return PosName + k;
+                yield return NrmName + k;
+                yield return JointWeightName + k;
+            }
+        }
+    }
+
+    public bool TryGetCustomAttribute(string attribute, out object value)
+    {
+        value = null;
+        if (attribute == RefPosName) value = RefPos;
+        else if (attribute.StartsWith(PosName)) value = Pos == null ? Vector3.Zero : Pos[int.Parse(attribute.AsSpan(PosName.Length))];
+        else if (attribute.StartsWith(NrmName)) value = Nrm == null ? Vector3.Zero : Nrm[int.Parse(attribute.AsSpan(NrmName.Length))];
+        else if (attribute.StartsWith(JointWeightName)) value = JointWeight == null ? new Vector2(-1, 0) : JointWeight[int.Parse(attribute.AsSpan(JointWeightName.Length))];
+        return value != null;
+    }
+
+    public void SetCustomAttribute(string attribute, object value)
+    {
+        throw new NotSupportedException();
+    }
+
+    public Vector2 GetTexCoord(int index)
+    {
+        return TexCoord;
+    }
+
+    public void SetTexCoord(int index, Vector2 coord)
+    {
+        TexCoord = coord;
+    }
+
+    public Vector4 GetColor(int index)
+    {
+        throw new ArgumentOutOfRangeException(nameof(index));
+    }
+
+    public void SetColor(int index, Vector4 color)
+    {
+    }
+
+    public void Validate()
+    {
+    }
+
+    public VertexMaterialDelta Subtract(IVertexMaterial baseValue)
+    {
+        throw new NotSupportedException();
+    }
+
+    public void Add(in VertexMaterialDelta delta)
+    {
+        throw new NotSupportedException();
+    }
+
+    public bool Equals(VertexTexture1Game<TS> other)
+    {
+        return TexCoord == other.TexCoord && RefPos == other.RefPos &&
+               Same(Pos, other.Pos) && Same(Nrm, other.Nrm) && Same(JointWeight, other.JointWeight);
+    }
+
+    static bool Same<T>(T[] a, T[] b) where T : IEquatable<T>
+    {
+        if (a == null || b == null) return a == b;
+        return a.AsSpan().SequenceEqual(b);
+    }
+
+    public override bool Equals(object obj)
+    {
+        return obj is VertexTexture1Game<TS> other && Equals(other);
+    }
+
+    public override int GetHashCode()
+    {
+        return HashCode.Combine(TexCoord, RefPos);
     }
 }
 
@@ -2370,6 +2628,9 @@ sealed class BuiltMesh
     public List<Vector3> Normals = new(); // output-space vertex normals (winding orientation only)
     public List<Vector2> Uvs = new();
     public List<List<(int Joint, float W)>> VertJoints = new();
+    // each vertex's influences as RH0 stores them, in its order with zero weights kept; Bone
+    // is the joint index here (empty: none to keep)
+    public List<List<StripWeight>> VertGame = new();
     public List<Primitive> Primitives = new();
     public List<int> SortedMslots = new();
     public Dictionary<int, int> MslotToJoint = new();

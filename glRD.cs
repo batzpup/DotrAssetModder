@@ -44,6 +44,21 @@ public static class glRD
 
     public static float PH(float per) => cur_win_h * (per / 100f);
 
+    // A field's width: a share of the room left on the line, but never under minEm font heights.
+    public static float FieldWidth(float share, float minEm)
+    {
+        return Math.Max(ImGui.GetContentRegionAvail().X * share, ImGui.GetFontSize() * minEm);
+    }
+
+    // The tooltip for the item just drawn.
+    public static void Tip(string text)
+    {
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(text);
+        }
+    }
+
     public static Vector2 GetScreenPixelsFromPercent(float per_x, float per_y) => P(per_x, per_y);
 
     static void UpdateMonDims()

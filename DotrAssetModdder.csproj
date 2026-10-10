@@ -7,6 +7,8 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!-- The extractor runs too rarely to tier up; compile its loops optimised from the start. -->
+        <TieredCompilationQuickJitForLoops>false</TieredCompilationQuickJitForLoops>
     </PropertyGroup>
 
     <ItemGroup>
@@ -25,6 +27,11 @@
     <ItemGroup>
       <None Remove="fonts\NotoSansJP-Regular.ttf" />
       <EmbeddedResource Include="fonts\NotoSansJP-Regular.ttf" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <!-- docs\rollback holds snapshot copies of source files; they are not part of the build. -->
+      <Compile Remove="docs\**" />
     </ItemGroup>
 
 

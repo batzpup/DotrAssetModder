@@ -78,6 +78,10 @@ public static class Rebuilder
         /// the import UI) ask the user before a fidelity-reduction fallback is applied.
         /// Null (default) keeps every fallback fully automatic, matching non-interactive use.
         public Rh0Assembler.ConfirmReduction? ConfirmReduction = null;
+
+        /// Node 0's bounding radius to write instead of the one measured from the geometry
+        /// (0 = measured). The board shrinks a monster by clamp(40 / radius, 0.3, 1).
+        public float BoundsRadius = 0f;
     }
 
     /// Size-check outcome, for surfacing a warning in the UI. No rescaling is performed.
@@ -109,12 +113,118 @@ public static class Rebuilder
         Options? options = null, FitInfo? fit = null, RebuildPipeline.Result[]? resultOut = null)
         => Assemble(model, originalMrg, textures, options, fit, resultOut);
 
+    // The one import entry point both archives use: a loaded glb over a donor block, with a hard
+    // byte budget. MONSTER.MRG passes its fixed 1 MiB slot and trimToContent false (the padded
+    // block is the contract the ISO offset math assumes); MODEL.MRG passes the block's own slot
+    // and trimToContent true. confirmReduction answers whether the assembler may shrink
+    // textures or animation to fit. Warnings worth showing the user are added to `warnings`.
+    public static byte[] Import(ImportedModel model, byte[] donor, int budget, bool trimToContent,
+        Rh0Assembler.ConfirmReduction confirmReduction, List<string> warnings, int maxTextureDim = 512,
+        IReadOnlyList<Rh0Assembler.TextureInput>? textures = null, float boundsRadius = 0f)
+    {
+        var opt = ImportOptions();
+        opt.BoundsRadius = boundsRadius;
+        opt.MaxOutputSize = budget;
+        opt.TrimToContent = trimToContent;
+        opt.MaxTextureDim = maxTextureDim;
+        // Keep each texture at its own power-of-two size instead of squeezing it into the donor
+        // slot's (a 256x256 face became 128x64 over a small donor: m853). A texture that already
+        // fits its donor still takes the template path, so retail round trips are unchanged; if the
+        // block overflows, ReduceTextures asks through confirmReduction before shrinking anything.
+        opt.RebuildTexturesNative = true;
+        opt.UseNeutralTextureForMissingSlots = true;
+        opt.PreserveTemplateTextureAnimation = false;
+        opt.ConfirmReduction = confirmReduction;
+        if (textures == null)
+        {
+            textures = GlbImporter.DecodeGlbTextures(model);
+        }
+        byte[] bytes = Assemble(model, donor, textures, opt, null);
+
+        foreach (string w in model.TexSlotWarnings)
+        {
+            warnings.Add("texture slots: " + w);
+        }
+        if (RebuildPipeline.LastClampedValues > 0)
+        {
+            warnings.Add($"{RebuildPipeline.LastClampedValues} vertex values were out of range and clamped; " +
+                         "parts may look stretched or flattened in game");
+        }
+        if (RebuildPipeline.LastDroppedAnimations is { Count: > 0 } dropped)
+        {
+            warnings.Add($"{dropped.Count} animation(s) left out, no free motion slot (idle 0, attack 2, death 4, win 5, damage 6, extras 1 and 3): " +
+                         string.Join(", ", dropped));
+        }
+        if (Rh0Assembler.LastOverflowBytes > 0)
+        {
+            string at = "";
+            if (Rh0Assembler.LastOverflowLabel != null)
+            {
+                at = " at " + Rh0Assembler.LastOverflowLabel;
+            }
+            warnings.Add($"assembler ran {Rh0Assembler.LastOverflowBytes:N0} B past the slot{at}");
+        }
+        if (Rh0Assembler.LastHalvedForPages > 0)
+        {
+            warnings.Add($"textures halved {Rh0Assembler.LastHalvedForPages} time(s) to fit the game's texture memory " +
+                         $"({Rh0Assembler.LastTexturePages} of {Rh0Assembler.MaxModelTexturePages} pages)");
+        }
+        if (!model.IsDotrExtractedGlb && Rh0Assembler.LastTexturePages > Rh0Assembler.MaxModelTexturePages)
+        {
+            warnings.Add($"textures take {Rh0Assembler.LastTexturePages} GS pages, over the {Rh0Assembler.MaxModelTexturePages} " +
+                         "a retail monster uses; the screen may flash when this model is drawn");
+        }
+        return bytes;
+    }
+
+    // The options Import builds the model with (RebuildPipeline.Build reads these).
+    private static Options ImportOptions()
+    {
+        var opt = new Options();
+        opt.DebugFrame = false;
+        opt.AdoptTemplateScaleForCustomModels = false;
+        return opt;
+    }
+
+    // Node 0's radius an Import of `model` over `donor` writes when no Radius is given: the same
+    // build, stopped once the bounding sphere is measured (no pages, no motions), so the windows
+    // show the number the game gets. donor may be empty (a model not over a block yet).
+    public static float MeasureRadius(ImportedModel model, byte[] donor)
+    {
+        return BuildOver(model, donor, ImportOptions(), true).BoundsRadius;
+    }
+
     private static byte[] Assemble(ImportedModel model, byte[] originalMrg,
         IReadOnlyList<Rh0Assembler.TextureInput>? textures, Options? options, FitInfo? fit,
         RebuildPipeline.Result[]? resultOut = null)
     {
         var opt = options ?? new Options();
+        var rebuilt = BuildOver(model, originalMrg, opt, false);
 
+        if (resultOut != null && resultOut.Length > 0) resultOut[0] = rebuilt;
+
+        if (fit != null)
+        {
+            fit.OriginalWorld = rebuilt.FitOriginalWorld;
+            fit.DonorWorld = rebuilt.FitDonorWorld;
+            fit.Message = rebuilt.FitReason;
+        }
+        var outBytes = Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
+            opt.RebuildTexturesNative, opt.MaxTextureDim,
+            opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation,
+            opt.TrimToContent, opt.ConfirmReduction, !model.IsDotrExtractedGlb);
+        // a slot past the template's count that the 1 MiB block could not grow to hold
+        foreach (var (slot, onto) in Rh0Assembler.LastShedTexSlots ?? new())
+        {
+            string w = $"texture slot {slot} did not fit in the 1 MiB block; its faces use slot {onto}'s texture";
+            if (!model.TexSlotWarnings.Contains(w)) model.TexSlotWarnings.Add(w);
+        }
+        return outBytes;
+    }
+
+    // RebuildPipeline.Build with the donor block's template values.
+    private static RebuildPipeline.Result BuildOver(ImportedModel model, byte[] originalMrg, Options opt, bool boundsOnly)
+    {
         // adopt the template's animTransScale/root-scale so retail motion files decode 1:1
         float templateATS = originalMrg.Length >= 0x68
             ? System.Buffers.Binary.BinaryPrimitives.ReadSingleLittleEndian(originalMrg.AsSpan(0x64))
@@ -145,29 +255,9 @@ public static class Rebuilder
             }
         }
         var templateFrame = ReadTemplateFrame(originalMrg);
-        var rebuilt = RebuildPipeline.Build(model, templateATS, templateTexCount,
+        return RebuildPipeline.Build(model, templateATS, templateTexCount,
             opt.WarnMinRatio, opt.WarnMaxRatio, templateFrame,
-            opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels, templateRootScale);
-
-        if (resultOut != null && resultOut.Length > 0) resultOut[0] = rebuilt;
-
-        if (fit != null)
-        {
-            fit.OriginalWorld = rebuilt.FitOriginalWorld;
-            fit.DonorWorld = rebuilt.FitDonorWorld;
-            fit.Message = rebuilt.FitReason;
-        }
-        var outBytes = Rh0Assembler.Assemble(originalMrg, rebuilt, textures, opt.MaxOutputSize,
-            opt.RebuildTexturesNative, opt.MaxTextureDim,
-            opt.UseNeutralTextureForMissingSlots, opt.PreserveTemplateTextureAnimation,
-            opt.TrimToContent, opt.ConfirmReduction);
-        // a slot past the template's count that the 1 MiB block could not grow to hold
-        foreach (var (slot, onto) in Rh0Assembler.LastShedTexSlots ?? new())
-        {
-            string w = $"texture slot {slot} did not fit in the 1 MiB block; its faces use slot {onto}'s texture";
-            if (!model.TexSlotWarnings.Contains(w)) model.TexSlotWarnings.Add(w);
-        }
-        return outBytes;
+            opt.DebugFrame, opt.AdoptTemplateScaleForCustomModels, templateRootScale, opt.BoundsRadius, boundsOnly);
     }
 
     private static RebuildPipeline.TemplateFrame? ReadTemplateFrame(byte[] originalMrg)
@@ -195,13 +285,7 @@ public static class Rebuilder
             F32(nodeTree + gnode1 + 0x28));
         var pivot = pivotRaw / ats;
 
-        if (!IsFinite(bounds) || !IsFinite(pivot) || !(radius > 1e-5f) || float.IsNaN(radius) || float.IsInfinity(radius))
-        {
-            return null;
-        }
-            
-
-        return new RebuildPipeline.TemplateFrame {
+        var frame = new RebuildPipeline.TemplateFrame {
             PivotWorld = pivot,
             BoundsCenterWorld = bounds,
             BoundsRadius = radius,
@@ -210,10 +294,6 @@ public static class Rebuilder
             RootScale = 1f / ats,
             PivotRaw = pivotRaw,
         };
-
-        static bool IsFinite(Vector3 v) =>
-            !float.IsNaN(v.X) && !float.IsInfinity(v.X) &&
-            !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
-            !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);
+        return frame.IsValid ? frame : null;
     }
 }
