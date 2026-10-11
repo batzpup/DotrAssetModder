@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DotrAssetModdder", "DotrAssetModdder.csproj", "{26922C39-7D0D-464F-A67A-53D22F118F54}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DotrAssetModder", "DotrAssetModder.csproj", "{26922C39-7D0D-464F-A67A-53D22F118F54}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

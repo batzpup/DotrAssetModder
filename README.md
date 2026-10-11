@@ -6,7 +6,7 @@
 
 ### AI Notice and disclosure:
 This has moderate to extensive use of AI primarily for the importing and exporting of the 3D Models, I do apologise, but many things around this project are out of my skillset, very time consuming and some of the formats are Konami specific formats with no documentation or uses elsewhere. I do not currently have the time, energy and passion to learn all the required skills that would normally be needed for this project without AI. But I know many people would like to have this functionality to unlock one of the last few hurdles in modding this game. If you do not wish to use this project because of the AI usage I completely understand.
-I have tried to label classes functions and code written by AI, and to the extent of what of it is AI code where i could. 
+I have tried to label classes functions and code written by AI, and to the extent of what of it is AI code where i can. 
 
 ### This is in Alpha, please report bugs, recommendations, features you would like to see
 
@@ -21,7 +21,7 @@ I have tried to label classes functions and code written by AI, and to the exten
 
 2. **Run the Application**:
    - After downloading, extract the contents of the ZIP file.
-   - Navigate to the extracted folder and run `DotrAssetModdder.exe`.
+   - Navigate to the extracted folder and run `DotrAssetModder.exe`.
   
 3. If it doesn't open, go to the runtimes folder, copy and paste the folder matching your operation system into main DotrAssetModder directory (next to DotrAssetModder.exe)
 
