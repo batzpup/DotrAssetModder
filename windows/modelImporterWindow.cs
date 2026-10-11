@@ -16,7 +16,6 @@ public class ModelImporterWindow
 {
     const int ModelCount = 683;
     const int BlockSize = 0x100000;
-    const int MaxTextureDim = 512;
     const int SourceMonster = 0;
     const int SourceModel = 1;
 
@@ -477,7 +476,7 @@ public class ModelImporterWindow
         }
         ImGui.SameLine();
         ImGui.Checkbox("Keep staged after save", ref keepStagedAfterSave);
-        Tip("On: staged models stay staged after Save to ISO, so they can be saved again (e.g. to another ISO). " +
+        HoveredTooltip("On: staged models stay staged after Save to ISO, so they can be saved again (e.g. to another ISO). " +
             "\nOff: a successful save clears the staging, since those models are now on the disc.");
     }
 
@@ -648,11 +647,11 @@ public class ModelImporterWindow
         ImGui.EndDisabled();
         if (IsStaged(index))
         {
-            Tip("Shows the staged import. Tick Compare in the preview to stand the model it replaces beside it.");
+            HoveredTooltip("Shows the staged import. Tick Compare in the preview to stand the model it replaces beside it.");
         }
         else
         {
-            Tip("Shows this model as it is on the ISO.");
+            HoveredTooltip("Shows this model as it is on the ISO.");
         }
         if (viewTask != null)
         {
@@ -697,7 +696,7 @@ public class ModelImporterWindow
             ExtractOne(index);
         }
         ImGui.EndDisabled();
-        Tip("Save just this model (as it is on the ISO) as a .glb, the same file the Extractor tab writes for it.");
+        HoveredTooltip("Save just this model (as it is on the ISO) as a .glb, the same file the Extractor tab writes for it.");
         if (extractTask != null)
         {
             ImGui.SameLine();
@@ -1527,7 +1526,7 @@ public class ModelImporterWindow
             ViewImport(false);
         }
         ImGui.EndDisabled();
-        Tip("Preview the model converted with these options, beside the model it would replace." +
+        HoveredTooltip("Preview the model converted with these options, beside the model it would replace." +
             "\nNothing is staged; press it again after changing an option.");
         ImGui.SameLine();
         if (ImGui.Button("Save .glb..."))
@@ -1604,7 +1603,7 @@ public class ModelImporterWindow
         {
             optScale = MinScale;                       // 0 collapses the model (and NaN fails the !(>=) too)
         }
-        Tip("Multiplies the source's size (in metres; 1 game unit = 1 metre). 1 keeps the model as exported." +
+        HoveredTooltip("Multiplies the source's size (in metres; 1 game unit = 1 metre). 1 keeps the model as exported." +
             "\nThe size it comes out at is in the convert report. At least " + MinScale + "." +
             "\nDrag to change it, double-click to type.");
         if (optScale != 1f)
@@ -1615,13 +1614,13 @@ public class ModelImporterWindow
                 optScale = 1f;
                 changed = true;
             }
-            Tip("Back to 1.");
+            HoveredTooltip("Back to 1.");
         }
         if (ScaleHiddenByShrink())
         {
             ImGui.SameLine();
             ImGui.TextDisabled("(the board/map shrinks it to radius 40: Feet on grid shows Scale)");
-            Tip("lSzModel_LoadCB: x clamp(40 / radius, 0.3, 1) on the board, half that on the map." +
+            HoveredTooltip("lSzModel_LoadCB: x clamp(40 / radius, 0.3, 1) on the board, half that on the map." +
                 "\nA bigger Scale grows the radius with it, so the game draws it the same size" +
                 "\nuntil the radius passes 133 (x0.3). Set Radius to keep the shrink fixed.");
         }
@@ -1665,12 +1664,12 @@ public class ModelImporterWindow
         ImGui.SeparatorText("Source fixes");
         ImGui.BeginDisabled(convertIsCard);            // a card has no source to fix
         changed |= ImGui.Checkbox("Bind at first frame", ref optRestFromAnim);
-        Tip("Bind the skin at the first animation's first frame instead of the file's bind pose." +
+        HoveredTooltip("Bind the skin at the first animation's first frame instead of the file's bind pose." +
             "\nOnly for rips whose bind pose lies flat or is never shown;" +
             "\nvertices pulled by several bones then move slightly differently.");
 
         changed |= ImGui.Checkbox("Flip UV", ref optFlipUv);
-        Tip("Turn this on if the textures land upside down: the source's UVs are already top-left." +
+        HoveredTooltip("Turn this on if the textures land upside down: the source's UVs are already top-left." +
             "\nDone by itself for FBX files exported by Unity Studio.");
         ImGui.EndDisabled();
         if (changed)
@@ -1691,7 +1690,7 @@ public class ModelImporterWindow
         float nameAt, float valuesAt, string tip, string[] axisTips, Vector3 resetTo = default)
     {
         bool changed = ImGui.Checkbox("##on" + id, ref on);
-        Tip("On: " + name + " is applied, and its gizmo shows in the View import preview." +
+        HoveredTooltip("On: " + name + " is applied, and its gizmo shows in the View import preview." +
             "\nOff: it is not applied (the values are kept).");
         ImGui.SameLine(nameAt);
         changed |= AxisFields(name, id, on, ref value, speed, resetLabel, valuesAt, tip, axisTips, resetTo);
@@ -1707,7 +1706,7 @@ public class ModelImporterWindow
         bool changed = false;
         ImGui.AlignTextToFramePadding();
         ImGui.Text(name);
-        Tip(tip);
+        HoveredTooltip(tip);
         ImGui.SameLine(valuesAt);
         ImGui.BeginDisabled(!on);
         string[] axes = { "X", "Y", "Z" };
@@ -1726,7 +1725,7 @@ public class ModelImporterWindow
                 value = WithAxis(value, k, v);
             }
             changed |= ImGui.IsItemDeactivatedAfterEdit();
-            Tip(axisTips[k] + "\nDrag to change it, double-click to type.");
+            HoveredTooltip(axisTips[k] + "\nDrag to change it, double-click to type.");
         }
         if (value != resetTo)
         {
@@ -1736,7 +1735,7 @@ public class ModelImporterWindow
                 value = resetTo;
                 changed = true;
             }
-            Tip($"Back to {resetTo.X:0.###}, {resetTo.Y:0.###}, {resetTo.Z:0.###}.");
+            HoveredTooltip($"Back to {resetTo.X:0.###}, {resetTo.Y:0.###}, {resetTo.Z:0.###}.");
         }
         ImGui.EndDisabled();
         return changed;
@@ -1822,7 +1821,7 @@ public class ModelImporterWindow
                 optRadius = 0f;
             }
         }
-        Tip("The model's bounding radius the import writes (node 0). Measured from the model until changed" +
+        HoveredTooltip("The model's bounding radius the import writes (node 0). Measured from the model until changed" +
             "\n(a card on the ISO: its own radius)." +
             "\nOn the duel board the game shrinks a monster to fit radius 40: x clamp(40 / radius, 0.3, 1);" +
             "\nthe map draws it at half that. Battle ignores it (real size)." +
@@ -1837,7 +1836,7 @@ public class ModelImporterWindow
             {
                 optRadius = cardRadiusOwn;
             }
-            Tip($"Back to the card's own radius, {cardRadiusOwn:0.###}.");
+            HoveredTooltip($"Back to the card's own radius, {cardRadiusOwn:0.###}.");
         }
         else if (!convertIsCard && optRadius > 0f)
         {
@@ -1846,7 +1845,7 @@ public class ModelImporterWindow
             {
                 optRadius = 0f;
             }
-            Tip("Go back to the measured radius.");
+            HoveredTooltip("Go back to the measured radius.");
         }
         ImGui.SameLine();
         if (!shown)
@@ -2043,10 +2042,10 @@ public class ModelImporterWindow
         int askedTotal = 0;
         int askedBudget = 0;
 
-        byte[] bytes;
+        Rebuilder.ImportResult import;
         try
         {
-            bytes = Rebuilder.Import(model, donor, BlockSize, false,
+            import = Rebuilder.Import(model, donor, BlockSize, false,
                 (category, categoryBytes, totalBytes, budget) =>
                 {
                     asked = true;
@@ -2056,7 +2055,7 @@ public class ModelImporterWindow
                     askedBudget = budget;
                     return allowReduction;
                 },
-                reportWarnings, MaxTextureDim, textures, optRadius);
+                textures, optRadius);
         }
         catch (Exception) when (asked)
         {
@@ -2076,6 +2075,8 @@ public class ModelImporterWindow
             return;
         }
 
+        byte[] bytes = import.Block;
+        reportWarnings.AddRange(import.Warnings);
         monsterStaged[index] = bytes;
         monsterStagedFrom[index] = label;
         cardEdits.Remove(index);                       // StageCardEdit records an edit again
@@ -2085,10 +2086,10 @@ public class ModelImporterWindow
         report = $"card {index:000}: {bytes.Length:N0} of {BlockSize:N0} B - staged. " +
                  $"Radius {radius:0.#}: board x{shrink:0.##}, map x{ViewScene.MapScale * shrink:0.##}.";
         // battle slots the glb lacked, filled with a copy of another motion (MotWriter)
-        if (MotWriter.LastClones != null && MotWriter.LastClones.Count > 0)
+        if (import.CopiedMotions.Count > 0)
         {
             var copied = new List<string>();
-            foreach (var c in MotWriter.LastClones)
+            foreach (var c in import.CopiedMotions)
             {
                 copied.Add($"slot {c.Slot} from slot {c.From}");
             }
@@ -2433,7 +2434,7 @@ public class ModelImporterWindow
     void DrawCompareControls()
     {
         ImGui.Checkbox("Aim at pivot", ref aimAtPivot);
-        Tip("The camera looks at node 1 (the Pivot) as it moves with the animation, as the game's duel board" +
+        HoveredTooltip("The camera looks at node 1 (the Pivot) as it moves with the animation, as the game's duel board" +
             "\nfocus camera and the camera that follows a monster after a hit do. Drag to turn, wheel to zoom." +
             "\nThe battle attack and win cameras are the card's own camera paths, set from node 0 instead.");
         ImGui.SameLine();
@@ -2445,7 +2446,7 @@ public class ModelImporterWindow
                 PlaceCompare();
                 FrameStanding();
             }
-            Tip("Stand a second model beside this one to compare sizes." +
+            HoveredTooltip("Stand a second model beside this one to compare sizes." +
                 "\nIt is this card's model as it is on the ISO: the model the import replaces.");
             if (compareOn)
             {
@@ -2454,7 +2455,7 @@ public class ModelImporterWindow
                 {
                     RequestCompare();
                 }
-                Tip("Compare with Dark Magician (card 060): 24.8 tall, about the median retail monster.");
+                HoveredTooltip("Compare with Dark Magician (card 060): 24.8 tall, about the median retail monster.");
             }
             if (previewIsMonster)
             {
@@ -2673,21 +2674,13 @@ public class ModelImporterWindow
         return NodeZero() + LivePivot();
     }
 
-    // The part of LiveGlb that does not depend on g: where the shown glb's turn centre (its own
-    // node 1, c0) lands, c + Move + S R (c0 - c), c the centre as the options stand.
+    // Where the shown glb's turn centre (its own node 1, c0) lands with the options as they stand:
+    // c + Move + S R (c0 - c), c the centre as the options stand.
     Vector3 LiveShift()
     {
         Vector3 c = TurnCentre();
         Vector3 now = RotateApplied();
         return c + MoveApplied() + optScale * Turn(Mat4.Euler(now.X, now.Y, now.Z), previewModel.RestPivot - c);
-    }
-
-    // A point of the shown glb where the options as they stand put it: the shown glb was turned
-    // about its own node 1 (c0), so g = c0 + A0 (x - c0) + previewMove for source point x.
-    Vector3 LiveGlb(Vector3 g)
-    {
-        Vector3 c0 = previewModel.RestPivot;
-        return LiveScale() * Turn(LiveTurn(), g - c0 - previewMove) + LiveShift();
     }
 
     // Node 1 from node 0 with the options as they stand: on the Pivot while its toggle is on, else
@@ -2745,7 +2738,8 @@ public class ModelImporterWindow
         return StandAt(previewModel.RestPivot, ShownLowest()) + s * previewModel.PivotNow();
     }
 
-    // Before DrawStanding: takes the shown glb's drawn point W(g) to LiveWorld(LiveGlb(g)),
+    // Before DrawStanding: takes the shown glb's drawn point W(g) to LiveWorld of where the options
+    // as they stand put g,
     // W(g) = A + s g: translate(A' + s LiveShift) * scale(k) * turn * translate(-(A + s (c0 + previewMove))).
     void ApplyLiveTransform()
     {

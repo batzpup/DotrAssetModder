@@ -45,7 +45,7 @@ public static class FontManager
         return dict[closest];
     }
 
-    public static ImFontPtr LoadCustomFont(string fontPath = "NotoSansJP-Regular.ttf", int pixelSize = 32, IntPtr? glyphRanges = null)
+    public static ImFontPtr LoadCustomFont(string fontPath = "NotoSansJP-Regular.ttf", int pixelSize = 32)
     {
         Assembly assembly = Assembly.GetExecutingAssembly();
         string resourceName = $"{assembly.GetName().Name}.fonts.{fontPath}";
@@ -69,10 +69,7 @@ public static class FontManager
                 IntPtr unmanagedPtr = Marshal.AllocHGlobal(bytesRead);
                 Marshal.Copy(fontData, 0, unmanagedPtr, bytesRead);
 
-                if (glyphRanges.HasValue)
-                    font = ImGui.GetIO().Fonts.AddFontFromMemoryTTF(unmanagedPtr, bytesRead, pixelSize, null, glyphRanges.Value);
-                else
-                    font = ImGui.GetIO().Fonts.AddFontFromMemoryTTF(unmanagedPtr, bytesRead, pixelSize);
+                font = ImGui.GetIO().Fonts.AddFontFromMemoryTTF(unmanagedPtr, bytesRead, pixelSize);
             }
             else
             {

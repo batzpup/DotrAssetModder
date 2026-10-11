@@ -67,43 +67,6 @@ public static class PS2Icon
         return bitmap;
     }
 
-    public static void BuildPaletteFromBitmap(SKBitmap bitmap)
-    {
-        const int maxColors = 256;
-
-        unsafe
-        {
-            uint* px = (uint*)bitmap.GetPixels().ToPointer();
-            int count = bitmap.Width * bitmap.Height;
-
-            var uniqueColors = new HashSet<uint>();
-
-            for (int i = 0; i < count; i++)
-            {
-                uint p = px[i];
-                uint rgb = p & 0x00FFFFFF;
-                uniqueColors.Add(rgb);
-
-                if (uniqueColors.Count > maxColors)
-                    break;
-            }
-
-            if (uniqueColors.Count <= maxColors)
-            {
-                var palette = new uint[maxColors];
-                int i = 0;
-
-                foreach (var rgb in uniqueColors)
-                    palette[i++] = 0xFF000000 | rgb;
-
-                for (; i < maxColors; i++)
-                    palette[i] = 0;
-
-                GameImageManager.CurrentTexture.Palette = palette;
-            }
-        }
-    }
-
     public static byte[] SaveIconToByte(byte[] originalData, SKBitmap bitmap)
     {
         if (bitmap.Width != TEX_WIDTH || bitmap.Height != TEX_HEIGHT * 2)

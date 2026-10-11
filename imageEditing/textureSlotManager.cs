@@ -181,18 +181,6 @@ public static class TextureSlotManager
         return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height, slot.Alpha);
     }
 
-    public static byte[] EncodeSlotOctree(TextureSlot slot, SKBitmap bitmap)
-    {
-        if (slot.Kind == TextureMrgKind.Icon)
-        {
-            return PS2Icon.SaveIconToByte(slot.Bytes, bitmap);
-        }
-
-        byte[] rgba = BitmapToRgba(bitmap);
-        rgba = OctreePreQuantise(rgba, bitmap.Width * bitmap.Height);
-        return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height, slot.Alpha);
-    }
-
     public static void PatchMrg(byte[] mrgBytes, List<TextureSlot> slots, int index, byte[] newSlotBytes)
     {
         var slot = slots[index];
@@ -208,12 +196,6 @@ public static class TextureSlotManager
             int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
             Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
         }
-    }
-
-    public static Texture2D RefreshThumbnail(TextureSlot slot, SKBitmap fromBitmap)
-    {
-        Raylib.UnloadTexture(slot.Thumbnail);
-        return BitmapToTexture(fromBitmap);
     }
 
     public static List<SKColor> BuildPalette(SKBitmap bitmap)
@@ -345,14 +327,6 @@ public static class TextureSlotManager
             src.Dispose();
         }
 
-        return tex;
-    }
-
-    public static Texture2D MakePlaceholderThumbnail()
-    {
-        var img = Raylib.GenImageColor(16, 16, Color.Purple);
-        var tex = Raylib.LoadTextureFromImage(img);
-        Raylib.UnloadImage(img);
         return tex;
     }
 

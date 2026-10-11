@@ -108,7 +108,7 @@ public class ViewScene
             changed = true;
         }
         Request();
-        Tip("Grid: the lowest idle point on the grid, at real size (battle draws monsters unscaled)." +
+        HoveredTooltip("Grid: the lowest idle point on the grid, at real size (battle draws monsters unscaled)." +
             "\nDuel board: as the game stands a monster over its card, and in battle (the same height):" +
             "\nnode 0 50 above the grid, which is the card." +
             "\nMap leader: as the map draws the deck leader, at half size, node 0 at a height the game" +
@@ -129,7 +129,7 @@ public class ViewScene
                 {
                     mapCard = Math.Clamp(mapCard, 0, MonsterCount - 1);
                 }
-                Tip("Whose map height to use: the game keeps it per card, not in the model.");
+                HoveredTooltip("Whose map height to use: the game keeps it per card, not in the model.");
             }
             else if (mapCard >= 0 && mapCard < MonsterCount)
             {
@@ -141,7 +141,7 @@ public class ViewScene
                 {
                     mrg.Tables.SetMapLeaderY(mapCard, Math.Clamp(height, sbyte.MinValue, sbyte.MaxValue));
                 }
-                Tip("How high the map stands this card's deck leader (node 0, Target_Model_Y)." +
+                HoveredTooltip("How high the map stands this card's deck leader (node 0, Target_Model_Y)." +
                     "\nThe game keeps it per card, not in the model; Save to ISO writes it.");
             }
             if (pickCard || (mapCard >= 0 && mapCard < MonsterCount))
@@ -152,7 +152,7 @@ public class ViewScene
             ImGui.SameLine();
             ImGui.SetNextItemWidth(FieldWidth(0.15f, 5f));
             ImGui.SliderInt("##arena", ref MapArena, 0, mrg.Tables.Addresses.ArenaCount - 1);
-            Tip("Which map arena the leader stands on; the map moves so that arena is under it.");
+            HoveredTooltip("Which map arena the leader stands on; the map moves so that arena is under it.");
         }
         if (Placement != PlaceFeet && mrg == null)
         {
@@ -164,7 +164,7 @@ public class ViewScene
         {
             ImGui.SameLine();
             ImGui.Checkbox("Debug lines", ref DebugLines);
-            Tip("Yellow: the tile's outline and a post up its centre." +
+            HoveredTooltip("Yellow: the tile's outline and a post up its centre." +
                 "\nGreen: node 1 at rest, the point the game puts over the tile centre (and scales about)." +
                 "\nMagenta: node 0's stand point (50 above the card)." +
                 "\nCyan: the box the idle animation fills (all its frames), its footprint and a post up its middle," +

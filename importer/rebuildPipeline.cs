@@ -49,49 +49,6 @@ public static class RebuildPipeline
 
 
 
-    private sealed class FrameDebugState
-    {
-        public int Root0;
-        public string Root0Name = "";
-        public bool SynthPivot;
-        public int ConsumedRootSlot;
-        public Vector3 BBoxMin;
-        public Vector3 BBoxMax;
-        public Vector3 BBoxCenter;
-        public bool HasGeometry;
-        public Vector3 PlacementPivot;
-        public string PlacementPivotSource = "unknown";
-        public Vector3 CameraTarget;
-        public string CameraTargetSource = "unknown";
-    }
-
-    public sealed class TemplateFrame
-    {
-        /// World-space engine placement pivot: retail GNode(1).pos / animTransScale.
-        public Vector3 PivotWorld;
-
-        /// World-space camera/framing centre from the donor node-tree bounds record.
-        public Vector3 BoundsCenterWorld;
-
-        /// Optional donor bounding radius. Used for diagnostics/comparison only unless an
-        /// explicit compatibility path is intentionally reintroduced elsewhere.
-        public float BoundsRadius;
-
-        public int NodeTreeOffset;
-        public float AnimTransScale;
-        public float RootScale;
-        public Vector3 PivotRaw;
-
-        public bool IsValid =>
-            IsFinite(PivotWorld) && IsFinite(BoundsCenterWorld) && BoundsRadius > 1e-5f &&
-            !float.IsNaN(BoundsRadius) && !float.IsInfinity(BoundsRadius);
-
-        private static bool IsFinite(Vector3 v) =>
-            !float.IsNaN(v.X) && !float.IsInfinity(v.X) &&
-            !float.IsNaN(v.Y) && !float.IsInfinity(v.Y) &&
-            !float.IsNaN(v.Z) && !float.IsInfinity(v.Z);
-    }
-
     public sealed class Result
     {
         public List<EncNode> Nodes = new();
@@ -116,18 +73,13 @@ public static class RebuildPipeline
 
         public List<(int BaseSlot, List<int> MemberSlots)> TexMerges = new();
 
-        /// World auto-fit report. Factor==1 means no rescale. Reason is a human-readable
-        /// explanation (e.g. "model too large") or null when untouched.
-        public float FitFactor = 1f;
+        /// Fixed-point values Q had to clamp (positions, normals, UVs, weights). Nonzero means
+        /// geometry is distorted in game; card 178's hidden arms did this before the extractor
+        /// bound them at full size.
+        public int ClampedValues;
 
-        public double FitOriginalWorld; // model's world extent before any rescale
-        public double FitDonorWorld; // donor template's reference world extent
-        public string? FitReason;
-
-        public string Summary() =>
-            $"nodes={Nodes.Count} pages={Pages.Count} motions={Motions.Count} scale={GlobalScale:G6} " +
-            $"strips={Pages.Sum(p => p.Strips.Count)} " +
-            $"maxBonesPerPage={(Pages.Count == 0 ? 0 : Pages.Max(p => p.BoneBinds.Count))}";
+        /// Animations left out because no motion slot was free (AssignSlotIds).
+        public List<string> DroppedAnimations = new();
     }
 
     /// templateAnimTransScale: header+0x64 of the template model (1/rootScale). When given
@@ -138,23 +90,12 @@ public static class RebuildPipeline
     /// scale. Deriving our own S instead made every animated translation wrong by
     /// retailS/ourS — the cause of off-origin identity imports and flung-apart parts on
     /// static replacements.
-    public static Result Build(ImportedModel im, float templateAnimTransScale = 0f,
-        int templateTexCount = 0, float warnMinRatio = 0.125f, float warnMaxRatio = 2.0f,
-        TemplateFrame? templateFrame = null,
-        bool debugFrame = false, bool adoptTemplateScaleForCustomModels = false,
-        float templateRootScale = 0f, float boundsRadiusOverride = 0f, bool boundsOnly = false)
+    public static Result Build(ImportedModel im, float templateAnimTransScale, int templateTexCount,
+        float templateRootScale, float boundsRadiusOverride, bool boundsOnly)
     {
         if (im.RootNodes.Count == 0) throw new InvalidOperationException("glb has no root node");
-        LastClampedValues = 0;
-        LastDroppedAnimations = new List<string>();
-
-        // ---- 0. donor/template frame is diagnostic only ------------------------------
-        // The imported GLB is the spatial authority. The donor/template MRG is still used
-        // for binary/container/texture/layout data and for comparison in debug output, but
-        // it must not decide the imported model's pivot, camera target, or bounds radius.
-        // Otherwise the same GLB would behave differently depending on the monster slot it
-        // replaces.
-        float donorBoundsRadius = templateFrame is { IsValid: true } ? templateFrame.BoundsRadius : 0f;
+        clampedValues = 0;
+        var droppedAnimations = new List<string>();
 
         // ---- 0a. UV-atlas merge of excess texture slots ----
         // The template's TexTable has a fixed number of RH2 payload slots; pages on slots
@@ -189,12 +130,6 @@ public static class RebuildPipeline
         // it"). PrepareRoot collapses those wrappers; for external models it additionally
         // requests a synthetic pivot (inserted after step 4).
         var (root0, synthPivot, consumedRootSlot) = PrepareRoot(im);
-        var frameDebug = new FrameDebugState {
-            Root0 = root0,
-            Root0Name = GlbPos(im, root0) >= 0 ? im.Nodes[GlbPos(im, root0)].Name : "<unknown>",
-            SynthPivot = synthPivot,
-            ConsumedRootSlot = consumedRootSlot,
-        };
 
         // Frame-generation positions (used for bounds/pivot/radius diagnostics) are just each
         // vertex's encoder position - skinned vertices stay in skin/bind space, unskinned
@@ -207,7 +142,7 @@ public static class RebuildPipeline
 
         bool IsImportHelperNode(int g)
         {
-            int pos = GlbPos(im, g);
+            int pos = g;
             if (pos < 0) return false;
             var n = im.Nodes[pos];
             // Ignore loose, root-level empty helper nodes without relying on specific names.
@@ -222,7 +157,7 @@ public static class RebuildPipeline
             if (IsImportHelperNode(g)) return;
             encIndexOf[g] = order.Count;
             order.Add(g);
-            foreach (int c in im.Nodes[GlbPos(im, g)].Children)
+            foreach (int c in im.Nodes[g].Children)
                 if (!IsImportHelperNode(c))
                     Dfs(c);
         }
@@ -249,22 +184,18 @@ public static class RebuildPipeline
             if (seenJoints.Add(inf.JointNode))
                 effectiveJoints.Add(inf.JointNode);
 
-        // accumulates the world-fit outcome for the caller/UI
-        (float Factor, double OriginalWorld, double DonorWorld, string? Reason) fitReport =
-            (1f, 0, 0, null);
-
         // ---- 2. global scale S ----
         // S must be big enough that inverse(RWS)*world = (1/S)*inverse(world)*world fits s16.
         // A `_bone` joint's vertices are encoded against the bone's bind matrix (step 5), whose
         // scale is its own, so S - which then only scales the root and whatever hangs off it
         // without a `_bone` - is sized from the other joints alone. Any other joint bound away
         // from rest (an unskinned part at scale 0 at rest) uses its bind matrix throughout.
-        bool IsBoneOwner(int g) => im.Nodes[GlbPos(im, g)].ScaleBone >= 0;
+        bool IsBoneOwner(int g) => im.Nodes[g].ScaleBone >= 0;
         var jointWorld = new Dictionary<int, Matrix4x4>();
         foreach (int g in effectiveJoints)
             jointWorld[g] = !IsBoneOwner(g) && im.JointBind.TryGetValue(g, out var bindW)
                 ? bindW
-                : im.Nodes[GlbPos(im, g)].WorldMatrix;
+                : im.Nodes[g].WorldMatrix;
         double maxLocal = 1e-6;
         bool anyPlainJoint = false;
         foreach (var prim in im.Primitives)
@@ -278,33 +209,6 @@ public static class RebuildPipeline
             var lp = Vector3.Transform(v.Pos, invJw);
             if (float.IsNaN(lp.X) || float.IsInfinity(lp.X)) continue;
             maxLocal = Math.Max(maxLocal, Math.Max(Math.Abs(lp.X), Math.Max(Math.Abs(lp.Y), Math.Abs(lp.Z))));
-        }
-
-        // ---- 2.5 size-warning report ----
-        // Use a real model-size metric, not max(|world coordinate|). The older warning used
-        // distance from global origin, so extracted round-trips looked 2-3x "too large"
-        // merely because the authored slot lives far from (0,0,0). Radius-around-camera is
-        // stable for both MrgRoot round-trips and external models.
-        if (!im.IsDotrExtractedGlb && ComputeBounds(im, out var warnMin, out var warnMax))
-        {
-            var warnCenter = im.FittedCameraLookAtWorld ?? im.AuthorCameraLookAtWorld ?? ((warnMin + warnMax) * 0.5f);
-            double srcRadius = Math.Max(ComputeRadius(im, warnCenter), 1e-9f);
-            double donorSize = donorBoundsRadius > 1e-5f ? donorBoundsRadius : srcRadius;
-            double ratio = srcRadius / Math.Max(donorSize, 1e-9);
-            fitReport.OriginalWorld = srcRadius;
-            fitReport.DonorWorld = donorSize;
-            if (ratio > warnMaxRatio)
-                fitReport.Reason =
-                    $"model radius is ~{ratio:0.#}x the donor slot radius — it may look oversized in-game.";
-            else if (ratio < warnMinRatio)
-                fitReport.Reason =
-                    $"model radius is ~{ratio:0.###}x the donor slot radius — it may look tiny in-game.";
-        }
-        else
-        {
-            fitReport.OriginalWorld = 0;
-            fitReport.DonorWorld = donorBoundsRadius > 0 ? donorBoundsRadius : 0;
-            fitReport.Reason = null;
         }
 
         float keepTemplateAts = 0f; // >0: write the template's own animTransScale, not 1/S
@@ -343,9 +247,7 @@ public static class RebuildPipeline
         //   * Extracted DotR GLBs may keep the template scale for round-trip / retail-motion compatibility.
         //   * Custom GLBs generate their own rootScale/animTransScale by default so the same GLB is
         //     not affected by whichever monster slot, or previous import, is used as the binary template.
-        // Enable adoptTemplateScaleForCustomModels only for explicit compatibility experiments.
-        bool mayAdoptTemplateScale = im.IsDotrExtractedGlb || adoptTemplateScaleForCustomModels;
-        if (mayAdoptTemplateScale && templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
+        if (im.IsDotrExtractedGlb && templateAnimTransScale > 0f && !float.IsNaN(templateAnimTransScale) &&
             !float.IsInfinity(templateAnimTransScale))
         {
             // The template's own stored root scale is the authority; 1/animTransScale is only
@@ -378,7 +280,7 @@ public static class RebuildPipeline
         for (int i = 0; i < order.Count; i++)
         {
             int g = order[i];
-            var src = im.Nodes[GlbPos(im, g)];
+            var src = im.Nodes[g];
             var nd = nodes[i];
             nd.Flags = 0;
             nd.MeshSlot = (ushort)(meshSlotOf.TryGetValue(g, out int ms) ? ms : 0);
@@ -423,7 +325,7 @@ public static class RebuildPipeline
         // carried as they were.
         for (int i = 0; i < nodes.Count; i++)
         {
-            var fm = System.Text.RegularExpressions.Regex.Match(im.Nodes[GlbPos(im, order[i])].Name, @"_f([0-9A-F]{4})(?:_|$)");
+            var fm = System.Text.RegularExpressions.Regex.Match(im.Nodes[order[i]].Name, @"_f([0-9A-F]{4})(?:_|$)");
             if (!fm.Success) continue;
             int f = Convert.ToInt32(fm.Groups[1].Value, 16);
             var nd = nodes[i];
@@ -434,11 +336,6 @@ public static class RebuildPipeline
         }
 
         bool hasBounds = ComputeBounds(im, out var geomMin, out var geomMax);
-        var geomCenter = hasBounds ? (geomMin + geomMax) * 0.5f : Vector3.Zero;
-        frameDebug.HasGeometry = hasBounds;
-        frameDebug.BBoxMin = hasBounds ? geomMin : Vector3.Zero;
-        frameDebug.BBoxMax = hasBounds ? geomMax : Vector3.Zero;
-        frameDebug.BBoxCenter = geomCenter;
 
         // ---- 4.5 GNode(1) pivot for external models ----
         // CONFIRMED RETAIL STRUCTURE (verified on blue-eyes_white_dragon.mrg's node tree AND
@@ -483,12 +380,7 @@ public static class RebuildPipeline
         // wrapper above the armature/mesh content - there is no way to synthesize that
         // automatically from geometry alone.
         if (synthPivot)
-            InsertGeneratedPivot(im, nodes, encIndexOf, S, frameDebug, hasBounds ? geomMin : null, hasBounds ? geomMax : null);
-        else if (nodes.Count > 1)
-        {
-            frameDebug.PlacementPivot = new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S);
-            frameDebug.PlacementPivotSource = "existing GNode(1)";
-        }
+            InsertGeneratedPivot(nodes, encIndexOf, S, hasBounds ? geomMin : null, hasBounds ? geomMax : null);
 
         // ---- 4.6/4.7 camera target ----
         // SzModel_GetCenter@0x1f2050 returns handle+0x80, which SzModel_DrawWithFunc_Pipe@0x1ec350
@@ -498,8 +390,6 @@ public static class RebuildPipeline
         Vector3 cameraTarget = nodes.Count > 1
             ? new Vector3(nodes[1].Pos.X * S, nodes[1].Pos.Y * S, nodes[1].Pos.Z * S)
             : Vector3.Zero;
-        frameDebug.CameraTarget = cameraTarget;
-        frameDebug.CameraTargetSource = nodes.Count > 1 ? "GNode(1) (matches live SzModel_GetCenter)" : "no GNode(1): origin";
 
         // ---- 5. per-joint RestWorldSkin = Scale(S) * glbWorld ; cache inverse + 3x3 inverse ----
         // A `_bone` joint encodes against its bind matrix scaled by sigma: bone-local
@@ -673,7 +563,7 @@ public static class RebuildPipeline
             int slotId = slotOf[animIndex++];
             if (slotId < 0)
             {
-                (LastDroppedAnimations ??= new List<string>()).Add(anim.Name);
+                droppedAnimations.Add(anim.Name);
                 continue;
             }
             int frames = Math.Max(anim.FrameCount, 1);
@@ -746,19 +636,14 @@ public static class RebuildPipeline
             motions.Add(motion);
         }
 
-        if (debugFrame)
-            DumpFrameDebug(im, templateFrame, frameDebug, nodes, S, AnimTransScale, boundsCenter, boundsRadius);
-
         return new Result {
             Nodes = nodes, Pages = pages, Motions = motions,
             GlobalScale = S, AnimTransScale = AnimTransScale,
             BoundsCenter = boundsCenter, BoundsRadius = WrittenRadius(boundsRadius, boundsRadiusOverride),
             MaxMeshSlot = effectiveJoints.Count > 0 ? 1 + 7 * (effectiveJoints.Count - 1) : 0,
             TexMerges = texMerges,
-            FitFactor = fitReport.Factor,
-            FitOriginalWorld = fitReport.OriginalWorld,
-            FitDonorWorld = fitReport.DonorWorld,
-            FitReason = fitReport.Reason,
+            ClampedValues = clampedValues,
+            DroppedAnimations = droppedAnimations,
         };
     }
 
@@ -1441,26 +1326,17 @@ public static class RebuildPipeline
     /// i.e. low in the body, not mid-body) and gives a stable, geometry-derived static
     /// placement instead of an arbitrary authoring-space coordinate. It remains strictly a
     /// fallback: prefer an explicit, animated pivot node whenever camera-follow matters.
-    private static void InsertGeneratedPivot(ImportedModel im, List<EncNode> nodes,
-        Dictionary<int, int> encIndexOf, float S, FrameDebugState debug,
+    private static void InsertGeneratedPivot(List<EncNode> nodes,
+        Dictionary<int, int> encIndexOf, float S,
         Vector3? geomMin = null, Vector3? geomMax = null)
     {
         if (nodes.Count == 0 || S <= 0f) return;
 
-        Vector3 pivotWorld;
-        string source;
+        Vector3 pivotWorld = Vector3.Zero;
         if (geomMin is { } gMin && geomMax is { } gMax)
         {
             pivotWorld = new Vector3((gMin.X + gMax.X) * 0.5f, gMin.Y, (gMin.Z + gMax.Z) * 0.5f);
-            source = "FALLBACK (static, no camera-follow): geometry horizontal centre / vertical base - no explicit animated 'origin'/'dotr_center' node found";
         }
-        else
-        {
-            pivotWorld = Vector3.Zero;
-            source = "FALLBACK (static, no camera-follow): world origin - no geometry and no explicit pivot node found";
-        }
-        debug.PlacementPivot = pivotWorld;
-        debug.PlacementPivotSource = source;
 
         // remap every index >= 1 to +1
         foreach (var nd in nodes)
@@ -1488,75 +1364,6 @@ public static class RebuildPipeline
         };
         nodes.Insert(1, pivot);
         nodes[0].Children.Insert(0, 1);
-    }
-
-    private static void DumpFrameDebug(ImportedModel im, TemplateFrame? templateFrame, FrameDebugState dbg,
-        List<EncNode> nodes, float rootScale, float animTransScale, Vector3 boundsCenter, float boundsRadius)
-    {
-        static string V(Vector3 v) => $"({v.X:G9}, {v.Y:G9}, {v.Z:G9})";
-        static string N(string? s) => string.IsNullOrWhiteSpace(s) ? "<unnamed>" : s!;
-
-        Console.WriteLine("=== DOTR FRAME DEBUG ===");
-        Console.WriteLine("GLB:");
-        Console.WriteLine($"  IsDotrExtractedGlb: {im.IsDotrExtractedGlb}");
-        Console.WriteLine($"  Nodes: {im.Nodes.Count}");
-        Console.WriteLine($"  Joints: {im.JointNodeIndices.Count}");
-        Console.WriteLine($"  Root nodes: {string.Join(", ", im.RootNodes.Select(r =>
-        {
-            int pos = GlbPos(im, r);
-            return pos >= 0 ? $"{r}:{N(im.Nodes[pos].Name)}" : $"{r}:<missing>";
-        }))}");
-        Console.WriteLine($"  Has MrgRoot: {im.Nodes.Any(n => n.Name == "MrgRoot")}");
-        Console.WriteLine("  Authoring markers: ignored in DOTR-convention mode");
-        Console.WriteLine($"  Geometry bbox valid: {dbg.HasGeometry}");
-        Console.WriteLine($"  Geometry bbox min: {V(dbg.BBoxMin)}");
-        Console.WriteLine($"  Geometry bbox max: {V(dbg.BBoxMax)}");
-        Console.WriteLine($"  Geometry bbox center: {V(dbg.BBoxCenter)}");
-        Console.WriteLine();
-
-        Console.WriteLine("Template MRG diagnostics only:");
-        if (templateFrame is { IsValid: true })
-        {
-            Console.WriteLine($"  nodeTree offset: 0x{templateFrame.NodeTreeOffset:X}");
-            Console.WriteLine($"  animTransScale: {templateFrame.AnimTransScale:G9}");
-            Console.WriteLine($"  rootScale: {templateFrame.RootScale:G9}");
-            Console.WriteLine($"  GNode(1) raw pos: {V(templateFrame.PivotRaw)}");
-            Console.WriteLine($"  GNode(1) world pivot: {V(templateFrame.PivotWorld)}");
-            Console.WriteLine($"  bounds center: {V(templateFrame.BoundsCenterWorld)}");
-            Console.WriteLine($"  bounds radius: {templateFrame.BoundsRadius:G9}");
-        }
-        else
-        {
-            Console.WriteLine("  <unavailable>");
-        }
-        Console.WriteLine();
-
-        Console.WriteLine("Generated:");
-        Console.WriteLine($"  root0: {dbg.Root0}:{N(dbg.Root0Name)}");
-        Console.WriteLine($"  synthPivot: {dbg.SynthPivot}");
-        Console.WriteLine($"  consumedRootSlot: {dbg.ConsumedRootSlot}");
-        Console.WriteLine($"  generated node count: {nodes.Count}");
-        Console.WriteLine($"  generated animTransScale: {animTransScale:G9}");
-        Console.WriteLine($"  generated rootScale: {rootScale:G9}");
-        if (nodes.Count > 1)
-        {
-            var raw = new Vector3(nodes[1].Pos.X, nodes[1].Pos.Y, nodes[1].Pos.Z);
-            var world = raw * rootScale;
-            Console.WriteLine($"  generated GNode(1) raw pos: {V(raw)}");
-            Console.WriteLine($"  generated GNode(1) world pivot: {V(world)}");
-        }
-        else
-        {
-            Console.WriteLine("  generated GNode(1): <missing>");
-        }
-        Console.WriteLine($"  selected pivot source: {dbg.PlacementPivotSource}");
-        Console.WriteLine($"  selected pivot world: {V(dbg.PlacementPivot)}");
-        Console.WriteLine($"  bounds center source: {dbg.CameraTargetSource}");
-        Console.WriteLine($"  selected bounds center world: {V(dbg.CameraTarget)}");
-        Console.WriteLine($"  generated bounds center: {V(boundsCenter)}");
-        Console.WriteLine($"  generated bounds radius: {boundsRadius:G9}");
-        Console.WriteLine("  note: DOTR convention uses GNode(1) at origin as the animated control/camera coordinate.");
-        Console.WriteLine("========================");
     }
 
     // Motion slots are battle roles (NOTES/models.md in DotR-PC): 0 idle, 2 attack, 4 death, 5 win,
@@ -2079,7 +1886,6 @@ public static class RebuildPipeline
     }
 
     // ---- helpers --------------------------------------------------------------------
-    private static int GlbPos(ImportedModel im, int glbIndex) => glbIndex; // ImportedModel.Nodes is indexed by logical index
 
     /// A "pure mesh-instancing leaf": HasMesh, no children, not itself a skin joint, and
     /// crucially none of its own vertices are influenced by its own node index (i.e. its
@@ -2098,7 +1904,7 @@ public static class RebuildPipeline
     /// being present in the encoded tree at all.
     private static bool IsPureMeshInstancingLeaf(ImportedModel im, int g)
     {
-        int pos = GlbPos(im, g);
+        int pos = g;
         if (pos < 0) return false;
         var n = im.Nodes[pos];
         if (!n.HasMesh || n.IsJoint || n.Children.Count != 0) return false;
@@ -2137,19 +1943,14 @@ public static class RebuildPipeline
         return (Q(n.X), Q(n.Y), Q(n.Z));
     }
 
-    /// Fixed-point values Q had to clamp in the last Build (positions, normals, UVs, weights).
-    /// Nonzero means geometry is distorted in game; card 178's hidden arms did this before the
-    /// extractor bound them at full size.
-    [ThreadStatic] public static int LastClampedValues;
-
-    /// Animations the last Build left out because no motion slot was free (AssignSlotIds).
-    [ThreadStatic] public static List<string>? LastDroppedAnimations;
+    /// Counts Q's clamps for the Build running on this thread (Result.ClampedValues).
+    [ThreadStatic] static int clampedValues;
 
     private static short Q(float v)
     {
         int r = (int)MathF.Round(v);
-        if (r > 32767) { r = 32767; LastClampedValues++; }
-        else if (r < -32768) { r = -32768; LastClampedValues++; }
+        if (r > 32767) { r = 32767; clampedValues++; }
+        else if (r < -32768) { r = -32768; clampedValues++; }
         return (short)r;
     }
 

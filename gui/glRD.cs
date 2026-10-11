@@ -38,12 +38,6 @@ public static class glRD
 
     public static Vector2 P(float x_per, float y_per) => new Vector2(cur_win_w * (x_per / 100f), cur_win_h * (y_per / 100f));
 
-
-    public static float PW(float per) => cur_win_w * (per / 100f);
-
-
-    public static float PH(float per) => cur_win_h * (per / 100f);
-
     // A field's width: a share of the room left on the line, but never under minEm font heights.
     public static float FieldWidth(float share, float minEm)
     {
@@ -51,7 +45,7 @@ public static class glRD
     }
 
     // The tooltip for the item just drawn.
-    public static void Tip(string text)
+    public static void HoveredTooltip(string text)
     {
         if (ImGui.IsItemHovered())
         {

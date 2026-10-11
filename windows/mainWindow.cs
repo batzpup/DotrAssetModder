@@ -5,14 +5,12 @@ namespace DotrAssetModder;
 
 public class MainWindow
 {
-    float title_padding_per = 0.5f;
     Windows current_window = Windows.Extractor;
 
     ExtractorWindow extract_window;
     TextureEditorWindow texture_window;
     ModelViewerWindow model_window;
     ModelImporterWindow import_window;
-    MusicExtractorWindow music_window;
 
 
     public enum Windows

@@ -95,43 +95,50 @@ public static class Rh0Assembler
     /// matching pre-existing non-interactive behaviour).
     public delegate bool ConfirmReduction(OverflowCategory category, int categoryBytes, int totalBytes, int budget);
 
-    /// Texture slots the last Assemble shed because the grown table did not fit the block,
-    /// each with the slot its pages were drawn from instead (the wrong texture).
-    [ThreadStatic] public static List<(int Slot, int Onto)>? LastShedTexSlots;
-
-    /// How far the last Assemble()'s finished block overshot its budget, in bytes (0 = it fits),
-    /// and the section/payload that first crossed the line. Assemble() never throws on overflow:
-    /// it returns the complete block so the caller can report "over by N B" and decide.
-    /// GS pages the textures of the last Assemble take (one per RH2 section), and how many
-    /// halvings the page cap made. See the page cap in Assemble.
+    /// See the page cap in Assemble.
     public const int MaxModelTexturePages = 31;
-    [ThreadStatic] public static int LastTexturePages;
-    [ThreadStatic] public static int LastHalvedForPages;
 
-    [ThreadStatic] public static int LastOverflowBytes;
-    [ThreadStatic] public static string? LastOverflowLabel;
+    /// Largest width/height (power of two) a texture is rebuilt at.
+    public const int MaxTextureDim = 512;
 
-    public static byte[] Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
-        IReadOnlyList<TextureInput>? textures = null, int blockSize = 0x100000,
-        bool rebuildNative = false, int maxTexDim = 512,
-        bool neutralMissingTextures = true, bool preserveTemplateAnm = false,
-        bool trimToContent = false, ConfirmReduction? confirmReduction = null,
-        bool ownSizeTextures = false)
+    public sealed class Result
+    {
+        public byte[] Block = Array.Empty<byte>();
+
+        /// Texture slots shed because the grown table did not fit the block, each with the slot
+        /// its pages were drawn from instead (the wrong texture).
+        public List<(int Slot, int Onto)> ShedTexSlots = new();
+
+        /// GS pages the textures take (one per RH2 section), and how many halvings the page cap made.
+        public int TexturePages;
+        public int HalvedForPages;
+
+        /// How far the finished block overshot its budget, in bytes (0 = it fits), and the
+        /// section/payload that first crossed the line. Assemble never throws on overflow: it
+        /// returns the complete block so the caller can report "over by N B" and decide.
+        public int OverflowBytes;
+        public string? OverflowLabel;
+
+        /// Battle slots the motions lacked, filled with a copy of another (MotWriter).
+        public List<(int Slot, int From)> MotionClones = new();
+    }
+
+    public static Result Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
+        IReadOnlyList<TextureInput>? textures, int blockSize, bool trimToContent,
+        ConfirmReduction confirmReduction, bool ownSizeTextures)
     {
         if (U32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
-        LastOverflowBytes = 0;
-        LastOverflowLabel = null;
+        var result = new Result();
 
         // ---- regenerate blocks ----
         byte[] nodeTree = NodeTreeWriter.Write(rebuilt.Nodes,
             (rebuilt.BoundsCenter.X, rebuilt.BoundsCenter.Y, rebuilt.BoundsCenter.Z), rebuilt.BoundsRadius);
         GeometryWriteResult geo = GeometryWriter.Write(rebuilt.Pages, rebuilt.MaxMeshSlot); // also fills EncPage.WalkOff
-        byte[] motBlocks; int motByte;
         // The template's own MOT slots (sectionFlags low byte, bit per slot): MotWriter only
         // guarantees the battle slots the template carries, because retail omits one only for
         // a card the game never plays it for (671, Exodia). 0 = no MOTs, i.e. not retail-like.
         int tplMotByte = (int)(U32(originalMrg, 0x04) & 0xFF);
-        (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, 1, 0f, tplMotByte);
+        MotWriter.Result mot = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, 1, 0f, tplMotByte);
 
         // ---- textures: per TexTable entry, build RH2 + ANM ----
         // The TexTable count is NOT fixed to the template's: every texture-context record
@@ -274,18 +281,17 @@ public static class Rh0Assembler
                 {
                     // Image-space records: a native PSMT8 build, never the donor's size or
                     // format, so ScaleTexAnimRecords below knows the texel grid they land on.
-                    var (tw, th) = Rh2Encoder.ChooseTarget(ti.Width, ti.Height, maxTexDim);
+                    var (tw, th) = Rh2Encoder.ChooseTarget(ti.Width, ti.Height, MaxTextureDim);
                     rh2[i] = Rh2Encoder.BuildNative(ti.Rgba, ti.Width, ti.Height, tw, th);
                     usedNative[i] = true;
                 }
                 else
                 {
                     // Normal single static texture - regular donor-fit/native encode path.
-                    rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, rebuildNative, maxTexDim,
-                        ownSizeTextures, out usedNative[i]);
+                    rh2[i] = EncodeTexture(donor, ti.Rgba, ti.Width, ti.Height, ownSizeTextures, out usedNative[i]);
                 }
             }
-            else if (neutralMissingTextures)
+            else
             {
                 // Do not inherit whatever picture happened to be in this slot from a previous
                 // import. A flat white texture carries no detail, so build it at the smallest
@@ -293,15 +299,10 @@ public static class Rh0Assembler
                 rh2[i] = Rh2Encoder.BuildNative(CreateNeutralRgba(MinTexW, MinTexH), MinTexW, MinTexH,
                     MinTexW, MinTexH);
             }
-            else
-            {
-                rh2[i] = donor.ToArray(); // explicit legacy mode: template texture verbatim
-            }
 
-            // Texture animation: a custom flipbook from the glb takes priority
-            // and is synthesized fresh. Otherwise, template ANM is carried over only when
-            // preserveTemplateAnm is set (default off for custom imports, to prevent
-            // previous-slot ANM bleeding into an unrelated GLB).
+            // Texture animation: a custom flipbook from the glb takes priority and is synthesized
+            // fresh. The template's own ANM is never carried over (it would bleed a previous
+            // slot's animation into an unrelated glb).
             if (byTex.TryGetValue(i, out var anmTi) && anmTi.AnimFrameCount > 1)
             {
                 anm[i] = BuildCustomTexAnimEntry(anmTi.AnimFrameCount, anmTi.AnimCols, anmTi.AnimRows,
@@ -311,15 +312,12 @@ public static class Rh0Assembler
             {
                 // The slot's own records, carried on the glb (an extracted model's retail
                 // animation). They come from the model being imported, not from whatever
-                // happens to sit in this template slot, so they need no preserve lever.
+                // happens to sit in this template slot.
                 anm[i] = records;
             }
             else
             {
-                int postOff = preserveTemplateAnm && i < origCount
-                    ? (int)U32(originalMrg, origTt + 0x10 + i * 16 + 8)
-                    : 0;
-                anm[i] = postOff > 0 ? TexAnmWriter.ExtractEntries(originalMrg, postOff) : Array.Empty<byte>();
+                anm[i] = Array.Empty<byte>();
             }
         }
 
@@ -330,7 +328,6 @@ public static class Rh0Assembler
         // model is drawn (45 pages did). The most a playable retail monster uses is 31
         // (Electromagnetic Bagworm; Summoned Lord Exodia's 35 is not a playable card), so halve
         // the largest supplied texture until the model fits that.
-        LastHalvedForPages = 0;
         if (ownSizeTextures)
         {
             var pageFloor = new bool[texCount];
@@ -351,10 +348,10 @@ public static class Rh0Assembler
                 if (Rh2Pages(smaller) >= Rh2Pages(rh2[big])) { pageFloor[big] = true; continue; }
                 rh2[big] = smaller;
                 usedNative[big] = true;
-                LastHalvedForPages++;
+                result.HalvedForPages++;
             }
         }
-        LastTexturePages = TexturePages(rh2, texCount);
+        result.TexturePages = TexturePages(rh2, texCount);
 
         // ---- aux lists ----
         // aux0/aux1 are LAYOUT-DEPENDENT: per-frame fixup lists for lRhModel_DynamicAddressBind
@@ -398,7 +395,7 @@ public static class Rh0Assembler
             Add(aux2.Length);
             for (int i = 0; i < count; i++) Add(rh2[i].Length);
             for (int i = 0; i < count; i++) Add(anm[i].Length);
-            Add(motBlocks.Length);
+            Add(mot.Blocks.Length);
             Add(postMotEarly.Length);
             return c;
         }
@@ -408,11 +405,11 @@ public static class Rh0Assembler
         // headroom before anything the user authored. Progressively decimate their keys,
         // ending with a static pose (one key per track). Card 671 no longer clones at all
         // (its template has no slots 4-6), but a custom glb over a fuller template still can.
-        if (EstimateTotal(texCount) > blockSize && MotWriter.LastClones is { Count: > 0 })
+        if (EstimateTotal(texCount) > blockSize && mot.Clones.Count > 0)
         {
             foreach (int stride in new[] { 2, 4, 8, 16, 32, MotWriter.StaticPose })
             {
-                (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, stride, 0f, tplMotByte);
+                mot = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, stride, 0f, tplMotByte);
                 if (EstimateTotal(texCount) <= blockSize) break;
             }
         }
@@ -421,13 +418,11 @@ public static class Rh0Assembler
         // headroom. The larger of {texture, animation} - by raw byte share of the budget -
         // is offered first; when that lever alone cannot free enough, the other one is
         // offered as well instead of failing in Place().
-        // confirmReduction == null preserves fully-automatic behaviour (the levers apply
-        // unconditionally, as before) for callers that don't want to ask, e.g. batch imports.
         if (EstimateTotal(texCount) > blockSize)
         {
             int texBytesPre = 0;
             for (int i = 0; i < texCount; i++) texBytesPre += rh2[i].Length;
-            var order = texBytesPre > motBlocks.Length
+            var order = texBytesPre > mot.Blocks.Length
                 ? new[] { OverflowCategory.Texture, OverflowCategory.Animation }
                 : new[] { OverflowCategory.Animation, OverflowCategory.Texture };
             foreach (var category in order)
@@ -438,8 +433,8 @@ public static class Rh0Assembler
                 if (category == OverflowCategory.Texture)
                     for (int i = 0; i < texCount; i++) categoryBytes += rh2[i].Length;
                 else
-                    categoryBytes = motBlocks.Length;
-                bool apply = confirmReduction?.Invoke(category, categoryBytes, totalPre, blockSize) ?? true;
+                    categoryBytes = mot.Blocks.Length;
+                bool apply = confirmReduction(category, categoryBytes, totalPre, blockSize);
                 if (!apply) break; // declined: don't go on to offer the other lever
                 if (category == OverflowCategory.Texture) ReduceTextures();
                 else ReduceMotion();
@@ -452,11 +447,11 @@ public static class Rh0Assembler
         void ReduceMotion()
         {
             int cloneStride = 1;
-            if (MotWriter.LastClones is { Count: > 0 })
+            if (mot.Clones.Count > 0)
                 cloneStride = MotWriter.StaticPose; // the automatic step already ran out
             foreach (float tol in new[] { 2f, 4f, 8f, 16f, 32f })
             {
-                (motBlocks, motByte) = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, cloneStride, tol, tplMotByte);
+                mot = MotWriter.Write(rebuilt.Nodes.Count, rebuilt.Motions, cloneStride, tol, tplMotByte);
                 if (EstimateTotal(texCount) <= blockSize) break;
             }
         }
@@ -466,7 +461,7 @@ public static class Rh0Assembler
         // throwing. Falls through to Place()'s error if even 128x64 everywhere is too big.
         void ReduceTextures()
         {
-            // 1. native slots (rebuildNative) back to the donor-fit encode, where that is smaller
+            // 1. native slots back to the donor-fit encode, where that is smaller
             while (EstimateTotal(texCount) > blockSize)
             {
                 int big = -1, bigLen = -1;
@@ -522,8 +517,7 @@ public static class Rh0Assembler
             }
 
         while (texCount > origCount && EstimateTotal(texCount) > blockSize) texCount--;
-        var shed = new List<(int Slot, int Onto)>();
-        LastShedTexSlots = shed;
+        var shed = result.ShedTexSlots;
         if (texCount != rh2.Length)
         {
             Array.Resize(ref rh2, texCount);
@@ -586,11 +580,11 @@ public static class Rh0Assembler
                 // import, and a pack model that misses its slot by a few bytes must come back as
                 // a complete block with a clean "over by N B" (the slot check in
                 // ModelMrg.Build / the caller's own size compare) instead of dying here
-                // with a half-assembled buffer. Grow and keep going; LastOverflowBytes and
-                // LastOverflowLabel record how far over the budget the finished block is.
+                // with a half-assembled buffer. Grow and keep going; OverflowBytes and
+                // OverflowLabel record how far over the budget the finished block is.
                 Array.Resize(ref outBuf, cursor);
-                if (LastOverflowBytes == 0) LastOverflowLabel = label;
-                LastOverflowBytes = cursor - blockSize;
+                if (result.OverflowBytes == 0) result.OverflowLabel = label;
+                result.OverflowBytes = cursor - blockSize;
             }
             Array.Copy(data, 0, outBuf, o, data.Length);
             return o;
@@ -649,14 +643,14 @@ public static class Rh0Assembler
         // block's computed end equal its own start (a phantom zero-length block). With no
         // chain content, header[0x0C] must instead hold the cursor's current value - the
         // real, already-placed end of the block (node tree + geometry + textures) - exactly
-        // like the motBlocks.Length>0 branch's `motOff = Place(motBlocks)` does for a
+        // like the mot.Blocks.Length>0 branch's `motOff = Place(mot.Blocks)` does for a
         // non-empty chain. Without it the block end is wrong for every assembled model with
         // zero embedded motion and zero trailing chain data, i.e. most custom GLBs.
         byte[] postMot = postMotEarly;
         int motOff;
-        if (motBlocks.Length > 0)
+        if (mot.Blocks.Length > 0)
         {
-            motOff = Place(motBlocks, "motBlocks");
+            motOff = Place(mot.Blocks, "motBlocks");
             if (postMot.Length > 0) Place(postMot, "postMot"); // contiguous: cursor flows from MOTs into it
         }
         else if (postMot.Length > 0)
@@ -672,7 +666,7 @@ public static class Rh0Assembler
         FillTexTable(outBuf, texTableOff, texCount, dispatch, rh2Offs, anmOffs);
 
         // ---- header fixups ----
-        W32(outBuf, 0x04, ((uint)U32(originalMrg, 0x04) & 0xFFFFFF00u) | (uint)(motByte & 0xFF)); // keep upper flag bits
+        W32(outBuf, 0x04, ((uint)U32(originalMrg, 0x04) & 0xFFFFFF00u) | (uint)(mot.SectionFlagsByte & 0xFF)); // keep upper flag bits
         W32(outBuf, 0x08, (uint)modelEnd);
         W32(outBuf, 0x0C, (uint)motOff);
         int[] secOff = { nodeTreeOff, section1Off, section2Off, section1AltOff, section2AltOff,
@@ -692,7 +686,7 @@ public static class Rh0Assembler
         // points at garbage and SzModel_BattleSeq spawns its particle effect at world origin.
         // Re-walk the just-written block with the same logic the engine uses and fail the
         // build (with a precise message) instead of shipping a model that spawns at (0,0,0).
-        ValidateRegionChain(outBuf, cursor, motByte);
+        ValidateRegionChain(outBuf, cursor, mot.SectionFlagsByte);
 
         if (trimToContent)
         {
@@ -704,9 +698,11 @@ public static class Rh0Assembler
             // dictates the returned array's length.
             var trimmed = new byte[cursor];
             Array.Copy(outBuf, 0, trimmed, 0, cursor);
-            return trimmed;
+            outBuf = trimmed;
         }
-        return outBuf;
+        result.Block = outBuf;
+        result.MotionClones = mot.Clones;
+        return result;
     }
 
     // ---- TexTable -------------------------------------------------------------------
@@ -972,22 +968,18 @@ public static class Rh0Assembler
     // ownSize (custom models): never take the donor's size, which scaled a 64x64 image up to the
     // donor's 256x128 and cost 5 GS pages for 1 (Alpha the Magnet Warrior over card 0: 45 pages).
     private static byte[] EncodeTexture(ReadOnlySpan<byte> donor, byte[] rgba, int w, int h,
-        bool allowNative, int maxDim, bool ownSize, out bool wentNative)
+        bool ownSize, out bool wentNative)
     {
         wentNative = false;
         bool haveDonor = !donor.IsEmpty && donor.Length >= 0x60;
-        if (haveDonor && !(allowNative && ownSize))
+        if (haveDonor && !ownSize)
         {
             var (decW, decH) = DonorDecodedDims(donor);
-            if (!allowNative || (w <= decW && h <= decH))
+            if (w <= decW && h <= decH)
                 return Rh2Encoder.Encode(donor, rgba, w, h);
         }
-        else if (!allowNative)
-        {
-            return donor.ToArray(); // empty donor and native off: nothing to encode into
-        }
 
-        var (tw, th) = Rh2Encoder.ChooseTarget(w, h, maxDim);
+        var (tw, th) = Rh2Encoder.ChooseTarget(w, h, MaxTextureDim);
         wentNative = true;
         return Rh2Encoder.BuildNative(rgba, w, h, tw, th);
     }

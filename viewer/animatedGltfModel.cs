@@ -1,7 +1,6 @@
 ﻿using System.Numerics;
 using System.Text.Json.Nodes;
 using Raylib_cs;
-using DotrAssetModder;
 using SharpGLTF.Schema2;
 using SharpGLTF.Runtime;
 using SharpGLTF.Materials;
@@ -32,6 +31,7 @@ using RlMesh       = Raylib_cs.Mesh;
 using RlMaterial   = Raylib_cs.Material;
 using RlImage      = Raylib_cs.Image;   // SharpGLTF.Schema2 also declares Image
 using GltfMaterial = SharpGLTF.Schema2.Material;
+namespace DotrAssetModder;
 
 
 

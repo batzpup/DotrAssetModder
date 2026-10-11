@@ -17,8 +17,6 @@ public class MusicExtractorWindow
     string playStopButton = "Play";
     int currentBGMIndex;
 
-    ImFontPtr font;
-
     CurrentMusicMode currentMode = CurrentMusicMode.BGM;
 
     string bgmPath;
@@ -76,7 +74,6 @@ public class MusicExtractorWindow
     {
         waveOut = new WaveOutEvent();
         waveOut.Volume = 0.1f;
-        font = FontManager.GetFont(FontManager.FontFamily.NotoSansJP, 32);
 
         bgmPath = Path.Combine(MusicDirectory, "BGM");
         pcmPath = Path.Combine(bgmPath, "Original_PCM");
@@ -189,10 +186,8 @@ public class MusicExtractorWindow
                 return ExtractCard(isoFile);
             case CurrentMusicMode.Monster:
                 return ExtractMonster(isoFile);
-                break;
             case CurrentMusicMode.System:
                 return ExtractSystem(isoFile);
-                break;
             default:
                 throw new ArgumentOutOfRangeException();
         }

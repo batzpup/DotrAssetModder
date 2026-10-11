@@ -557,23 +557,20 @@ public class ModelMrg : IDisposable
     // never staged: the result says by how much it is over and the staging list is unchanged.
     // allowReduction lets the assembler shrink textures / animation precision to fit; off by
     // default, so an over-slot model is reported, not quietly degraded.
-    public StageResult Stage(int entryIndex, string glbPath, bool allowReduction = false,
-        int maxTextureDim = 512)
+    public StageResult Stage(int entryIndex, string glbPath, bool allowReduction = false)
     {
-        return StageModel(entryIndex, null, glbPath, allowReduction, maxTextureDim);
+        return StageModel(entryIndex, null, glbPath, allowReduction);
     }
 
     // The same, from glb bytes already in memory (the model converter's output). glbLabel is only
     // the name the staging list shows for it, usually the source file's path.
-    public StageResult Stage(int entryIndex, byte[] glb, string glbLabel, bool allowReduction = false,
-        int maxTextureDim = 512)
+    public StageResult Stage(int entryIndex, byte[] glb, string glbLabel, bool allowReduction = false)
     {
-        return StageModel(entryIndex, glb, glbLabel, allowReduction, maxTextureDim);
+        return StageModel(entryIndex, glb, glbLabel, allowReduction);
     }
 
     // glb null: read it from glbPath instead, which is then also the staged block's source name.
-    StageResult StageModel(int entryIndex, byte[]? glb, string glbPath, bool allowReduction,
-        int maxTextureDim)
+    StageResult StageModel(int entryIndex, byte[]? glb, string glbPath, bool allowReduction)
     {
         Block? b = Find(entryIndex);
         if (b == null)
@@ -598,8 +595,10 @@ public class ModelMrg : IDisposable
             {
                 imported = GlbImporter.LoadFromBytes(glb);
             }
-            built = Rebuilder.Import(imported, BlockBytes(entryIndex), (int)b.Slot, true,
-                (category, categoryBytes, totalBytes, budget) => allowReduction, res.Warnings, maxTextureDim);
+            Rebuilder.ImportResult import = Rebuilder.Import(imported, BlockBytes(entryIndex), (int)b.Slot, true,
+                (category, categoryBytes, totalBytes, budget) => allowReduction);
+            built = import.Block;
+            res.Warnings.AddRange(import.Warnings);
         }
         catch (Exception ex)
         {

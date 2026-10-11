@@ -38,15 +38,6 @@ public class PaintCanvas
         redoStack.Clear();
     }
 
-    public PaintCanvas(int width, int height, SKColor? background = null)
-    {
-        Bitmap = new SKBitmap(width, height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
-        using var canvas = new SKCanvas(Bitmap);
-        canvas.Clear(background ?? SKColors.White);
-        CreateTexture();
-        UploadToTexture();
-    }
-
     public PaintCanvas(SKBitmap bitmap)
     {
         LoadBitmap(bitmap);

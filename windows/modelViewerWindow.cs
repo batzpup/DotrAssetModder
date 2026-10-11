@@ -3,15 +3,14 @@ using Raylib_cs;
 using rlImGui_cs;
 using System.Linq;
 using System.Numerics;
-using DotrAssetModder;
 using NativeFileDialogSharp;
+namespace DotrAssetModder;
 
 public class ModelViewerWindow
 {
     AnimatedGltfModel model;
     bool modelLoaded = false;
     string loadError = null;
-    string loadedPath = string.Empty;
 
 
     string[] modelFiles = Array.Empty<string>();
@@ -36,7 +35,6 @@ public class ModelViewerWindow
 
     OrbitCamera orbit = new OrbitCamera();
     Vector2 savedMousePos;
-    bool freeLooking = false;
     int flySpeed = 50;
 
 
@@ -119,15 +117,6 @@ public class ModelViewerWindow
         LoadModel(modelFiles[0]);
     }
 
-    // The shown model's file name; empty when it was loaded by itself, not from a folder.
-    string CurrentName()
-    {
-        if (currentModelIndex >= 0 && currentModelIndex < modelFiles.Length)
-        {
-            return modelFiles[currentModelIndex];
-        }
-        return loadedPath;
-    }
 
     void GoToModelIndex(int index)
     {
@@ -138,7 +127,6 @@ public class ModelViewerWindow
 
     public void LoadModel(string path)
     {
-        loadedPath = path;
         AnimatedGltfModel newModel;
         ImportedModel imported;
         try
@@ -265,7 +253,6 @@ public class ModelViewerWindow
             glRD.Io.ConfigFlags |= ImGuiConfigFlags.NoMouseCursorChange;
             Raylib.HideCursor();
             Raylib.SetMousePosition(Raylib.GetScreenWidth() / 2, Raylib.GetScreenHeight() / 2);
-            freeLooking = true;
         }
 
         if (Raylib.IsMouseButtonReleased(MouseButton.Right))
@@ -273,7 +260,6 @@ public class ModelViewerWindow
             Raylib.ShowCursor();
             glRD.Io.ConfigFlags &= ~ImGuiConfigFlags.NoMouseCursorChange;
             Raylib.SetMousePosition((int)savedMousePos.X, (int)savedMousePos.Y);
-            freeLooking = false;
         }
 
         Vector3 cameraPos = orbit.Position;

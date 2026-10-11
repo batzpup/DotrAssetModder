@@ -294,7 +294,7 @@ public static class Rh2Encoder
 
         WritePalette(outBuf, paletteOff, paletteLen, clut32, palette);
 
-        if (is4) WriteImagePsmt4(outBuf, startOfImage, w, h, decW, decH, indices);
+        if (is4) WriteImagePsmt4(outBuf, startOfImage, decW, decH, indices);
         else WriteImagePsmt8(outBuf, startOfImage, w, h, paletteLen, indices);
 
         return outBuf;
@@ -384,7 +384,7 @@ public static class Rh2Encoder
     }
 
     // ---- PSMT4 image (inverse of DecodePsmt4) — UNTESTED, no PSMT4 sample available ---
-    private static void WriteImagePsmt4(byte[] o, int startOfImage, int w, int h, int decW, int decH, int[] idx)
+    private static void WriteImagePsmt4(byte[] o, int startOfImage, int decW, int decH, int[] idx)
     {
         int[] bitTbl = GsSwizzle.GetPsmt4BitIndices(decW, decH); // 4 bit-positions per pixel
         int npix = decW * decH;

@@ -226,28 +226,6 @@ public sealed class ImportedModel
     /// Inverse of the extractor's MrgRoot world, when RebuildPipeline.PrepareRoot dropped it
     /// without baking it into node 0: maps glb-space positions back to model space.
     public Matrix4x4? DroppedRootUndo;
-
-    /// Deprecated/unused in DOTR-convention mode. Marker names are intentionally ignored.
-    public Vector3? AuthorCameraLookAtWorld;
-
-    /// Deprecated/unused in DOTR-convention mode. Marker names are intentionally ignored.
-    public Vector3? AuthorWorldPosCenterWorld;
-
-    /// RebuildPipeline may fit an external imported model into the donor/template model's
-    /// coordinate frame before encoding. These are the fitted/output-space equivalents
-    /// of the authoring markers, used later when writing the node-tree bounds record
-    /// and for diagnostics.
-    public Vector3? FittedCameraLookAtWorld;
-
-    /// RebuildPipeline may fit an external imported model into the donor/template model's
-    /// coordinate frame before encoding. This guard prevents applying the same transform
-    /// twice when callers reuse an ImportedModel instance across preview/build passes.
-    public bool AppliedTemplateFrameFit;
-
-    public string Summary() =>
-        $"nodes={Nodes.Count} joints={JointNodeIndices.Count} prims={Primitives.Count} " +
-        $"tris={Primitives.Sum(p => p.Triangles.Count)} verts={Primitives.Sum(p => p.Vertices.Count)} " +
-        $"anims={Animations.Count}";
 }
 
 public static class GlbImporter
@@ -749,15 +727,6 @@ public static class GlbImporter
         }
         return true;
     }
-
-    // DOTR-convention mode intentionally does not use string-named authoring markers.
-    // New/custom GLBs should be authored in DOTR space: scene/model origin is the
-    // placement/control point, and geometry is positioned relative to that origin.
-    internal static bool IsCameraLookAtMarker(string? name) => false;
-
-    internal static bool IsWorldPosCenterMarker(string? name) => false;
-
-    internal static bool IsAuthoringMarker(string? name) => false;
 
     // Element-wise compare, tolerance relative to the matrices' largest entry (translations
     // can be large) so float noise in an inverse bind matrix never counts as a different bind.
@@ -1469,19 +1438,19 @@ public static class GlbImporter
     /// Decode the glb's embedded base-colour images (per "mat_texN" texture index) into raw
     /// RGBA TextureInputs for the RH2 re-encoder. Decoded by LoadRgba, the same stb_image
     /// decode as the model viewer. Best-effort: a
-    /// texture that fails to decode is skipped and keeps the template's original RH2.
-    /// `maxDim`: same per-axis cap used everywhere else native textures get built (see
-    /// Rh2Encoder.ChooseTarget / Rh0Assembler's maxTexDim) - default 512, matching the
-    /// rest of this codebase's default. THIS MATTERS MORE for animated slots than static
+    /// texture that fails to decode is skipped (its slot gets a flat white texture).
+    /// Each frame is capped at Rh0Assembler.MaxTextureDim, the cap every native texture is built
+    /// under (Rh2Encoder.ChooseTarget). THIS MATTERS MORE for animated slots than static
     /// ones: a flipbook sheet's width grows with frame count, so an unclamped per-frame
     /// cell size (e.g. a raw 1012px-wide source rounding up to 1024) multiplies directly
     /// by frame count in the final sheet - a 4-frame flipbook from an uncapped 1024px
     /// source becomes a 4096x1024 sheet (~4 MB encoded), which cannot fit in either a
     /// fixed 1 MiB monster.mrg slot or a typical MODEL.MRG model's real budget. Clamping
-    /// each cell to maxDim first keeps sheet size bounded and predictable the same way
+    /// each cell first keeps sheet size bounded and predictable the same way
     /// static textures already are.
-    public static List<Rh0Assembler.TextureInput> DecodeGlbTextures(ImportedModel model, int maxDim = 512)
+    public static List<Rh0Assembler.TextureInput> DecodeGlbTextures(ImportedModel model)
     {
+        const int maxDim = Rh0Assembler.MaxTextureDim;
         var inputs = new List<Rh0Assembler.TextureInput>();
         var animSlots = model.TextureAnimFrames.Keys.ToHashSet();
 
@@ -1621,7 +1590,7 @@ public static class GlbImporter
 
     /// A sprite sheet is encoded at exactly its packed size (Rh0Assembler never reduces it), so it
     /// has to fit the 1 MiB block on its own terms: 512 x 512 texels, 256 KB at 8 bpp, the same
-    /// ceiling as the default maxDim of a static texture. (A 512 x 1024 sheet overflowed a monster
+    /// ceiling as Rh0Assembler.MaxTextureDim for a static texture. (A 512 x 1024 sheet overflowed a monster
     /// slot by 13 KB.)
     private const long MaxAnimSheetPixels = 512 * 512;
 
@@ -1736,8 +1705,6 @@ public static class GlbImporter
     }
 
     private static int U16L(byte[] b, int o) => b[o] | (b[o + 1] << 8);
-
-    private static bool IsPow2Local(int v) => v > 0 && (v & (v - 1)) == 0;
 
     /// A glTF image decoded by Raylib (stb_image), in its own pixel format; Width is 0 when it
     /// does not decode. The viewer uploads these and the importer encodes them, so both see the

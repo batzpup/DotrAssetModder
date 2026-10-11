@@ -204,16 +204,6 @@ public class FileLoader : IDisposable
         return buf;
     }
 
-    // A slice of a file, for the big archives nobody wants in memory whole.
-    public byte[] ReadFileRange(FileEntry f, long offset, int length)
-    {
-        if (offset < 0 || length < 0 || offset + length > f.Size)
-            throw new ArgumentOutOfRangeException(nameof(offset), $"{f.IsoPath}: [{offset},{offset + length}) outside the file's {f.Size} bytes");
-        var buf = new byte[length];
-        ReadAt(f.ImageOffset + offset, buf, 0, length);
-        return buf;
-    }
-
     public void ReadAt(long imageOffset, byte[] buffer, int bufferOffset, int count)
     {
         lock (FileStreamLock)
@@ -239,22 +229,6 @@ public class FileLoader : IDisposable
             file.ReadExactly(buffer);
             return buffer;
         }
-    }
-
-    const uint Rh0Magic = 0x00304852; // "RH0\0"
-    public const int ModelBlock = 0x100000; // 1 MiB per RH0 block
-
-    // Number of 1 MiB RH0 model blocks in a DATA .MRG (for the import index slider).
-    public int CountRH0(string path)
-    {
-        byte[] data = GetFileBytesFromDisk(path);
-        if (data.Length <= ModelBlock)
-            return (data.Length >= 4 && BitConverter.ToUInt32(data, 0) == Rh0Magic) ? 1 : 0;
-        int count = 0;
-        for (long o = 0; o + 4 <= data.Length; o += ModelBlock)
-            if (BitConverter.ToUInt32(data, (int)o) == Rh0Magic)
-                count++;
-        return count;
     }
 
     public static FileLoader Instance

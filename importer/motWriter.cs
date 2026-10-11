@@ -91,27 +91,30 @@ public static class MotWriter
     /// except the ones the template itself lacks (templateSlotsByte).
     private static readonly int[] BattleRequiredSlots = { 0, 2, 4, 5, 6 };
 
-    /// Slots synthesised by the last Write, as (missing slot, cloned from).
-    [ThreadStatic] public static List<(int Slot, int From)>? LastClones;
+    public sealed class Result
+    {
+        public byte[] Blocks = Array.Empty<byte>();
+        public int SectionFlagsByte;                       // RH0 sectionFlags low byte, bit per slot present
+        public List<(int Slot, int From)> Clones = new();  // synthesised battle slots: (missing slot, cloned from)
+    }
 
     /// Serialise the motions (any order; emitted in ascending SlotId) into back-to-back MOT
     /// blocks, and report the RH0 sectionFlags low byte (set bit per slot present).
     /// cloneKeyStride: keyframe decimation stride applied ONLY to synthesised battle-slot
-    /// clones (see EnsureBattleSlots) - 1 (default) keeps them full-fidelity; a caller under
+    /// clones (see EnsureBattleSlots) - 1 keeps them full-fidelity; a caller under
     /// size pressure (Rh0Assembler) passes progressively higher strides to shrink them.
     /// rotTolBams > 0: also drop rotation keys that the game's per-axis lerp between the
     /// kept neighbours reproduces within that many BAMS (a size lever; RebuildPipeline fits
     /// at 0.75). Rotation keys are ~95% of retail key data.
     /// templateSlotsByte: the template block's sectionFlags low byte (bit per MOT slot it
     /// carries). A battle slot the template lacks is not cloned (see EnsureBattleSlots); 0
-    /// (the default) means no template is known and every battle slot is guaranteed.
-    public static (byte[] Blocks, int SectionFlagsByte) Write(int nodeCount, IReadOnlyList<EncMotion> motions,
-        int cloneKeyStride = 1, float rotTolBams = 0f, int templateSlotsByte = 0)
+    /// means no template is known and every battle slot is guaranteed.
+    public static Result Write(int nodeCount, IReadOnlyList<EncMotion> motions,
+        int cloneKeyStride, float rotTolBams, int templateSlotsByte)
     {
-        var clones = new List<(int Slot, int From)>();
+        var result = new Result();
         if (rotTolBams > 0f) motions = motions.Select(m => SimplifyRotations(m, rotTolBams)).ToList();
-        var ordered = EnsureBattleSlots(motions, cloneKeyStride, clones, templateSlotsByte);
-        LastClones = clones;
+        var ordered = EnsureBattleSlots(motions, cloneKeyStride, result.Clones, templateSlotsByte);
         var outAll = new List<byte>();
         int flags = 0;
         foreach (var m in ordered)
@@ -119,7 +122,9 @@ public static class MotWriter
             flags |= 1 << (m.SlotId & 7);
             outAll.AddRange(WriteBlock(nodeCount, m));
         }
-        return (outAll.ToArray(), flags & 0xFF);
+        result.Blocks = outAll.ToArray();
+        result.SectionFlagsByte = flags & 0xFF;
+        return result;
     }
 
     /// Returns the motions ordered by SlotId, with the battle slots {0, 2, 4, 5, 6} added by
