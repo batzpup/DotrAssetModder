@@ -1,19 +1,19 @@
 namespace DotrAssetModder;
 // Mostly AI
 
-// A 4x4 double matrix, row-major, column vectors (p' = M p), as numpy in tools/toglb.py
-// (DotR-PC): M[r * 4 + c]. Doubles, not System.Numerics' float Matrix4x4, so the conversion
-// matches the Python reference to float precision.
-public sealed class Mat4
+/* A 4x4 double matrix, row-major, column vectors (p' = M p), as numpy in tools/toglb.py
+   (DotR-PC): M[r * 4 + c]. Doubles, not System.Numerics' float Matrix4x4, so the conversion
+   matches the Python reference to float precision. */
+public sealed class Matrix4
 {
-    public double[] M = new double[16];
+    public double[] Elements = new double[16];
 
     // numpy.allclose: every element within atol + 1e-5 * |b|.
-    public static bool AllClose(Mat4 a, Mat4 b, double atol)
+    public static bool AllClose(Matrix4 left, Matrix4 right, double absoluteTolerance)
     {
         for (int k = 0; k < 16; k++)
         {
-            if (Math.Abs(a.M[k] - b.M[k]) > atol + 1e-5 * Math.Abs(b.M[k]))
+            if (Math.Abs(left.Elements[k] - right.Elements[k]) > absoluteTolerance + 1e-5 * Math.Abs(right.Elements[k]))
             {
                 return false;
             }
@@ -21,274 +21,274 @@ public sealed class Mat4
         return true;
     }
 
-    public static Mat4 Identity()
+    public static Matrix4 Identity()
     {
-        Mat4 m = new Mat4();
-        m.M[0] = 1;
-        m.M[5] = 1;
-        m.M[10] = 1;
-        m.M[15] = 1;
-        return m;
+        Matrix4 result = new Matrix4();
+        result.Elements[0] = 1;
+        result.Elements[5] = 1;
+        result.Elements[10] = 1;
+        result.Elements[15] = 1;
+        return result;
     }
 
-    public double this[int r, int c]
+    public double this[int row, int column]
     {
-        get { return M[r * 4 + c]; }
-        set { M[r * 4 + c] = value; }
+        get { return Elements[row * 4 + column]; }
+        set { Elements[row * 4 + column] = value; }
     }
 
-    public Mat4 Copy()
+    public Matrix4 Copy()
     {
-        Mat4 m = new Mat4();
-        Array.Copy(M, m.M, 16);
-        return m;
+        Matrix4 copy = new Matrix4();
+        Array.Copy(Elements, copy.Elements, 16);
+        return copy;
     }
 
-    public static Mat4 operator *(Mat4 a, Mat4 b)
+    public static Matrix4 operator *(Matrix4 left, Matrix4 right)
     {
-        Mat4 o = new Mat4();
-        for (int r = 0; r < 4; r++)
+        Matrix4 product = new Matrix4();
+        for (int row = 0; row < 4; row++)
         {
-            for (int c = 0; c < 4; c++)
+            for (int column = 0; column < 4; column++)
             {
-                double s = 0;
+                double sum = 0;
                 for (int k = 0; k < 4; k++)
                 {
-                    s += a.M[r * 4 + k] * b.M[k * 4 + c];
+                    sum += left.Elements[row * 4 + k] * right.Elements[k * 4 + column];
                 }
-                o.M[r * 4 + c] = s;
+                product.Elements[row * 4 + column] = sum;
             }
         }
-        return o;
+        return product;
     }
 
-    public static Mat4 Translation(double x, double y, double z)
+    public static Matrix4 Translation(double x, double y, double z)
     {
-        Mat4 m = Identity();
-        m.M[3] = x;
-        m.M[7] = y;
-        m.M[11] = z;
-        return m;
+        Matrix4 result = Identity();
+        result.Elements[3] = x;
+        result.Elements[7] = y;
+        result.Elements[11] = z;
+        return result;
     }
 
-    public static Mat4 Scale(double x, double y, double z)
+    public static Matrix4 Scale(double x, double y, double z)
     {
-        Mat4 m = Identity();
-        m.M[0] = x;
-        m.M[5] = y;
-        m.M[10] = z;
-        return m;
+        Matrix4 result = Identity();
+        result.Elements[0] = x;
+        result.Elements[5] = y;
+        result.Elements[10] = z;
+        return result;
     }
 
     // toglb mrot: turn about an axis, in degrees
-    public static Mat4 Rotation(double ax, double ay, double az, double deg)
+    public static Matrix4 Rotation(double axisX, double axisY, double axisZ, double degrees)
     {
-        double len = Math.Sqrt(ax * ax + ay * ay + az * az);
-        double x = ax / len;
-        double y = ay / len;
-        double z = az / len;
-        double a = deg * Math.PI / 180.0;
-        double c = Math.Cos(a);
-        double s = Math.Sin(a);
-        double t = 1 - c;
-        Mat4 m = Identity();
-        m.M[0] = t * x * x + c;
-        m.M[1] = t * x * y - s * z;
-        m.M[2] = t * x * z + s * y;
-        m.M[4] = t * x * y + s * z;
-        m.M[5] = t * y * y + c;
-        m.M[6] = t * y * z - s * x;
-        m.M[8] = t * x * z - s * y;
-        m.M[9] = t * y * z + s * x;
-        m.M[10] = t * z * z + c;
-        return m;
+        double length = Math.Sqrt(axisX * axisX + axisY * axisY + axisZ * axisZ);
+        double x = axisX / length;
+        double y = axisY / length;
+        double z = axisZ / length;
+        double radians = degrees * Math.PI / 180.0;
+        double cosine = Math.Cos(radians);
+        double sine = Math.Sin(radians);
+        double oneMinusCosine = 1 - cosine;
+        Matrix4 result = Identity();
+        result.Elements[0] = oneMinusCosine * x * x + cosine;
+        result.Elements[1] = oneMinusCosine * x * y - sine * z;
+        result.Elements[2] = oneMinusCosine * x * z + sine * y;
+        result.Elements[4] = oneMinusCosine * x * y + sine * z;
+        result.Elements[5] = oneMinusCosine * y * y + cosine;
+        result.Elements[6] = oneMinusCosine * y * z - sine * x;
+        result.Elements[8] = oneMinusCosine * x * z - sine * y;
+        result.Elements[9] = oneMinusCosine * y * z + sine * x;
+        result.Elements[10] = oneMinusCosine * z * z + cosine;
+        return result;
     }
 
     // toglb euler: Euler angles in degrees, the first letter of order applied first
-    public static Mat4 Euler(double dx, double dy, double dz, string order = "XYZ")
+    public static Matrix4 EulerAngles(double degreesX, double degreesY, double degreesZ, string order = "XYZ")
     {
-        Mat4 m = Identity();
-        foreach (char ch in order)
+        Matrix4 result = Identity();
+        foreach (char axisLetter in order)
         {
-            double deg;
+            double degrees;
             int i;
             int j;
-            if (ch == 'X')
+            if (axisLetter == 'X')
             {
-                deg = dx;
+                degrees = degreesX;
                 i = 1;
                 j = 2;
             }
-            else if (ch == 'Y')
+            else if (axisLetter == 'Y')
             {
-                deg = dy;
+                degrees = degreesY;
                 i = 2;
                 j = 0;
             }
             else
             {
-                deg = dz;
+                degrees = degreesZ;
                 i = 0;
                 j = 1;
             }
-            double a = deg * Math.PI / 180.0;
-            Mat4 r = Identity();
-            r.M[i * 4 + i] = Math.Cos(a);
-            r.M[i * 4 + j] = -Math.Sin(a);
-            r.M[j * 4 + i] = Math.Sin(a);
-            r.M[j * 4 + j] = Math.Cos(a);
-            m = r * m;
+            double radians = degrees * Math.PI / 180.0;
+            Matrix4 axisRotation = Identity();
+            axisRotation.Elements[i * 4 + i] = Math.Cos(radians);
+            axisRotation.Elements[i * 4 + j] = -Math.Sin(radians);
+            axisRotation.Elements[j * 4 + i] = Math.Sin(radians);
+            axisRotation.Elements[j * 4 + j] = Math.Cos(radians);
+            result = axisRotation * result;
         }
-        return m;
+        return result;
     }
 
-    public Mat4 Inverse()
+    public Matrix4 Inverse()
     {
         // Gauss-Jordan with partial pivoting (numpy's inv is LU with pivoting)
-        double[] a = new double[16];
-        Array.Copy(M, a, 16);
-        Mat4 inv = Identity();
-        double[] b = inv.M;
-        for (int col = 0; col < 4; col++)
+        double[] work = new double[16];
+        Array.Copy(Elements, work, 16);
+        Matrix4 inverse = Identity();
+        double[] inverseElements = inverse.Elements;
+        for (int column = 0; column < 4; column++)
         {
-            int piv = col;
-            for (int r = col + 1; r < 4; r++)
+            int pivotRow = column;
+            for (int row = column + 1; row < 4; row++)
             {
-                if (Math.Abs(a[r * 4 + col]) > Math.Abs(a[piv * 4 + col]))
+                if (Math.Abs(work[row * 4 + column]) > Math.Abs(work[pivotRow * 4 + column]))
                 {
-                    piv = r;
+                    pivotRow = row;
                 }
             }
-            if (a[piv * 4 + col] == 0)
+            if (work[pivotRow * 4 + column] == 0)
             {
                 throw new InvalidOperationException("singular matrix");
             }
-            if (piv != col)
+            if (pivotRow != column)
             {
                 for (int k = 0; k < 4; k++)
                 {
-                    (a[col * 4 + k], a[piv * 4 + k]) = (a[piv * 4 + k], a[col * 4 + k]);
-                    (b[col * 4 + k], b[piv * 4 + k]) = (b[piv * 4 + k], b[col * 4 + k]);
+                    (work[column * 4 + k], work[pivotRow * 4 + k]) = (work[pivotRow * 4 + k], work[column * 4 + k]);
+                    (inverseElements[column * 4 + k], inverseElements[pivotRow * 4 + k]) = (inverseElements[pivotRow * 4 + k], inverseElements[column * 4 + k]);
                 }
             }
-            double d = a[col * 4 + col];
+            double pivot = work[column * 4 + column];
             for (int k = 0; k < 4; k++)
             {
-                a[col * 4 + k] /= d;
-                b[col * 4 + k] /= d;
+                work[column * 4 + k] /= pivot;
+                inverseElements[column * 4 + k] /= pivot;
             }
-            for (int r = 0; r < 4; r++)
+            for (int row = 0; row < 4; row++)
             {
-                if (r == col)
+                if (row == column)
                 {
                     continue;
                 }
-                double f = a[r * 4 + col];
-                if (f == 0)
+                double factor = work[row * 4 + column];
+                if (factor == 0)
                 {
                     continue;
                 }
                 for (int k = 0; k < 4; k++)
                 {
-                    a[r * 4 + k] -= f * a[col * 4 + k];
-                    b[r * 4 + k] -= f * b[col * 4 + k];
+                    work[row * 4 + k] -= factor * work[column * 4 + k];
+                    inverseElements[row * 4 + k] -= factor * inverseElements[column * 4 + k];
                 }
             }
         }
-        return inv;
+        return inverse;
     }
 
-    public double Det3()
+    public double Determinant3x3()
     {
-        return M[0] * (M[5] * M[10] - M[6] * M[9])
-             - M[1] * (M[4] * M[10] - M[6] * M[8])
-             + M[2] * (M[4] * M[9] - M[5] * M[8]);
+        return Elements[0] * (Elements[5] * Elements[10] - Elements[6] * Elements[9])
+             - Elements[1] * (Elements[4] * Elements[10] - Elements[6] * Elements[8])
+             + Elements[2] * (Elements[4] * Elements[9] - Elements[5] * Elements[8]);
     }
 
-    public void TransformPoint(double x, double y, double z, out double ox, out double oy, out double oz)
+    public void TransformPoint(double x, double y, double z, out double resultX, out double resultY, out double resultZ)
     {
-        ox = M[0] * x + M[1] * y + M[2] * z + M[3];
-        oy = M[4] * x + M[5] * y + M[6] * z + M[7];
-        oz = M[8] * x + M[9] * y + M[10] * z + M[11];
+        resultX = Elements[0] * x + Elements[1] * y + Elements[2] * z + Elements[3];
+        resultY = Elements[4] * x + Elements[5] * y + Elements[6] * z + Elements[7];
+        resultZ = Elements[8] * x + Elements[9] * y + Elements[10] * z + Elements[11];
     }
 
-    public void TransformDir(double x, double y, double z, out double ox, out double oy, out double oz)
+    public void TransformDir(double x, double y, double z, out double resultX, out double resultY, out double resultZ)
     {
-        ox = M[0] * x + M[1] * y + M[2] * z;
-        oy = M[4] * x + M[5] * y + M[6] * z;
-        oz = M[8] * x + M[9] * y + M[10] * z;
+        resultX = Elements[0] * x + Elements[1] * y + Elements[2] * z;
+        resultY = Elements[4] * x + Elements[5] * y + Elements[6] * z;
+        resultZ = Elements[8] * x + Elements[9] * y + Elements[10] * z;
     }
 
-    // toglb decompose: translation, quaternion (x, y, z, w), scale; shear is dropped. A
-    // mirrored basis keeps a negative X scale. The rotation is the nearest orthonormal one
-    // (numpy: U Vt of the SVD), found here by polar iteration, which gives the same matrix.
-    public void Decompose(double[] t, double[] q, double[] s)
+    /* toglb decompose: translation, quaternion (x, y, z, w), scale; shear is dropped. A
+       mirrored basis keeps a negative X scale. The rotation is the nearest orthonormal one
+       (numpy: U Vt of the SVD), found here by polar iteration, which gives the same matrix. */
+    public void Decompose(double[] translation, double[] rotation, double[] scale)
     {
-        t[0] = M[3];
-        t[1] = M[7];
-        t[2] = M[11];
-        double[] r = new double[9];
-        for (int c = 0; c < 3; c++)
+        translation[0] = Elements[3];
+        translation[1] = Elements[7];
+        translation[2] = Elements[11];
+        double[] rotationMatrix = new double[9];
+        for (int column = 0; column < 3; column++)
         {
-            double n = Math.Sqrt(M[c] * M[c] + M[4 + c] * M[4 + c] + M[8 + c] * M[8 + c]);
-            s[c] = n;
-            double d = 1.0;
-            if (n > 1e-12)
+            double columnLength = Math.Sqrt(Elements[column] * Elements[column] + Elements[4 + column] * Elements[4 + column] + Elements[8 + column] * Elements[8 + column]);
+            scale[column] = columnLength;
+            double divisor = 1.0;
+            if (columnLength > 1e-12)
             {
-                d = n;
+                divisor = columnLength;
             }
             for (int k = 0; k < 3; k++)
             {
-                r[k * 3 + c] = M[k * 4 + c] / d;
+                rotationMatrix[k * 3 + column] = Elements[k * 4 + column] / divisor;
             }
         }
-        if (Det3x3(r) < 0)
+        if (Det3x3(rotationMatrix) < 0)
         {
-            s[0] = -s[0];
+            scale[0] = -scale[0];
             for (int k = 0; k < 3; k++)
             {
-                r[k * 3] = -r[k * 3];
+                rotationMatrix[k * 3] = -rotationMatrix[k * 3];
             }
         }
-        Orthonormalise(r);
-        if (Det3x3(r) < 0)
+        Orthonormalise(rotationMatrix);
+        if (Det3x3(rotationMatrix) < 0)
         {
-            r = new double[] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            rotationMatrix = new double[] { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         }
-        Quat(r, q);
+        ToQuaternion(rotationMatrix, rotation);
     }
 
-    static double Det3x3(double[] r)
+    static double Det3x3(double[] rotation)
     {
-        return r[0] * (r[4] * r[8] - r[5] * r[7])
-             - r[1] * (r[3] * r[8] - r[5] * r[6])
-             + r[2] * (r[3] * r[7] - r[4] * r[6]);
+        return rotation[0] * (rotation[4] * rotation[8] - rotation[5] * rotation[7])
+             - rotation[1] * (rotation[3] * rotation[8] - rotation[5] * rotation[6])
+             + rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6]);
     }
 
     // Polar decomposition by Newton iteration, R <- (R + R^-T) / 2: converges to U Vt.
-    static void Orthonormalise(double[] r)
+    static void Orthonormalise(double[] rotation)
     {
-        double det = Det3x3(r);
-        if (Math.Abs(det) < 1e-12)
+        double determinant = Det3x3(rotation);
+        if (Math.Abs(determinant) < 1e-12)
         {
             return;
         }
-        for (int it = 0; it < 50; it++)
+        for (int iteration = 0; iteration < 50; iteration++)
         {
-            double d = Det3x3(r);
+            double iterationDeterminant = Det3x3(rotation);
             // inverse transpose = cofactor matrix / det
-            double[] cof = new double[]
+            double[] cofactors = new double[]
             {
-                r[4] * r[8] - r[5] * r[7], r[5] * r[6] - r[3] * r[8], r[3] * r[7] - r[4] * r[6],
-                r[2] * r[7] - r[1] * r[8], r[0] * r[8] - r[2] * r[6], r[1] * r[6] - r[0] * r[7],
-                r[1] * r[5] - r[2] * r[4], r[2] * r[3] - r[0] * r[5], r[0] * r[4] - r[1] * r[3],
+                rotation[4] * rotation[8] - rotation[5] * rotation[7], rotation[5] * rotation[6] - rotation[3] * rotation[8], rotation[3] * rotation[7] - rotation[4] * rotation[6],
+                rotation[2] * rotation[7] - rotation[1] * rotation[8], rotation[0] * rotation[8] - rotation[2] * rotation[6], rotation[1] * rotation[6] - rotation[0] * rotation[7],
+                rotation[1] * rotation[5] - rotation[2] * rotation[4], rotation[2] * rotation[3] - rotation[0] * rotation[5], rotation[0] * rotation[4] - rotation[1] * rotation[3],
             };
             double change = 0;
             for (int k = 0; k < 9; k++)
             {
-                double v = (r[k] + cof[k] / d) / 2;
-                change = Math.Max(change, Math.Abs(v - r[k]));
-                r[k] = v;
+                double averaged = (rotation[k] + cofactors[k] / iterationDeterminant) / 2;
+                change = Math.Max(change, Math.Abs(averaged - rotation[k]));
+                rotation[k] = averaged;
             }
             if (change < 1e-15)
             {
@@ -298,80 +298,80 @@ public sealed class Mat4
     }
 
     // toglb quat_many for one 3x3 rotation (row-major) -> (x, y, z, w)
-    static void Quat(double[] m, double[] q)
+    static void ToQuaternion(double[] rotation, double[] quaternion)
     {
-        double r00 = m[0];
-        double r11 = m[4];
-        double r22 = m[8];
-        double[] cand = { 1 + r00 + r11 + r22, 1 + r00 - r11 - r22, 1 - r00 + r11 - r22, 1 - r00 - r11 + r22 };
-        int big = 0;
+        double r00 = rotation[0];
+        double r11 = rotation[4];
+        double r22 = rotation[8];
+        double[] candidates = { 1 + r00 + r11 + r22, 1 + r00 - r11 - r22, 1 - r00 + r11 - r22, 1 - r00 - r11 + r22 };
+        int largest = 0;
         for (int k = 1; k < 4; k++)
         {
-            if (cand[k] > cand[big])
+            if (candidates[k] > candidates[largest])
             {
-                big = k;
+                largest = k;
             }
         }
-        if (big == 0)
+        if (largest == 0)
         {
-            double w = Math.Sqrt(Math.Max(cand[0], 1e-12)) / 2;
-            q[0] = (m[7] - m[5]) / (4 * w);
-            q[1] = (m[2] - m[6]) / (4 * w);
-            q[2] = (m[3] - m[1]) / (4 * w);
-            q[3] = w;
+            double w = Math.Sqrt(Math.Max(candidates[0], 1e-12)) / 2;
+            quaternion[0] = (rotation[7] - rotation[5]) / (4 * w);
+            quaternion[1] = (rotation[2] - rotation[6]) / (4 * w);
+            quaternion[2] = (rotation[3] - rotation[1]) / (4 * w);
+            quaternion[3] = w;
         }
-        else if (big == 1)
+        else if (largest == 1)
         {
-            double x = Math.Sqrt(Math.Max(cand[1], 1e-12)) / 2;
-            q[0] = x;
-            q[1] = (m[1] + m[3]) / (4 * x);
-            q[2] = (m[2] + m[6]) / (4 * x);
-            q[3] = (m[7] - m[5]) / (4 * x);
+            double x = Math.Sqrt(Math.Max(candidates[1], 1e-12)) / 2;
+            quaternion[0] = x;
+            quaternion[1] = (rotation[1] + rotation[3]) / (4 * x);
+            quaternion[2] = (rotation[2] + rotation[6]) / (4 * x);
+            quaternion[3] = (rotation[7] - rotation[5]) / (4 * x);
         }
-        else if (big == 2)
+        else if (largest == 2)
         {
-            double y = Math.Sqrt(Math.Max(cand[2], 1e-12)) / 2;
-            q[0] = (m[1] + m[3]) / (4 * y);
-            q[1] = y;
-            q[2] = (m[5] + m[7]) / (4 * y);
-            q[3] = (m[2] - m[6]) / (4 * y);
+            double y = Math.Sqrt(Math.Max(candidates[2], 1e-12)) / 2;
+            quaternion[0] = (rotation[1] + rotation[3]) / (4 * y);
+            quaternion[1] = y;
+            quaternion[2] = (rotation[5] + rotation[7]) / (4 * y);
+            quaternion[3] = (rotation[2] - rotation[6]) / (4 * y);
         }
         else
         {
-            double z = Math.Sqrt(Math.Max(cand[3], 1e-12)) / 2;
-            q[0] = (m[2] + m[6]) / (4 * z);
-            q[1] = (m[5] + m[7]) / (4 * z);
-            q[2] = z;
-            q[3] = (m[3] - m[1]) / (4 * z);
+            double z = Math.Sqrt(Math.Max(candidates[3], 1e-12)) / 2;
+            quaternion[0] = (rotation[2] + rotation[6]) / (4 * z);
+            quaternion[1] = (rotation[5] + rotation[7]) / (4 * z);
+            quaternion[2] = z;
+            quaternion[3] = (rotation[3] - rotation[1]) / (4 * z);
         }
-        double len = Math.Sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+        double length = Math.Sqrt(quaternion[0] * quaternion[0] + quaternion[1] * quaternion[1] + quaternion[2] * quaternion[2] + quaternion[3] * quaternion[3]);
         for (int k = 0; k < 4; k++)
         {
-            q[k] /= len;
+            quaternion[k] /= length;
         }
     }
 
     // toglb trs_many for one frame
-    public static Mat4 FromTrs(double[] t, double[] q, double[] s)
+    public static Matrix4 FromTrs(double[] translation, double[] rotation, double[] scale)
     {
-        double len = Math.Sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-        double x = q[0] / len;
-        double y = q[1] / len;
-        double z = q[2] / len;
-        double w = q[3] / len;
-        Mat4 m = Identity();
-        m.M[0] = (1 - 2 * (y * y + z * z)) * s[0];
-        m.M[1] = 2 * (x * y - z * w) * s[1];
-        m.M[2] = 2 * (x * z + y * w) * s[2];
-        m.M[4] = 2 * (x * y + z * w) * s[0];
-        m.M[5] = (1 - 2 * (x * x + z * z)) * s[1];
-        m.M[6] = 2 * (y * z - x * w) * s[2];
-        m.M[8] = 2 * (x * z - y * w) * s[0];
-        m.M[9] = 2 * (y * z + x * w) * s[1];
-        m.M[10] = (1 - 2 * (x * x + y * y)) * s[2];
-        m.M[3] = t[0];
-        m.M[7] = t[1];
-        m.M[11] = t[2];
-        return m;
+        double length = Math.Sqrt(rotation[0] * rotation[0] + rotation[1] * rotation[1] + rotation[2] * rotation[2] + rotation[3] * rotation[3]);
+        double x = rotation[0] / length;
+        double y = rotation[1] / length;
+        double z = rotation[2] / length;
+        double w = rotation[3] / length;
+        Matrix4 result = Identity();
+        result.Elements[0] = (1 - 2 * (y * y + z * z)) * scale[0];
+        result.Elements[1] = 2 * (x * y - z * w) * scale[1];
+        result.Elements[2] = 2 * (x * z + y * w) * scale[2];
+        result.Elements[4] = 2 * (x * y + z * w) * scale[0];
+        result.Elements[5] = (1 - 2 * (x * x + z * z)) * scale[1];
+        result.Elements[6] = 2 * (y * z - x * w) * scale[2];
+        result.Elements[8] = 2 * (x * z - y * w) * scale[0];
+        result.Elements[9] = 2 * (y * z + x * w) * scale[1];
+        result.Elements[10] = (1 - 2 * (x * x + y * y)) * scale[2];
+        result.Elements[3] = translation[0];
+        result.Elements[7] = translation[1];
+        result.Elements[11] = translation[2];
+        return result;
     }
 }

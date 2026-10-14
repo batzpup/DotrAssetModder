@@ -5,9 +5,9 @@ using SkiaSharp;
 namespace DotrAssetModder;
 // Mostly AI
 
-// glTF source -> Scene, a port of tools/toglb.py's read_glb (DotR-PC). The file is parsed by
-// SharpGLTF, as everywhere else in this project; what is kept from the port is the Scene it
-// fills and the 30 fps resampling (slerp, gltf_sample).
+/* glTF source -> Scene, a port of tools/toglb.py's read_glb (DotR-PC). The file is parsed by
+   SharpGLTF; what is kept from the port is the Scene it fills and the 30 fps resampling
+   (slerp, gltf_sample). */
 public static class GltfSourceReader
 {
     // A 1x1 PNG handed to SharpGLTF for an image file that is not where the glTF says, so the
@@ -17,15 +17,15 @@ public static class GltfSourceReader
 
     static readonly string[] ImageExtensions = { ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tga", ".dds", ".ktx2" };
 
-    // .glb or .gltf with embedded or side-by-side buffers. Rips are often not valid glTF, so
-    // nothing is validated; an image file is also looked for beside the model and up to two
-    // folders below it (SourceImages), and one that is not found anywhere gets MissingImage.
+    /* .glb or .gltf with embedded or side-by-side buffers. Rips are often not valid glTF, so
+       nothing is validated; an image file is also looked for beside the model and up to two
+       folders below it (SourceImages), and one that is not found anywhere gets MissingImage. */
     static ModelRoot Load(string path, SourceImages images, Action<string> warn)
     {
-        string dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        string directory = Path.GetDirectoryName(Path.GetFullPath(path))!;
         ReadContext context = ReadContext.Create(name =>
         {
-            string file = Path.Combine(dir, Uri.UnescapeDataString(name));
+            string file = Path.Combine(directory, Uri.UnescapeDataString(name));
             if (File.Exists(file))
             {
                 return new ArraySegment<byte>(File.ReadAllBytes(file));
@@ -46,32 +46,32 @@ public static class GltfSourceReader
         return context.ReadSchema2(Path.GetFileName(path));
     }
 
-    // System.Numerics keeps the translation in the bottom row; Mat4 in the right column.
-    static Mat4 ToMat4(Matrix4x4 n)
+    // System.Numerics keeps the translation in the bottom row; Matrix4 in the right column.
+    static Matrix4 ToMat4(Matrix4x4 matrix)
     {
-        float[] f = {
-            n.M11, n.M12, n.M13, n.M14, n.M21, n.M22, n.M23, n.M24,
-            n.M31, n.M32, n.M33, n.M34, n.M41, n.M42, n.M43, n.M44,
+        float[] elements = {
+            matrix.M11, matrix.M12, matrix.M13, matrix.M14, matrix.M21, matrix.M22, matrix.M23, matrix.M24,
+            matrix.M31, matrix.M32, matrix.M33, matrix.M34, matrix.M41, matrix.M42, matrix.M43, matrix.M44,
         };
-        Mat4 m = new Mat4();
-        for (int r = 0; r < 4; r++)
+        Matrix4 result = new Matrix4();
+        for (int row = 0; row < 4; row++)
         {
-            for (int c = 0; c < 4; c++)
+            for (int column = 0; column < 4; column++)
             {
-                m[r, c] = f[c * 4 + r];
+                result[row, column] = elements[column * 4 + row];
             }
         }
-        return m;
+        return result;
     }
 
     // ---- slerp ----
 
-    static void Slerp(double[] q0, int o0, double[] q1, int o1, double u, double[] outq, int oo)
+    static void Slerp(double[] quaternions0, int offset0, double[] quaternions1, int offset1, double fraction, double[] output, int outputOffset)
     {
         double dot = 0;
         for (int k = 0; k < 4; k++)
         {
-            dot += q0[o0 + k] * q1[o1 + k];
+            dot += quaternions0[offset0 + k] * quaternions1[offset1 + k];
         }
         double sign = 1.0;
         if (dot < 0)
@@ -89,205 +89,205 @@ public static class GltfSourceReader
             clamped = -1.0;
         }
         double theta = Math.Acos(clamped);
-        double a;
-        double b;
+        double weight0;
+        double weight1;
         if (dot > 0.9995)
         {
-            a = 1 - u;
-            b = u;
+            weight0 = 1 - fraction;
+            weight1 = fraction;
         }
         else
         {
-            double st = Math.Sin(theta);
-            a = Math.Sin((1 - u) * theta) / st;
-            b = Math.Sin(u * theta) / st;
+            double sinTheta = Math.Sin(theta);
+            weight0 = Math.Sin((1 - fraction) * theta) / sinTheta;
+            weight1 = Math.Sin(fraction * theta) / sinTheta;
         }
-        double len = 0;
+        double length = 0;
         for (int k = 0; k < 4; k++)
         {
-            double x = a * q0[o0 + k] + b * sign * q1[o1 + k];
-            outq[oo + k] = x;
-            len += x * x;
+            double x = weight0 * quaternions0[offset0 + k] + weight1 * sign * quaternions1[offset1 + k];
+            output[outputOffset + k] = x;
+            length += x * x;
         }
-        len = Math.Sqrt(len);
+        length = Math.Sqrt(length);
         for (int k = 0; k < 4; k++)
         {
-            outq[oo + k] /= len;
+            output[outputOffset + k] /= length;
         }
     }
 
     // ---- gltf_sample ----
 
-    // A glTF animation sampler evaluated at times t (STEP, LINEAR, CUBICSPLINE). `v` holds
-    // `w` values a key, or for CUBICSPLINE in-tangent, value, out-tangent a key.
-    static double[] Sample(double[] times, double[] v, int w, string interp, double[] t, bool rotation)
+    // A glTF animation sampler evaluated at sampleTimes (STEP, LINEAR, CUBICSPLINE). `values` holds
+    // `width` values a key, or for CUBICSPLINE in-tangent, value, out-tangent a key.
+    static double[] SampleKeys(double[] times, double[] values, int width, string interpolation, double[] sampleTimes, bool rotation)
     {
         int k = times.Length;
-        int vstep = w;        // one key's stride in v
-        int vbase = 0;        // the value's offset inside a key
-        int tinBase = 0;
-        int toutBase = 0;
-        bool cubic = interp == "CUBICSPLINE";
+        int keyStride = width;        // one key's stride in values
+        int valueBase = 0;        // the value's offset inside a key
+        int inTangentBase = 0;
+        int outTangentBase = 0;
+        bool cubic = interpolation == "CUBICSPLINE";
         if (cubic)
         {
-            vstep = 3 * w;
-            tinBase = 0;
-            vbase = w;
-            toutBase = 2 * w;
+            keyStride = 3 * width;
+            inTangentBase = 0;
+            valueBase = width;
+            outTangentBase = 2 * width;
         }
-        double[] outv = new double[t.Length * w];
+        double[] output = new double[sampleTimes.Length * width];
         if (k == 1)
         {
-            for (int f = 0; f < t.Length; f++)
+            for (int frame = 0; frame < sampleTimes.Length; frame++)
             {
-                for (int c = 0; c < w; c++)
+                for (int component = 0; component < width; component++)
                 {
-                    outv[f * w + c] = v[vbase + c];
+                    output[frame * width + component] = values[valueBase + component];
                 }
             }
-            return outv;
+            return output;
         }
-        for (int f = 0; f < t.Length; f++)
+        for (int frame = 0; frame < sampleTimes.Length; frame++)
         {
-            int seg = SearchRight(times, t[f]) - 1;
-            if (seg < 0)
+            int segment = SearchRight(times, sampleTimes[frame]) - 1;
+            if (segment < 0)
             {
-                seg = 0;
+                segment = 0;
             }
-            if (seg > k - 2)
+            if (segment > k - 2)
             {
-                seg = k - 2;
+                segment = k - 2;
             }
-            double t0 = times[seg];
-            double t1 = times[seg + 1];
-            double dt = 1.0;
-            if (t1 > t0)
+            double time0 = times[segment];
+            double time1 = times[segment + 1];
+            double duration = 1.0;
+            if (time1 > time0)
             {
-                dt = t1 - t0;
+                duration = time1 - time0;
             }
-            double u = (t[f] - t0) / dt;
-            if (u < 0.0)
+            double fraction = (sampleTimes[frame] - time0) / duration;
+            if (fraction < 0.0)
             {
-                u = 0.0;
+                fraction = 0.0;
             }
-            if (u > 1.0)
+            if (fraction > 1.0)
             {
-                u = 1.0;
+                fraction = 1.0;
             }
-            int a = seg * vstep + vbase;
-            int b = (seg + 1) * vstep + vbase;
-            if (interp == "STEP")
+            int value0Offset = segment * keyStride + valueBase;
+            int value1Offset = (segment + 1) * keyStride + valueBase;
+            if (interpolation == "STEP")
             {
-                int src = a;
-                if (u >= 1.0)
+                int sourceOffset = value0Offset;
+                if (fraction >= 1.0)
                 {
-                    src = b;
+                    sourceOffset = value1Offset;
                 }
-                for (int c = 0; c < w; c++)
+                for (int component = 0; component < width; component++)
                 {
-                    outv[f * w + c] = v[src + c];
+                    output[frame * width + component] = values[sourceOffset + component];
                 }
             }
             else if (cubic)
             {
-                double u2 = u * u;
-                double u3 = u * u * u;
-                int ta = seg * vstep + toutBase;
-                int tb = (seg + 1) * vstep + tinBase;
-                for (int c = 0; c < w; c++)
+                double fractionSquared = fraction * fraction;
+                double fractionCubed = fraction * fraction * fraction;
+                int outTangentOffset = segment * keyStride + outTangentBase;
+                int inTangentOffset = (segment + 1) * keyStride + inTangentBase;
+                for (int component = 0; component < width; component++)
                 {
-                    outv[f * w + c] = (2 * u3 - 3 * u2 + 1) * v[a + c] + (u3 - 2 * u2 + u) * v[ta + c] * dt
-                        + (-2 * u3 + 3 * u2) * v[b + c] + (u3 - u2) * v[tb + c] * dt;
+                    output[frame * width + component] = (2 * fractionCubed - 3 * fractionSquared + 1) * values[value0Offset + component] + (fractionCubed - 2 * fractionSquared + fraction) * values[outTangentOffset + component] * duration
+                        + (-2 * fractionCubed + 3 * fractionSquared) * values[value1Offset + component] + (fractionCubed - fractionSquared) * values[inTangentOffset + component] * duration;
                 }
             }
             else if (rotation)
             {
-                Slerp(v, a, v, b, u, outv, f * w);
+                Slerp(values, value0Offset, values, value1Offset, fraction, output, frame * width);
             }
             else
             {
-                for (int c = 0; c < w; c++)
+                for (int component = 0; component < width; component++)
                 {
-                    outv[f * w + c] = (1 - u) * v[a + c] + u * v[b + c];
+                    output[frame * width + component] = (1 - fraction) * values[value0Offset + component] + fraction * values[value1Offset + component];
                 }
             }
         }
         if (rotation)
         {
-            for (int f = 0; f < t.Length; f++)
+            for (int frame = 0; frame < sampleTimes.Length; frame++)
             {
-                double len = 0;
-                for (int c = 0; c < w; c++)
+                double length = 0;
+                for (int component = 0; component < width; component++)
                 {
-                    len += outv[f * w + c] * outv[f * w + c];
+                    length += output[frame * width + component] * output[frame * width + component];
                 }
-                len = Math.Sqrt(len);
-                for (int c = 0; c < w; c++)
+                length = Math.Sqrt(length);
+                for (int component = 0; component < width; component++)
                 {
-                    outv[f * w + c] /= len;
+                    output[frame * width + component] /= length;
                 }
             }
         }
-        return outv;
+        return output;
     }
 
     // np.searchsorted(times, x, side="right"): how many times are <= x
     static int SearchRight(double[] times, double x)
     {
-        int lo = 0;
-        int hi = times.Length;
-        while (lo < hi)
+        int low = 0;
+        int high = times.Length;
+        while (low < high)
         {
-            int mid = (lo + hi) / 2;
-            if (times[mid] <= x)
+            int middle = (low + high) / 2;
+            if (times[middle] <= x)
             {
-                lo = mid + 1;
+                low = middle + 1;
             }
             else
             {
-                hi = mid;
+                high = middle;
             }
         }
-        return lo;
+        return low;
     }
 
     // One channel's keys as gltf_sample takes them: the times, and the values flattened `w` a
     // key (in-tangent, value, out-tangent a key for CUBICSPLINE).
-    static void Keys<T>(IAnimationSampler<T> s, Func<T, double[]> row, out double[] times, out double[] vals, out string interp)
+    static void ReadKeys<T>(IAnimationSampler<T> sampler, Func<T, double[]> toRow, out double[] times, out double[] values, out string interpolation)
     {
-        List<double> ts = new List<double>();
-        List<double> vs = new List<double>();
-        interp = s.InterpolationMode.ToString();
-        if (s.InterpolationMode == AnimationInterpolationMode.CUBICSPLINE)
+        List<double> timeList = new List<double>();
+        List<double> valueList = new List<double>();
+        interpolation = sampler.InterpolationMode.ToString();
+        if (sampler.InterpolationMode == AnimationInterpolationMode.CUBICSPLINE)
         {
-            foreach ((float time, (T tin, T value, T tout)) in s.GetCubicKeys())
+            foreach ((float time, (T inTangent, T value, T outTangent)) in sampler.GetCubicKeys())
             {
-                ts.Add(time);
-                vs.AddRange(row(tin));
-                vs.AddRange(row(value));
-                vs.AddRange(row(tout));
+                timeList.Add(time);
+                valueList.AddRange(toRow(inTangent));
+                valueList.AddRange(toRow(value));
+                valueList.AddRange(toRow(outTangent));
             }
         }
         else
         {
-            foreach ((float time, T value) in s.GetLinearKeys())
+            foreach ((float time, T value) in sampler.GetLinearKeys())
             {
-                ts.Add(time);
-                vs.AddRange(row(value));
+                timeList.Add(time);
+                valueList.AddRange(toRow(value));
             }
         }
-        times = ts.ToArray();
-        vals = vs.ToArray();
+        times = timeList.ToArray();
+        values = valueList.ToArray();
     }
 
-    static double[] Row(Vector3 v)
+    static double[] Vector3Row(Vector3 vector)
     {
-        return new double[] { v.X, v.Y, v.Z };
+        return new double[] { vector.X, vector.Y, vector.Z };
     }
 
-    static double[] Row(Quaternion q)
+    static double[] QuaternionRow(Quaternion rotation)
     {
-        return new double[] { q.X, q.Y, q.Z, q.W };
+        return new double[] { rotation.X, rotation.Y, rotation.Z, rotation.W };
     }
 
     // ---- read_glb ----
@@ -295,53 +295,53 @@ public static class GltfSourceReader
     // A glTF scene as it is: glTF is already +Y up, +Z front and in metres.
     public static Scene Read(string path, Action<string> warn)
     {
-        string dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
-        SourceImages images = new SourceImages(dir, warn);
+        string directory = Path.GetDirectoryName(Path.GetFullPath(path))!;
+        SourceImages images = new SourceImages(directory, warn);
         ModelRoot model = Load(path, images, warn);
-        Scene sc = new Scene();
-        IReadOnlyList<Node> gnodes = model.LogicalNodes;
+        Scene scene = new Scene();
+        IReadOnlyList<Node> glbNodes = model.LogicalNodes;
         // per glTF node: translation, rotation, scale (a matrix node is decomposed)
-        List<double[]> restT = new List<double[]>();
-        List<double[]> restQ = new List<double[]>();
-        List<double[]> restS = new List<double[]>();
-        for (int k = 0; k < gnodes.Count; k++)
+        List<double[]> restTranslations = new List<double[]>();
+        List<double[]> restRotations = new List<double[]>();
+        List<double[]> restScales = new List<double[]>();
+        for (int k = 0; k < glbNodes.Count; k++)
         {
-            Node nd = gnodes[k];
-            string name = nd.Name ?? "";
+            Node glbNode = glbNodes[k];
+            string name = glbNode.Name ?? "";
             if (name.Length == 0)
             {
                 name = "node" + k;
             }
-            sc.AddNode(name);
-            var lt = nd.LocalTransform;
-            double[] t;
-            double[] q;
-            double[] s;
-            if (lt.IsMatrix)
+            scene.AddNode(name);
+            var localTransform = glbNode.LocalTransform;
+            double[] translation;
+            double[] rotation;
+            double[] scaling;
+            if (localTransform.IsMatrix)
             {
-                Mat4 m = ToMat4(lt.Matrix);
-                sc.Nodes[k].Local = m;
-                t = new double[3];
-                q = new double[4];
-                s = new double[3];
-                m.Decompose(t, q, s);
+                Matrix4 localMatrix = ToMat4(localTransform.Matrix);
+                scene.Nodes[k].Local = localMatrix;
+                translation = new double[3];
+                rotation = new double[4];
+                scaling = new double[3];
+                localMatrix.Decompose(translation, rotation, scaling);
             }
             else
             {
-                t = Row(lt.Translation);
-                q = Row(lt.Rotation);
-                s = Row(lt.Scale);
-                sc.Nodes[k].Local = Mat4.FromTrs(t, q, s);
+                translation = Vector3Row(localTransform.Translation);
+                rotation = QuaternionRow(localTransform.Rotation);
+                scaling = Vector3Row(localTransform.Scale);
+                scene.Nodes[k].Local = Matrix4.FromTrs(translation, rotation, scaling);
             }
-            restT.Add(t);
-            restQ.Add(q);
-            restS.Add(s);
+            restTranslations.Add(translation);
+            restRotations.Add(rotation);
+            restScales.Add(scaling);
         }
-        for (int k = 0; k < gnodes.Count; k++)
+        for (int k = 0; k < glbNodes.Count; k++)
         {
-            foreach (Node c in gnodes[k].VisualChildren)
+            foreach (Node child in glbNodes[k].VisualChildren)
             {
-                sc.Nodes[c.LogicalIndex].Parent = k;
+                scene.Nodes[child.LogicalIndex].Parent = k;
             }
         }
         // nodes outside the scene shown are left out by giving them no meshes or joints
@@ -349,130 +349,130 @@ public static class GltfSourceReader
         Stack<Node> stack = new Stack<Node>();
         if (model.DefaultScene != null)
         {
-            foreach (Node n in model.DefaultScene.VisualChildren)
+            foreach (Node sceneRoot in model.DefaultScene.VisualChildren)
             {
-                stack.Push(n);
+                stack.Push(sceneRoot);
             }
         }
         else
         {
-            foreach (Node n in gnodes)
+            foreach (Node candidate in glbNodes)
             {
-                stack.Push(n);
+                stack.Push(candidate);
             }
         }
         while (stack.Count > 0)
         {
-            Node n = stack.Pop();
-            shown.Add(n.LogicalIndex);
-            foreach (Node c in n.VisualChildren)
+            Node visited = stack.Pop();
+            shown.Add(visited.LogicalIndex);
+            foreach (Node child in visited.VisualChildren)
             {
-                stack.Push(c);
+                stack.Push(child);
             }
         }
 
         Dictionary<int, SKBitmap?> imageCache = new Dictionary<int, SKBitmap?>();
-        Dictionary<int, int> matIndex = new Dictionary<int, int>();
-        Dictionary<int, int> matSet = new Dictionary<int, int>(); // glTF material -> its base-colour TEXCOORD set
+        Dictionary<int, int> materialIndexByGlb = new Dictionary<int, int>();
+        Dictionary<int, int> texCoordSetByMaterial = new Dictionary<int, int>(); // glTF material -> its base-colour TEXCOORD set
 
-        for (int k = 0; k < gnodes.Count; k++)
+        for (int k = 0; k < glbNodes.Count; k++)
         {
-            Node nd = gnodes[k];
-            if (nd.Mesh == null || !shown.Contains(k))
+            Node glbNode = glbNodes[k];
+            if (glbNode.Mesh == null || !shown.Contains(k))
             {
                 continue;
             }
-            Mesh gm = nd.Mesh;
-            Skin? skin = nd.Skin;
+            Mesh glbMesh = glbNode.Mesh;
+            Skin? skin = glbNode.Skin;
             List<int> joints = new List<int>();
             if (skin != null)
             {
-                for (int ji = 0; ji < skin.JointsCount; ji++)
+                for (int jointSlot = 0; jointSlot < skin.JointsCount; jointSlot++)
                 {
-                    (Node joint, Matrix4x4 inverseBind) = skin.GetJoint(ji);
+                    (Node joint, Matrix4x4 inverseBind) = skin.GetJoint(jointSlot);
                     joints.Add(joint.LogicalIndex);
-                    if (sc.Nodes[joint.LogicalIndex].Bind == null)
+                    if (scene.Nodes[joint.LogicalIndex].Bind == null)
                     {
-                        sc.Nodes[joint.LogicalIndex].Bind = ToMat4(inverseBind).Inverse();
+                        scene.Nodes[joint.LogicalIndex].Bind = ToMat4(inverseBind).Inverse();
                     }
                 }
             }
-            List<double> cps = new List<double>();
-            List<double> nrms = new List<double>();
-            bool anyNoNormal = false;
+            List<double> controlPointList = new List<double>();
+            List<double> normalList = new List<double>();
+            bool anyWithoutNormals = false;
             List<double> uvs = new List<double>();
-            List<int> tris = new List<int>();
-            List<int> tmat = new List<int>();
-            List<List<Influence>> infl = new List<List<Influence>>();
-            int bse = 0;
-            foreach (MeshPrimitive prim in gm.Primitives)
+            List<int> triangleCorners = new List<int>();
+            List<int> triangleMaterials = new List<int>();
+            List<List<Influence>> influences = new List<List<Influence>>();
+            int vertexBase = 0;
+            foreach (MeshPrimitive primitive in glbMesh.Primitives)
             {
-                if (prim.DrawPrimitiveType != PrimitiveType.TRIANGLES)
+                if (primitive.DrawPrimitiveType != PrimitiveType.TRIANGLES)
                 {
-                    string mname = gm.Name ?? "";
-                    if (mname.Length == 0)
+                    string primitiveMeshName = glbMesh.Name ?? "";
+                    if (primitiveMeshName.Length == 0)
                     {
-                        mname = "mesh";
+                        primitiveMeshName = "mesh";
                     }
-                    warn(mname + ": primitive mode " + (int)prim.DrawPrimitiveType + " skipped (triangles only)");
+                    warn(primitiveMeshName + ": primitive mode " + (int)primitive.DrawPrimitiveType + " skipped (triangles only)");
                     continue;
                 }
-                IList<Vector3> pos = prim.GetVertexAccessor("POSITION").AsVector3Array();
-                int np = pos.Count;
-                int[] idx;
-                if (prim.IndexAccessor != null)
+                IList<Vector3> positions = primitive.GetVertexAccessor("POSITION").AsVector3Array();
+                int positionCount = positions.Count;
+                int[] indexList;
+                if (primitive.IndexAccessor != null)
                 {
-                    IList<uint> ia = prim.IndexAccessor.AsIndicesArray();
-                    idx = new int[ia.Count];
-                    for (int e = 0; e < idx.Length; e++)
+                    IList<uint> glbIndices = primitive.IndexAccessor.AsIndicesArray();
+                    indexList = new int[glbIndices.Count];
+                    for (int indexNumber = 0; indexNumber < indexList.Length; indexNumber++)
                     {
-                        idx[e] = (int)ia[e];
+                        indexList[indexNumber] = (int)glbIndices[indexNumber];
                     }
                 }
                 else
                 {
-                    idx = new int[np];
-                    for (int e = 0; e < np; e++)
+                    indexList = new int[positionCount];
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        idx[e] = e;
+                        indexList[vertex] = vertex;
                     }
                 }
-                Material(prim.Material, sc, imageCache, matIndex, matSet, warn, out int mi, out int tset);
-                Accessor? na = prim.GetVertexAccessor("NORMAL");
-                if (na != null)
+                Material(primitive.Material, scene, imageCache, materialIndexByGlb, texCoordSetByMaterial, warn, out int materialIndex, out int texCoordSet);
+                Accessor? normalAccessor = primitive.GetVertexAccessor("NORMAL");
+                if (normalAccessor != null)
                 {
-                    IList<Vector3> nv = na.AsVector3Array();
-                    for (int e = 0; e < np; e++)
+                    IList<Vector3> normalValues = normalAccessor.AsVector3Array();
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        nrms.Add(nv[e].X);
-                        nrms.Add(nv[e].Y);
-                        nrms.Add(nv[e].Z);
+                        normalList.Add(normalValues[vertex].X);
+                        normalList.Add(normalValues[vertex].Y);
+                        normalList.Add(normalValues[vertex].Z);
                     }
                 }
                 else
                 {
-                    anyNoNormal = true;
-                    for (int e = 0; e < np; e++)
+                    anyWithoutNormals = true;
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        nrms.Add(0);
-                        nrms.Add(0);
-                        nrms.Add(0);
+                        normalList.Add(0);
+                        normalList.Add(0);
+                        normalList.Add(0);
                     }
                 }
-                Accessor? ua = prim.GetVertexAccessor("TEXCOORD_" + tset);
-                if (ua != null)
+                Accessor? uvAccessor = primitive.GetVertexAccessor("TEXCOORD_" + texCoordSet);
+                if (uvAccessor != null)
                 {
-                    IList<Vector2> uv = ua.AsVector2Array();
-                    for (int e = 0; e < np; e++)
+                    IList<Vector2> uvValues = uvAccessor.AsVector2Array();
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        uvs.Add(uv[e].X);
+                        uvs.Add(uvValues[vertex].X);
                         // glTF is top-left; the scene keeps bottom-left (write_glb flips back)
-                        uvs.Add(1.0 - uv[e].Y);
+                        uvs.Add(1.0 - uvValues[vertex].Y);
                     }
                 }
                 else
                 {
-                    for (int e = 0; e < np; e++)
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
                         uvs.Add(0);
                         uvs.Add(0);
@@ -480,37 +480,37 @@ public static class GltfSourceReader
                 }
                 if (skin != null)
                 {
-                    List<List<Influence>> d = new List<List<Influence>>();
-                    for (int e = 0; e < np; e++)
+                    List<List<Influence>> vertexInfluences = new List<List<Influence>>();
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        d.Add(new List<Influence>());
+                        vertexInfluences.Add(new List<Influence>());
                     }
                     for (int set = 0; set < 4; set++)
                     {
-                        Accessor? ja = prim.GetVertexAccessor("JOINTS_" + set);
-                        if (ja == null)
+                        Accessor? jointAccessor = primitive.GetVertexAccessor("JOINTS_" + set);
+                        if (jointAccessor == null)
                         {
                             break;
                         }
-                        IList<Vector4> jn = ja.AsVector4Array();
-                        IList<Vector4> wv = prim.GetVertexAccessor("WEIGHTS_" + set).AsVector4Array();
-                        for (int c = 0; c < 4; c++)
+                        IList<Vector4> jointValues = jointAccessor.AsVector4Array();
+                        IList<Vector4> weightValues = primitive.GetVertexAccessor("WEIGHTS_" + set).AsVector4Array();
+                        for (int influenceSlot = 0; influenceSlot < 4; influenceSlot++)
                         {
-                            for (int v = 0; v < np; v++)
+                            for (int vertex = 0; vertex < positionCount; vertex++)
                             {
-                                double w = Component(wv[v], c);
+                                double w = Component(weightValues[vertex], influenceSlot);
                                 if (!(w > 0))
                                 {
                                     continue;
                                 }
-                                int node = joints[(int)Component(jn[v], c)];
-                                List<Influence> list = d[v];
+                                int node = joints[(int)Component(jointValues[vertex], influenceSlot)];
+                                List<Influence> list = vertexInfluences[vertex];
                                 bool found = false;
-                                for (int q = 0; q < list.Count; q++)
+                                for (int influenceIndex = 0; influenceIndex < list.Count; influenceIndex++)
                                 {
-                                    if (list[q].Joint == node)
+                                    if (list[influenceIndex].Joint == node)
                                     {
-                                        list[q].Weight += w;
+                                        list[influenceIndex].Weight += w;
                                         found = true;
                                         break;
                                     }
@@ -522,114 +522,114 @@ public static class GltfSourceReader
                             }
                         }
                     }
-                    for (int v = 0; v < np; v++)
+                    for (int vertex = 0; vertex < positionCount; vertex++)
                     {
-                        if (d[v].Count == 0)
+                        if (vertexInfluences[vertex].Count == 0)
                         {
-                            d[v].Add(new Influence(k, 1.0)); // unweighted: rides the mesh's own node
+                            vertexInfluences[vertex].Add(new Influence(k, 1.0)); // unweighted: rides the mesh's own node
                         }
                     }
-                    infl.AddRange(d);
+                    influences.AddRange(vertexInfluences);
                 }
-                for (int e = 0; e < np; e++)
+                for (int vertex = 0; vertex < positionCount; vertex++)
                 {
-                    cps.Add(pos[e].X);
-                    cps.Add(pos[e].Y);
-                    cps.Add(pos[e].Z);
+                    controlPointList.Add(positions[vertex].X);
+                    controlPointList.Add(positions[vertex].Y);
+                    controlPointList.Add(positions[vertex].Z);
                 }
-                for (int e = 0; e < idx.Length; e++)
+                for (int indexNumber = 0; indexNumber < indexList.Length; indexNumber++)
                 {
-                    tris.Add(idx[e] + bse);
+                    triangleCorners.Add(indexList[indexNumber] + vertexBase);
                 }
-                for (int e = 0; e < idx.Length / 3; e++)
+                for (int triangle = 0; triangle < indexList.Length / 3; triangle++)
                 {
-                    tmat.Add(mi);
+                    triangleMaterials.Add(materialIndex);
                 }
-                bse += np;
+                vertexBase += positionCount;
             }
-            if (cps.Count == 0)
+            if (controlPointList.Count == 0)
             {
                 continue;
             }
-            double[] cp = cps.ToArray();
-            int[] corners = tris.ToArray();
-            double[]? cornerNrm = null;
-            if (!anyNoNormal)
+            double[] controlPoints = controlPointList.ToArray();
+            int[] corners = triangleCorners.ToArray();
+            double[]? cornerNormals = null;
+            if (!anyWithoutNormals)
             {
-                cornerNrm = new double[corners.Length * 3];
-                for (int e = 0; e < corners.Length; e++)
+                cornerNormals = new double[corners.Length * 3];
+                for (int corner = 0; corner < corners.Length; corner++)
                 {
-                    cornerNrm[e * 3] = nrms[corners[e] * 3];
-                    cornerNrm[e * 3 + 1] = nrms[corners[e] * 3 + 1];
-                    cornerNrm[e * 3 + 2] = nrms[corners[e] * 3 + 2];
+                    cornerNormals[corner * 3] = normalList[corners[corner] * 3];
+                    cornerNormals[corner * 3 + 1] = normalList[corners[corner] * 3 + 1];
+                    cornerNormals[corner * 3 + 2] = normalList[corners[corner] * 3 + 2];
                 }
             }
             double[] cornerUv = new double[corners.Length * 2];
-            for (int e = 0; e < corners.Length; e++)
+            for (int corner = 0; corner < corners.Length; corner++)
             {
-                cornerUv[e * 2] = uvs[corners[e] * 2];
-                cornerUv[e * 2 + 1] = uvs[corners[e] * 2 + 1];
+                cornerUv[corner * 2] = uvs[corners[corner] * 2];
+                cornerUv[corner * 2 + 1] = uvs[corners[corner] * 2 + 1];
             }
-            string meshName = gm.Name ?? "";
+            string meshName = glbMesh.Name ?? "";
             if (meshName.Length == 0)
             {
-                meshName = nd.Name ?? "";
+                meshName = glbNode.Name ?? "";
             }
             if (meshName.Length == 0)
             {
                 meshName = "mesh";
             }
             SceneMesh mesh = new SceneMesh(meshName, k);
-            List<Influence>[]? cpInfl = null;
+            List<Influence>[]? controlPointInfluences = null;
             if (skin != null)
             {
-                cpInfl = infl.ToArray();
-                if (sc.Nodes[k].Bind == null && infl.Any(list => list.Any(f => f.Joint == k)))
+                controlPointInfluences = influences.ToArray();
+                if (scene.Nodes[k].Bind == null && influences.Any(list => list.Any(influence => influence.Joint == k)))
                 {
-                    sc.Nodes[k].Bind = sc.NodeWorld(k);
+                    scene.Nodes[k].Bind = scene.NodeWorld(k);
                 }
             }
             int[] triCorners = new int[corners.Length];
-            for (int e = 0; e < corners.Length; e++)
+            for (int corner = 0; corner < corners.Length; corner++)
             {
-                triCorners[e] = e;
+                triCorners[corner] = corner;
             }
-            MeshBuild.Build(mesh, cp, corners, cornerNrm, cornerUv, triCorners, tmat.ToArray(), cpInfl);
-            sc.Meshes.Add(mesh);
+            MeshBuild.Build(mesh, controlPoints, corners, cornerNormals, cornerUv, triCorners, triangleMaterials.ToArray(), controlPointInfluences);
+            scene.Meshes.Add(mesh);
         }
 
-        int ai = 0;
-        foreach (Animation ga in model.LogicalAnimations)
+        int animationIndex = 0;
+        foreach (Animation glbAnimation in model.LogicalAnimations)
         {
-            List<int> chNode = new List<int>();
-            List<string> chPath = new List<string>();
-            List<double[]> chTimes = new List<double[]>();
-            List<double[]> chVals = new List<double[]>();
+            List<int> channelNodes = new List<int>();
+            List<string> channelPaths = new List<string>();
+            List<double[]> channelTimes = new List<double[]>();
+            List<double[]> channelValues = new List<double[]>();
             List<string> chInterp = new List<string>();
             double end = 0.0;
-            foreach (AnimationChannel ch in ga.Channels)
+            foreach (AnimationChannel glbChannel in glbAnimation.Channels)
             {
-                if (ch.TargetNode == null)
+                if (glbChannel.TargetNode == null)
                 {
                     continue;
                 }
                 double[] times;
-                double[] vals;
-                string interp;
+                double[] keyValues;
+                string interpolation;
                 string pathName;
-                if (ch.TargetNodePath == PropertyPath.translation)
+                if (glbChannel.TargetNodePath == PropertyPath.translation)
                 {
-                    Keys(ch.GetTranslationSampler(), Row, out times, out vals, out interp);
+                    ReadKeys(glbChannel.GetTranslationSampler(), Vector3Row, out times, out keyValues, out interpolation);
                     pathName = "translation";
                 }
-                else if (ch.TargetNodePath == PropertyPath.rotation)
+                else if (glbChannel.TargetNodePath == PropertyPath.rotation)
                 {
-                    Keys(ch.GetRotationSampler(), Row, out times, out vals, out interp);
+                    ReadKeys(glbChannel.GetRotationSampler(), QuaternionRow, out times, out keyValues, out interpolation);
                     pathName = "rotation";
                 }
-                else if (ch.TargetNodePath == PropertyPath.scale)
+                else if (glbChannel.TargetNodePath == PropertyPath.scale)
                 {
-                    Keys(ch.GetScaleSampler(), Row, out times, out vals, out interp);
+                    ReadKeys(glbChannel.GetScaleSampler(), Vector3Row, out times, out keyValues, out interpolation);
                     pathName = "scale";
                 }
                 else
@@ -640,178 +640,178 @@ public static class GltfSourceReader
                 {
                     continue;
                 }
-                chNode.Add(ch.TargetNode.LogicalIndex);
-                chPath.Add(pathName);
-                chTimes.Add(times);
-                chVals.Add(vals);
-                chInterp.Add(interp);
+                channelNodes.Add(glbChannel.TargetNode.LogicalIndex);
+                channelPaths.Add(pathName);
+                channelTimes.Add(times);
+                channelValues.Add(keyValues);
+                chInterp.Add(interpolation);
                 end = Math.Max(end, times[times.Length - 1]);
             }
-            if (chNode.Count == 0)
+            if (channelNodes.Count == 0)
             {
-                ai++;
+                animationIndex++;
                 continue;
             }
             int frames = (int)Math.Round(end * Scene.Fps, MidpointRounding.ToEven) + 1;
-            double[] t = new double[frames];
-            for (int f = 0; f < frames; f++)
+            double[] sampleTimes = new double[frames];
+            for (int frame = 0; frame < frames; frame++)
             {
-                t[f] = (double)f / Scene.Fps;
+                sampleTimes[frame] = (double)frame / Scene.Fps;
             }
-            string aname = ga.Name ?? "";
-            if (aname.Length == 0)
+            string animationName = glbAnimation.Name ?? "";
+            if (animationName.Length == 0)
             {
-                aname = "animation" + ai;
+                animationName = "animation" + animationIndex;
             }
-            SceneAnim anim = new SceneAnim(aname, frames);
-            Dictionary<int, double[][]> trs = new Dictionary<int, double[][]>();
+            SceneAnim anim = new SceneAnim(animationName, frames);
+            Dictionary<int, double[][]> trsByNode = new Dictionary<int, double[][]>();
             List<int> trsOrder = new List<int>();
-            for (int c = 0; c < chNode.Count; c++)
+            for (int channelIndex = 0; channelIndex < channelNodes.Count; channelIndex++)
             {
-                int node = chNode[c];
-                if (!trs.ContainsKey(node))
+                int node = channelNodes[channelIndex];
+                if (!trsByNode.ContainsKey(node))
                 {
-                    double[][] slots = new double[3][];
-                    slots[0] = Tile(restT[node], frames);
-                    slots[1] = Tile(restQ[node], frames);
-                    slots[2] = Tile(restS[node], frames);
-                    trs[node] = slots;
+                    double[][] trsSlots = new double[3][];
+                    trsSlots[0] = Repeat(restTranslations[node], frames);
+                    trsSlots[1] = Repeat(restRotations[node], frames);
+                    trsSlots[2] = Repeat(restScales[node], frames);
+                    trsByNode[node] = trsSlots;
                     trsOrder.Add(node);
                 }
                 int slot = 0;
                 int w = 3;
-                if (chPath[c] == "rotation")
+                if (channelPaths[channelIndex] == "rotation")
                 {
                     slot = 1;
                     w = 4;
                 }
-                else if (chPath[c] == "scale")
+                else if (channelPaths[channelIndex] == "scale")
                 {
                     slot = 2;
                 }
-                trs[node][slot] = Sample(chTimes[c], chVals[c], w, chInterp[c], t, chPath[c] == "rotation");
+                trsByNode[node][slot] = SampleKeys(channelTimes[channelIndex], channelValues[channelIndex], w, chInterp[channelIndex], sampleTimes, channelPaths[channelIndex] == "rotation");
             }
             foreach (int node in trsOrder)
             {
-                double[][] slots = trs[node];
-                Mat4[] mats = new Mat4[frames];
-                double[] tt = new double[3];
-                double[] qq = new double[4];
-                double[] ss = new double[3];
-                for (int f = 0; f < frames; f++)
+                double[][] trsSlots = trsByNode[node];
+                Matrix4[] frameMatrices = new Matrix4[frames];
+                double[] translation = new double[3];
+                double[] rotation = new double[4];
+                double[] scaling = new double[3];
+                for (int frame = 0; frame < frames; frame++)
                 {
-                    tt[0] = slots[0][f * 3];
-                    tt[1] = slots[0][f * 3 + 1];
-                    tt[2] = slots[0][f * 3 + 2];
-                    qq[0] = slots[1][f * 4];
-                    qq[1] = slots[1][f * 4 + 1];
-                    qq[2] = slots[1][f * 4 + 2];
-                    qq[3] = slots[1][f * 4 + 3];
-                    ss[0] = slots[2][f * 3];
-                    ss[1] = slots[2][f * 3 + 1];
-                    ss[2] = slots[2][f * 3 + 2];
-                    mats[f] = Mat4.FromTrs(tt, qq, ss);
+                    translation[0] = trsSlots[0][frame * 3];
+                    translation[1] = trsSlots[0][frame * 3 + 1];
+                    translation[2] = trsSlots[0][frame * 3 + 2];
+                    rotation[0] = trsSlots[1][frame * 4];
+                    rotation[1] = trsSlots[1][frame * 4 + 1];
+                    rotation[2] = trsSlots[1][frame * 4 + 2];
+                    rotation[3] = trsSlots[1][frame * 4 + 3];
+                    scaling[0] = trsSlots[2][frame * 3];
+                    scaling[1] = trsSlots[2][frame * 3 + 1];
+                    scaling[2] = trsSlots[2][frame * 3 + 2];
+                    frameMatrices[frame] = Matrix4.FromTrs(translation, rotation, scaling);
                 }
-                anim.Tracks[node] = mats;
+                anim.Tracks[node] = frameMatrices;
             }
-            sc.Anims.Add(anim);
-            ai++;
+            scene.Anims.Add(anim);
+            animationIndex++;
         }
-        return sc;
+        return scene;
     }
 
-    static double Component(Vector4 v, int c)
+    static double Component(Vector4 vector, int componentIndex)
     {
-        if (c == 0)
+        if (componentIndex == 0)
         {
-            return v.X;
+            return vector.X;
         }
-        if (c == 1)
+        if (componentIndex == 1)
         {
-            return v.Y;
+            return vector.Y;
         }
-        if (c == 2)
+        if (componentIndex == 2)
         {
-            return v.Z;
+            return vector.Z;
         }
-        return v.W;
+        return vector.W;
     }
 
-    static double[] Tile(double[] row, int frames)
+    static double[] Repeat(double[] row, int frames)
     {
-        double[] o = new double[row.Length * frames];
-        for (int f = 0; f < frames; f++)
+        double[] repeated = new double[row.Length * frames];
+        for (int frame = 0; frame < frames; frame++)
         {
-            for (int c = 0; c < row.Length; c++)
+            for (int component = 0; component < row.Length; component++)
             {
-                o[f * row.Length + c] = row[c];
+                repeated[frame * row.Length + component] = row[component];
             }
         }
-        return o;
+        return repeated;
     }
 
     // read_glb's image(): one bitmap per glTF image, shared by the materials that use it
-    static SKBitmap? Image(Image im, Dictionary<int, SKBitmap?> cache, Action<string> warn)
+    static SKBitmap? LoadImage(Image glbImage, Dictionary<int, SKBitmap?> cache, Action<string> warn)
     {
-        if (!cache.ContainsKey(im.LogicalIndex))
+        if (!cache.ContainsKey(glbImage.LogicalIndex))
         {
-            byte[] data = im.Content.Content.ToArray();
-            SKBitmap? bmp = null;
+            byte[] data = glbImage.Content.Content.ToArray();
+            SKBitmap? bitmap = null;
             if (!data.AsSpan().SequenceEqual(MissingImage))
             {
-                bmp = SourceImages.Decode(data);
-                if (bmp == null)
+                bitmap = SourceImages.Decode(data);
+                if (bitmap == null)
                 {
-                    warn("texture " + (im.Name ?? "image" + im.LogicalIndex) + " did not load");
+                    warn("texture " + (glbImage.Name ?? "image" + glbImage.LogicalIndex) + " did not load");
                 }
             }
-            cache[im.LogicalIndex] = bmp;
+            cache[glbImage.LogicalIndex] = bitmap;
         }
-        return cache[im.LogicalIndex];
+        return cache[glbImage.LogicalIndex];
     }
 
     // read_glb's material(): a primitive's material index in the scene, and its TEXCOORD set
-    static void Material(Material? m, Scene sc, Dictionary<int, SKBitmap?> imageCache,
-        Dictionary<int, int> matIndex, Dictionary<int, int> matSet, Action<string> warn, out int index, out int tset)
+    static void Material(Material? glbMaterial, Scene scene, Dictionary<int, SKBitmap?> imageCache,
+        Dictionary<int, int> materialIndexByGlb, Dictionary<int, int> texCoordSetByMaterial, Action<string> warn, out int index, out int texCoordSet)
     {
-        int mi = m == null ? -1 : m.LogicalIndex; // -1: the primitive has no material (Python's None)
-        if (!matIndex.ContainsKey(mi))
+        int glbMaterialIndex = glbMaterial == null ? -1 : glbMaterial.LogicalIndex; // -1: the primitive has no material (Python's None)
+        if (!materialIndexByGlb.ContainsKey(glbMaterialIndex))
         {
-            if (m == null)
+            if (glbMaterial == null)
             {
-                matIndex[mi] = sc.AddMaterial("default", new double[] { 1.0, 1.0, 1.0, 1.0 }, null);
-                matSet[mi] = 0;
-                index = matIndex[mi];
-                tset = 0;
+                materialIndexByGlb[glbMaterialIndex] = scene.AddMaterial("default", new double[] { 1.0, 1.0, 1.0, 1.0 }, null);
+                texCoordSetByMaterial[glbMaterialIndex] = 0;
+                index = materialIndexByGlb[glbMaterialIndex];
+                texCoordSet = 0;
                 return;
             }
             double[] color = new double[] { 1, 1, 1, 1 };
-            SKBitmap? img = null;
-            matSet[mi] = 0;
-            MaterialChannel? bc = m.FindChannel("BaseColor");
-            if (bc.HasValue)
+            SKBitmap? bitmap = null;
+            texCoordSetByMaterial[glbMaterialIndex] = 0;
+            MaterialChannel? baseColor = glbMaterial.FindChannel("BaseColor");
+            if (baseColor.HasValue)
             {
-                Vector4 f = bc.Value.Color;
-                color = new double[] { f.X, f.Y, f.Z, f.W };
-                Texture? tex = bc.Value.Texture;
-                if (tex != null)
+                Vector4 colorFactor = baseColor.Value.Color;
+                color = new double[] { colorFactor.X, colorFactor.Y, colorFactor.Z, colorFactor.W };
+                Texture? texture = baseColor.Value.Texture;
+                if (texture != null)
                 {
-                    Image? src = tex.FallbackImage ?? tex.PrimaryImage;
-                    if (src != null)
+                    Image? sourceImage = texture.FallbackImage ?? texture.PrimaryImage;
+                    if (sourceImage != null)
                     {
-                        img = Image(src, imageCache, warn);
+                        bitmap = LoadImage(sourceImage, imageCache, warn);
                     }
-                    matSet[mi] = bc.Value.TextureCoordinate;
+                    texCoordSetByMaterial[glbMaterialIndex] = baseColor.Value.TextureCoordinate;
                 }
             }
-            string name = m.Name ?? "";
+            string name = glbMaterial.Name ?? "";
             if (name.Length == 0)
             {
-                name = "material" + mi;
+                name = "material" + glbMaterialIndex;
             }
-            matIndex[mi] = sc.AddMaterial(name, color, img);
+            materialIndexByGlb[glbMaterialIndex] = scene.AddMaterial(name, color, bitmap);
         }
-        index = matIndex[mi];
-        tset = matSet[mi];
+        index = materialIndexByGlb[glbMaterialIndex];
+        texCoordSet = texCoordSetByMaterial[glbMaterialIndex];
     }
 }

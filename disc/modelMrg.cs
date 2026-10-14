@@ -1,18 +1,17 @@
-using System.Buffers.Binary;
 using System.Security.Cryptography;
+using static DotrAssetModder.Bin;
 
 namespace DotrAssetModder;
 
-// The DATA/MODEL.MRG archive: parse, import staging and save. The harness (`mrgimp`, `mrgrt`,
-// `mrgnames`, `boardbands`) and the importer window drive exactly this class.
-//
-// MODEL.MRG is 81 entries of anOfs_MODEL: 39 share-data packs (297 RH0 sub-models between them)
-// then 42 single-model stained-glass windows. A pack's sub-models are located by the ELF's own
-// per-pack sub-offset table (OFS[p]), which is authoritative - no layout has to be guessed.
-//
-// A sub-model's SLOT is the gap to the next OFS entry (the last entry of OFS[p] is the pack size).
-// A replacement is written inside that slot and nothing else moves, so no ELF table is ever
-// touched; growing past a slot needs the pack repacked.
+/* The DATA/MODEL.MRG archive: parse, import staging and save.
+
+   MODEL.MRG is 81 entries of anOfs_MODEL: 39 share-data packs (297 RH0 sub-models between them)
+   then 42 single-model stained-glass windows. A pack's sub-models are located by the ELF's own
+   per-pack sub-offset table (OFS[p]), which is authoritative.
+
+   A sub-model's SLOT is the gap to the next OFS entry (the last entry of OFS[p] is the pack size).
+   A replacement is written inside that slot and nothing else moves, so no ELF table is ever
+   touched; growing past a slot needs the pack repacked. */
 public class ModelMrg : IDisposable
 {
     public const string MrgPath = "DATA/MODEL.MRG";
@@ -22,7 +21,7 @@ public class ModelMrg : IDisposable
     {
         public int Index;             // global index: pack sub-models in pack order, then windows
         public int Pack = -1;         // -1 for a window
-        public int K = -1;            // sub-model index inside the pack, -1 for a window
+        public int SubModelIndex = -1;            // sub-model index inside the pack, -1 for a window
         public int Entry;             // anOfs_MODEL entry this block lives in (pack index, or 39..80)
         public int ModelId = -1;      // FIRST[pack] + K; -1 for a window (windows have no FIRST/COUNT)
         public int WindowIndex = -1;  // 0..41 for a window
@@ -79,9 +78,8 @@ public class ModelMrg : IDisposable
         public string SourcePath;
     }
 
-    // What Stage() answers with. Fits == false means Staged == false: nothing is ever staged
-    // silently when it does not fit its slot. Error != null means the rebuild threw and
-    // Size/Fits are meaningless.
+    /* What Stage() answers with. Fits == false means Staged == false: nothing is staged when it
+       does not fit its slot. Error != null means the rebuild threw and Size/Fits are meaningless. */
     public class StageResult
     {
         public int Index;
@@ -123,9 +121,9 @@ public class ModelMrg : IDisposable
         }
     }
 
-    // What Build() answers with: the changes, plus which blocks they came from. Unchanged means
-    // the replacement was byte-identical to what is on the disc. Errors are over-slot blocks,
-    // named with model id / size / slot; any error means no change at all is kept.
+    /* What Build() answers with: the changes, plus which blocks they came from. Unchanged means
+       the replacement was byte-identical to what is on the disc. Errors are over-slot blocks;
+       any error means no change at all is kept. */
     public class BuildResult
     {
         public ChangeSet Changes = new ChangeSet();
@@ -143,10 +141,10 @@ public class ModelMrg : IDisposable
     // Every group name in list order, for the filter.
     public static readonly string[] Groups = { "DUEL", "RING", "STAGE", "EVENT", "FIELD", "windows" };
 
-    // What each model is, where it is known (DotR-PC NOTES/model-mrg.md). The DUEL names come
-    // from renders, the FIELD order from messages 71-80, the window index from
-    // SzDuel_SetupDuel @ 0x1DDE4C: side * 100 + (leader kind & 0x1F), kinds in the game's order
-    // (DotR-PC tools/rules.py KINDS). STAGE and EVENT scenes are not mapped yet.
+    /* What each model is, where known (DotR-PC NOTES/model-mrg.md). The DUEL names come from
+       renders, the FIELD order from messages 71-80, the window index from
+       SzDuel_SetupDuel @ 0x1DDE4C: side * 100 + (leader kind & 0x1F), kinds in the game's order
+       (DotR-PC tools/rules.py KINDS). STAGE and EVENT scenes are not mapped yet. */
     static readonly string[] DuelNames =
         { "Duel table and board", "Gold emblem", "Dark crystal", "Cyan crystal", "Pink crystal" };
     static readonly string[] FieldNames =
@@ -158,10 +156,10 @@ public class ModelMrg : IDisposable
         "Pyro", "Rock", "Plant", "Immortal",
     };
 
-    FileLoader? disc;
+    FileLoader? discLoader;
     bool ownsDisc;
-    byte[] mrg = Array.Empty<byte>();
-    Dictionary<int, StagedBlock> staged = new Dictionary<int, StagedBlock>();
+    byte[] mrgFileBytes = Array.Empty<byte>();
+    Dictionary<int, StagedBlock> stagedBlocksByIndex = new Dictionary<int, StagedBlock>();
 
     public GameTables Tables;
     public List<PackInfo> Packs = new List<PackInfo>();
@@ -174,33 +172,33 @@ public class ModelMrg : IDisposable
     {
         get
         {
-            if (disc == null)
+            if (discLoader == null)
             {
                 throw new InvalidOperationException("this MODEL.MRG was parsed from bytes, not a disc");
             }
-            return disc;
+            return discLoader;
         }
     }
 
     public IEnumerable<StagedBlock> Staged
     {
-        get { return staged.Values; }
+        get { return stagedBlocksByIndex.Values; }
     }
 
     public int StagedCount
     {
-        get { return staged.Count; }
+        get { return stagedBlocksByIndex.Count; }
     }
 
     public long MrgSize
     {
-        get { return mrg.LongLength; }
+        get { return mrgFileBytes.LongLength; }
     }
 
     // One representative per identity group, in first-seen order: the 192 distinct models.
     public IEnumerable<Block> DistinctBlocks
     {
-        get { return IdentityGroups.Select(g => g[0]); }
+        get { return IdentityGroups.Select(identityGroup => identityGroup[0]); }
     }
 
     ModelMrg()
@@ -209,16 +207,16 @@ public class ModelMrg : IDisposable
 
     public ModelMrg(FileLoader disc, bool ownsDisc = false)
     {
-        this.disc = disc;
+        this.discLoader = disc;
         this.ownsDisc = ownsDisc;
         Reload();
     }
 
-    public static ModelMrg Parse(byte[] mrg, GameTables tables)
+    public static ModelMrg Parse(byte[] mrgBytes, GameTables tables)
     {
-        var m = new ModelMrg();
-        m.ParseBytes(mrg, tables);
-        return m;
+        var parsedMrg = new ModelMrg();
+        parsedMrg.ParseBytes(mrgBytes, tables);
+        return parsedMrg;
     }
 
     public static ModelMrg Open(string isoPath)
@@ -227,245 +225,240 @@ public class ModelMrg : IDisposable
     }
 
     // The pack names are the JP debug build's own symbols (NOTES/model-mrg.md).
-    public static string PackName(int p)
+    public static string PackName(int packIndex)
     {
-        if (p >= 0 && p <= 21)
+        if (packIndex >= 0 && packIndex <= 21)
         {
-            return $"DUEL{p:D2}";
+            return $"DUEL{packIndex:D2}";
         }
-        if (p == 22)
+        if (packIndex == 22)
         {
             return "RING";
         }
-        if (p >= 23 && p <= 32)
+        if (packIndex >= 23 && packIndex <= 32)
         {
-            return $"STAGE{p - 23}";
+            return $"STAGE{packIndex - 23}";
         }
-        if (p >= 33 && p <= 37)
+        if (packIndex >= 33 && packIndex <= 37)
         {
-            return $"EVENT{p - 33}";
+            return $"EVENT{packIndex - 33}";
         }
-        if (p == 38)
+        if (packIndex == 38)
         {
             return "FIELD";
         }
-        return $"pack{p}";
-    }
-
-    static uint U32(byte[] d, long o)
-    {
-        return BinaryPrimitives.ReadUInt32LittleEndian(d.AsSpan((int)o, 4));
+        return $"pack{packIndex}";
     }
 
     // Re-reads MODEL.MRG from the disc and re-parses it. Drops anything staged.
     public void Reload()
     {
-        staged.Clear();
+        stagedBlocksByIndex.Clear();
         ParseBytes(Disc.ReadFile(MrgPath), GameTables.Load(Disc));
     }
 
     void ParseBytes(byte[] bytes, GameTables tables)
     {
         Tables = tables;
-        mrg = bytes;
+        mrgFileBytes = bytes;
         Packs.Clear();
         Blocks.Clear();
         Windows.Clear();
         IdentityGroups.Clear();
         Anomalies.Clear();
 
-        if (mrg.LongLength != tables.AnOfsModel[tables.ModelEntryCount])
+        if (mrgFileBytes.LongLength != tables.ModelMrgOffsets[tables.ModelEntryCount])
         {
-            Anomalies.Add($"MODEL.MRG is {mrg.LongLength:N0} B but anOfs_MODEL ends at " +
-                          $"{tables.AnOfsModel[tables.ModelEntryCount]:N0}");
+            Anomalies.Add($"MODEL.MRG is {mrgFileBytes.LongLength:N0} B but anOfs_MODEL ends at " +
+                          $"{tables.ModelMrgOffsets[tables.ModelEntryCount]:N0}");
         }
 
         int index = 0;
-        for (int p = 0; p < tables.PackCount; p++)
+        for (int packIndex = 0; packIndex < tables.PackCount; packIndex++)
         {
-            var (packOff, packSize) = tables.ModelEntry(p);
-            int type = TypeOfPack(tables, p);
+            var (packOffset, packSize) = tables.ModelEntry(packIndex);
+            int modelType = TypeOfPack(tables, packIndex);
             var pack = new PackInfo();
-            pack.Index = p;
-            pack.Name = PackName(p);
-            pack.ModelType = type;
-            if (type >= 0)
+            pack.Index = packIndex;
+            pack.Name = PackName(packIndex);
+            pack.ModelType = modelType;
+            if (modelType >= 0)
             {
-                pack.LoadBuffer = tables.ShareData[type].Buffer;
+                pack.LoadBuffer = tables.ShareData[modelType].Buffer;
             }
-            pack.Offset = packOff;
+            pack.Offset = packOffset;
             pack.Size = packSize;
-            pack.FirstModelId = (int)tables.PackFirst[p];
+            pack.FirstModelId = (int)tables.FirstPack[packIndex];
 
-            uint[] sub = tables.PackSubOffsets[p];
-            int count = (int)tables.PackSubCount[p];
-            if (sub[count] != packSize)
+            uint[] subModelOffsets = tables.PackSubOffsets[packIndex];
+            int subModelCount = (int)tables.PackSubCount[packIndex];
+            if (subModelOffsets[subModelCount] != packSize)
             {
-                Anomalies.Add($"{pack.Name}: OFS[{p}][{count}] = {sub[count]:N0} but the pack is {packSize:N0} B");
+                Anomalies.Add($"{pack.Name}: OFS[{packIndex}][{subModelCount}] = {subModelOffsets[subModelCount]:N0} but the pack is {packSize:N0} B");
             }
 
-            for (int k = 0; k < count; k++)
+            for (int k = 0; k < subModelCount; k++)
             {
-                long off = packOff + sub[k];
-                long slot = sub[k + 1] - sub[k];
-                Block b = ReadBlock(off, slot);
-                b.Index = index++;
-                b.Pack = p;
-                b.K = k;
-                b.Entry = p;
-                b.ModelId = pack.FirstModelId + k;
-                b.ModelType = type;
-                b.Name = $"{pack.Name}/{k:D2}";
-                pack.Blocks.Add(b);
-                Blocks.Add(b);
+                long blockOffset = packOffset + subModelOffsets[k];
+                long blockSlot = subModelOffsets[k + 1] - subModelOffsets[k];
+                Block block = ReadBlock(blockOffset, blockSlot);
+                block.Index = index++;
+                block.Pack = packIndex;
+                block.SubModelIndex = k;
+                block.Entry = packIndex;
+                block.ModelId = pack.FirstModelId + k;
+                block.ModelType = modelType;
+                block.Name = $"{pack.Name}/{k:D2}";
+                pack.Blocks.Add(block);
+                Blocks.Add(block);
             }
 
             Packs.Add(pack);
         }
 
-        // Windows: anOfs_MODEL entries past the packs, one RH0 block each, loaded by
-        // SzModel_Load for model type 1 into a 0xA000 buffer - that cap, not the entry size,
-        // is a window's real slot (they are equal on retail).
-        long winCap = tables.WindowBufferSize;
-        for (int e = tables.PackCount; e < tables.ModelEntryCount; e++)
+        /* Windows: anOfs_MODEL entries past the packs, one RH0 block each, loaded by
+           SzModel_Load for model type 1 into a 0xA000 buffer - that cap, not the entry size,
+           is a window's real slot (they are equal on retail). */
+        long windowCapacity = tables.WindowBufferSize;
+        for (int entryIndex = tables.PackCount; entryIndex < tables.ModelEntryCount; entryIndex++)
         {
-            var (off, size) = tables.ModelEntry(e);
-            long slot = Math.Min(size, winCap);
-            if (size > winCap)
+            var (blockOffset, size) = tables.ModelEntry(entryIndex);
+            long blockSlot = Math.Min(size, windowCapacity);
+            if (size > windowCapacity)
             {
-                Anomalies.Add($"window entry {e} is {size:N0} B, past the {winCap:N0} B load buffer");
+                Anomalies.Add($"window entry {entryIndex} is {size:N0} B, past the {windowCapacity:N0} B load buffer");
             }
-            Block b = ReadBlock(off, slot);
-            b.Index = index++;
-            b.Entry = e;
-            b.WindowIndex = e - tables.PackCount;
-            b.ModelType = 1;
-            b.Name = $"window_{b.WindowIndex:D2}";
-            Windows.Add(b);
-            Blocks.Add(b);
+            Block block = ReadBlock(blockOffset, blockSlot);
+            block.Index = index++;
+            block.Entry = entryIndex;
+            block.WindowIndex = entryIndex - tables.PackCount;
+            block.ModelType = 1;
+            block.Name = $"window_{block.WindowIndex:D2}";
+            Windows.Add(block);
+            Blocks.Add(block);
         }
 
         // Identity groups: the 22 DUEL packs hold the same bytes, so one edit covers all of them.
-        var byHash = new Dictionary<string, int>();
-        foreach (Block b in Blocks)
+        var groupIndexByHash = new Dictionary<string, int>();
+        foreach (Block block in Blocks)
         {
-            if (!byHash.TryGetValue(b.Hash, out int g))
+            if (!groupIndexByHash.TryGetValue(block.Hash, out int groupIndex))
             {
-                g = IdentityGroups.Count;
-                byHash[b.Hash] = g;
+                groupIndex = IdentityGroups.Count;
+                groupIndexByHash[block.Hash] = groupIndex;
                 IdentityGroups.Add(new List<Block>());
             }
-            b.IdentityGroup = g;
-            IdentityGroups[g].Add(b);
+            block.IdentityGroup = groupIndex;
+            IdentityGroups[groupIndex].Add(block);
         }
-        foreach (List<Block> g in IdentityGroups)
+        foreach (List<Block> identityGroup in IdentityGroups)
         {
-            foreach (Block b in g)
+            foreach (Block block in identityGroup)
             {
-                b.Copies = g.Count;
-                b.IsMirror = b != g[0];
+                block.Copies = identityGroup.Count;
+                block.IsMirror = block != identityGroup[0];
             }
         }
 
-        foreach (Block b in Blocks)
+        foreach (Block block in Blocks)
         {
-            b.FriendlyName = FriendlyNameOf(b);
-            b.Group = GroupOf(b);
+            block.FriendlyName = FriendlyNameOf(block);
+            block.Group = GroupOf(block);
         }
     }
 
-    // Model type of a pack: the aShareData entry whose Base is the greatest one <= pack index
-    // (anOfs_MODEL[aShareData[type].Base + i], NOTES/model-mrg.md). Bases at or past the pack
-    // count address the windows, not a pack.
-    static int TypeOfPack(GameTables tables, int p)
+    /* Model type of a pack: the aShareData entry whose Base is the greatest one <= pack index
+       (anOfs_MODEL[aShareData[type].Base + i], NOTES/model-mrg.md). Bases at or past the pack
+       count address the windows, not a pack. */
+    static int TypeOfPack(GameTables tables, int packIndex)
     {
-        int best = -1;
-        for (int t = 0; t < tables.ShareData.Length; t++)
+        int bestShareType = -1;
+        for (int shareTypeIndex = 0; shareTypeIndex < tables.ShareData.Length; shareTypeIndex++)
         {
-            ShareDataEntry e = tables.ShareData[t];
-            if (e.Base > p || e.Base >= tables.PackCount)
+            ShareDataEntry shareEntry = tables.ShareData[shareTypeIndex];
+            if (shareEntry.Base > packIndex || shareEntry.Base >= tables.PackCount)
             {
                 continue;
             }
-            if (best < 0 || e.Base > tables.ShareData[best].Base)
+            if (bestShareType < 0 || shareEntry.Base > tables.ShareData[bestShareType].Base)
             {
-                best = t;
+                bestShareType = shareTypeIndex;
             }
         }
-        return best;
+        return bestShareType;
     }
 
-    Block ReadBlock(long off, long slot)
+    Block ReadBlock(long blockOffset, long blockSlot)
     {
-        var b = new Block();
-        b.Offset = off;
-        b.Slot = slot;
-        b.Size = slot;
-        if (off + 0x80 > mrg.LongLength)
+        var block = new Block();
+        block.Offset = blockOffset;
+        block.Slot = blockSlot;
+        block.Size = blockSlot;
+        if (blockOffset + 0x80 > mrgFileBytes.LongLength)
         {
-            Anomalies.Add($"block at 0x{off:X} runs past the file");
-            return b;
+            Anomalies.Add($"block at 0x{blockOffset:X} runs past the file");
+            return block;
         }
-        if (U32(mrg, off) != Rh0Assembler.Rh0Magic)
+        if (ReadU32(mrgFileBytes, (int)blockOffset) != Rh0Assembler.Rh0Magic)
         {
-            Anomalies.Add($"block at 0x{off:X} has no RH0 magic (0x{U32(mrg, off):X8})");
-            return b;
+            Anomalies.Add($"block at 0x{blockOffset:X} has no RH0 magic (0x{ReadU32(mrgFileBytes, (int)blockOffset):X8})");
+            return block;
         }
 
-        long end = Rh0Assembler.ComputeBlockEnd(mrg, off, out _);
-        if (end < 0 || end == long.MaxValue || end > off + slot)
+        long blockEnd = Rh0Assembler.ComputeBlockEnd(mrgFileBytes, blockOffset, out _);
+        if (blockEnd < 0 || blockEnd == long.MaxValue || blockEnd > blockOffset + blockSlot)
         {
-            Anomalies.Add($"block at 0x{off:X}: ComputeBlockEnd gave 0x{end:X} for a slot of {slot:N0} B");
-            end = off + slot;
+            Anomalies.Add($"block at 0x{blockOffset:X}: ComputeBlockEnd gave 0x{blockEnd:X} for a slot of {blockSlot:N0} B");
+            blockEnd = blockOffset + blockSlot;
         }
-        b.Size = end - off;
-        b.Flags = U32(mrg, off + 0x04);
-        b.HasEmbeddedMot = (b.Flags & 0xFFu) != 0;
-        long texTable = off + U32(mrg, off + 0x38);
-        if (texTable >= off && texTable + 4 <= end)
+        block.Size = blockEnd - blockOffset;
+        block.Flags = ReadU32(mrgFileBytes, (int)(blockOffset + 0x04));
+        block.HasEmbeddedMot = (block.Flags & 0xFFu) != 0;
+        long texTable = blockOffset + ReadU32(mrgFileBytes, (int)(blockOffset + 0x38));
+        if (texTable >= blockOffset && texTable + 4 <= blockEnd)
         {
-            b.TexCount = (int)U32(mrg, texTable);
+            block.TexCount = (int)ReadU32(mrgFileBytes, (int)texTable);
         }
-        b.NodeCount = CountNodes(mrg, off + U32(mrg, off + 0x10), (int)U32(mrg, off + 0x14));
-        b.Hash = Convert.ToHexString(SHA256.HashData(mrg.AsSpan((int)off, (int)b.Size)));
-        return b;
+        block.NodeCount = CountNodes(mrgFileBytes, blockOffset + ReadU32(mrgFileBytes, (int)(blockOffset + 0x10)), (int)ReadU32(mrgFileBytes, (int)(blockOffset + 0x14)));
+        block.Hash = Convert.ToHexString(SHA256.HashData(mrgFileBytes.AsSpan((int)blockOffset, (int)block.Size)));
+        return block;
     }
 
     // The RH0 node tree's child (+0x1C) / sibling (+0x2C) walk.
-    static int CountNodes(byte[] mrg, long treeAbs, int treeSize)
+    static int CountNodes(byte[] mrgBytes, long treeAbsoluteOffset, int treeSize)
     {
-        int count = 0;
-        var stack = new Stack<long>();
-        var seen = new HashSet<long>();
-        stack.Push(0);
-        while (stack.Count > 0)
+        int nodeCount = 0;
+        var pendingOffsets = new Stack<long>();
+        var visitedOffsets = new HashSet<long>();
+        pendingOffsets.Push(0);
+        while (pendingOffsets.Count > 0)
         {
-            long off = stack.Pop();
-            if (off < 0 || off + 0x30 > treeSize || treeAbs + off + 0x30 > mrg.LongLength || !seen.Add(off))
+            long nodeOffset = pendingOffsets.Pop();
+            if (nodeOffset < 0 || nodeOffset + 0x30 > treeSize || treeAbsoluteOffset + nodeOffset + 0x30 > mrgBytes.LongLength || !visitedOffsets.Add(nodeOffset))
             {
                 continue;
             }
-            count++;
-            long child = U32(mrg, treeAbs + off + 0x1C) & 0x0FFFFFFF;
-            long sib = U32(mrg, treeAbs + off + 0x2C) & 0x0FFFFFFF;
-            if (sib != 0)
+            nodeCount++;
+            long childOffset = ReadU32(mrgBytes, (int)(treeAbsoluteOffset + nodeOffset + 0x1C)) & 0x0FFFFFFF;
+            long siblingOffset = ReadU32(mrgBytes, (int)(treeAbsoluteOffset + nodeOffset + 0x2C)) & 0x0FFFFFFF;
+            if (siblingOffset != 0)
             {
-                stack.Push(sib);
+                pendingOffsets.Push(siblingOffset);
             }
-            if (child != 0)
+            if (childOffset != 0)
             {
-                stack.Push(child);
+                pendingOffsets.Push(childOffset);
             }
         }
-        return count;
+        return nodeCount;
     }
 
-    static string FriendlyNameOf(Block b)
+    static string FriendlyNameOf(Block block)
     {
-        if (b.IsWindow)
+        if (block.IsWindow)
         {
-            int side = b.WindowIndex / KindNames.Length;
-            int kind = b.WindowIndex % KindNames.Length;
+            int side = block.WindowIndex / KindNames.Length;
+            int kind = block.WindowIndex % KindNames.Length;
             string frame = "white";
             if (side == 0)
             {
@@ -473,42 +466,42 @@ public class ModelMrg : IDisposable
             }
             return $"Window, side {side} ({frame} frame): {KindNames[kind]} leader";
         }
-        string pack = PackName(b.Pack);
-        if (pack.StartsWith("DUEL", StringComparison.Ordinal) && b.K < DuelNames.Length)
+        string pack = PackName(block.Pack);
+        if (pack.StartsWith("DUEL", StringComparison.Ordinal) && block.SubModelIndex < DuelNames.Length)
         {
-            return DuelNames[b.K];
+            return DuelNames[block.SubModelIndex];
         }
         if (pack == "RING")
         {
             return "Gold ring";
         }
-        if (pack == "FIELD" && b.K < FieldNames.Length)
+        if (pack == "FIELD" && block.SubModelIndex < FieldNames.Length)
         {
-            return $"Terrain tile: {FieldNames[b.K]}";
+            return $"Terrain tile: {FieldNames[block.SubModelIndex]}";
         }
         return string.Empty;
     }
 
-    static string GroupOf(Block b)
+    static string GroupOf(Block block)
     {
-        if (b.IsWindow)
+        if (block.IsWindow)
         {
             return "windows";
         }
-        string name = PackName(b.Pack);
-        foreach (string g in Groups)
+        string name = PackName(block.Pack);
+        foreach (string groupName in Groups)
         {
-            if (g != "windows" && name.StartsWith(g, StringComparison.Ordinal))
+            if (groupName != "windows" && name.StartsWith(groupName, StringComparison.Ordinal))
             {
-                return g;
+                return groupName;
             }
         }
         return name;
     }
 
-    public Block Sub(int pack, int k)
+    public Block SubModel(int pack, int subModelIndex)
     {
-        return Packs[pack].Blocks[k];
+        return Packs[pack].Blocks[subModelIndex];
     }
 
     public Block? Find(int index)
@@ -522,11 +515,11 @@ public class ModelMrg : IDisposable
 
     public Block? FindByName(string name)
     {
-        foreach (Block b in Blocks)
+        foreach (Block block in Blocks)
         {
-            if (string.Equals(b.Name, name, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(block.Name, name, StringComparison.OrdinalIgnoreCase))
             {
-                return b;
+                return block;
             }
         }
         return null;
@@ -535,28 +528,28 @@ public class ModelMrg : IDisposable
     // The block's current bytes: what the extractor exported, and the donor a rebuild uses.
     public byte[] BlockBytes(int index)
     {
-        Block? b = Find(index);
-        if (b == null)
+        Block? block = Find(index);
+        if (block == null)
         {
             throw new ArgumentOutOfRangeException(nameof(index), $"no MODEL.MRG block {index}");
         }
-        return mrg.AsSpan((int)b.Offset, (int)b.Size).ToArray();
+        return mrgFileBytes.AsSpan((int)block.Offset, (int)block.Size).ToArray();
     }
 
     public byte[]? StagedBytes(int index)
     {
-        if (staged.TryGetValue(index, out StagedBlock? s))
+        if (stagedBlocksByIndex.TryGetValue(index, out StagedBlock? stagedBlock))
         {
-            return s.Bytes;
+            return stagedBlock.Bytes;
         }
         return null;
     }
 
-    // Rebuilds `glbPath` over the block's own retail bytes (the donor), with the block's slot as
-    // the hard output budget, and stages the result if it fits. A block that does not fit is
-    // never staged: the result says by how much it is over and the staging list is unchanged.
-    // allowReduction lets the assembler shrink textures / animation precision to fit; off by
-    // default, so an over-slot model is reported, not quietly degraded.
+    /* Rebuilds `glbPath` over the block's own retail bytes (the donor), with the block's slot as
+       the hard output budget, and stages the result if it fits. A block that does not fit is
+       never staged: the result says by how much it is over. allowReduction lets the assembler
+       shrink textures / animation precision to fit; off by default, so an over-slot model is
+       reported, not degraded. */
     public StageResult Stage(int entryIndex, string glbPath, bool allowReduction = false)
     {
         return StageModel(entryIndex, null, glbPath, allowReduction);
@@ -572,16 +565,16 @@ public class ModelMrg : IDisposable
     // glb null: read it from glbPath instead, which is then also the staged block's source name.
     StageResult StageModel(int entryIndex, byte[]? glb, string glbPath, bool allowReduction)
     {
-        Block? b = Find(entryIndex);
-        if (b == null)
+        Block? block = Find(entryIndex);
+        if (block == null)
         {
             throw new ArgumentOutOfRangeException(nameof(entryIndex));
         }
-        var res = new StageResult();
-        res.Index = b.Index;
-        res.Name = b.Name;
-        res.Slot = b.Slot;
-        res.Mirrors = b.Copies - 1;
+        var stageResult = new StageResult();
+        stageResult.Index = block.Index;
+        stageResult.Name = block.Name;
+        stageResult.Slot = block.Slot;
+        stageResult.Mirrors = block.Copies - 1;
 
         byte[] built;
         try
@@ -595,150 +588,149 @@ public class ModelMrg : IDisposable
             {
                 imported = GlbImporter.LoadFromBytes(glb);
             }
-            Rebuilder.ImportResult import = Rebuilder.Import(imported, BlockBytes(entryIndex), (int)b.Slot, true,
+            Rebuilder.ImportResult importResult = Rebuilder.Import(imported, BlockBytes(entryIndex), (int)block.Slot, true,
                 (category, categoryBytes, totalBytes, budget) => allowReduction);
-            built = import.Block;
-            res.Warnings.AddRange(import.Warnings);
+            built = importResult.Block;
+            stageResult.Warnings.AddRange(importResult.Warnings);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            res.Error = ex.Message;
-            return res;
+            stageResult.Error = exception.Message;
+            return stageResult;
         }
 
-        res.Size = built.Length;
-        res.Fits = built.Length <= b.Slot;
-        if (res.Fits)
+        stageResult.Size = built.Length;
+        stageResult.Fits = built.Length <= block.Slot;
+        if (stageResult.Fits)
         {
-            Add(b, built, glbPath);
-            res.Staged = true;
+            Add(block, built, glbPath);
+            stageResult.Staged = true;
         }
-        return res;
+        return stageResult;
     }
 
     // Stages an already-built RH0 block (the harness' board-band path, or a .rh0 on disk). The
     // same slot rule applies.
     public StageResult StageBytes(int entryIndex, byte[] rh0, string sourceLabel = "")
     {
-        Block? b = Find(entryIndex);
-        if (b == null)
+        Block? block = Find(entryIndex);
+        if (block == null)
         {
             throw new ArgumentOutOfRangeException(nameof(entryIndex));
         }
-        var res = new StageResult();
-        res.Index = b.Index;
-        res.Name = b.Name;
-        res.Slot = b.Slot;
-        res.Mirrors = b.Copies - 1;
-        res.Size = rh0.Length;
-        res.Fits = rh0.Length <= b.Slot;
-        if (res.Fits)
+        var stageResult = new StageResult();
+        stageResult.Index = block.Index;
+        stageResult.Name = block.Name;
+        stageResult.Slot = block.Slot;
+        stageResult.Mirrors = block.Copies - 1;
+        stageResult.Size = rh0.Length;
+        stageResult.Fits = rh0.Length <= block.Slot;
+        if (stageResult.Fits)
         {
-            Add(b, rh0, sourceLabel);
-            res.Staged = true;
+            Add(block, rh0, sourceLabel);
+            stageResult.Staged = true;
         }
-        return res;
+        return stageResult;
     }
 
-    void Add(Block b, byte[] bytes, string source)
+    void Add(Block block, byte[] bytes, string source)
     {
-        var s = new StagedBlock();
-        s.Block = b;
-        s.Bytes = bytes;
-        s.SourcePath = source;
-        staged[b.Index] = s;
+        var stagedBlock = new StagedBlock();
+        stagedBlock.Block = block;
+        stagedBlock.Bytes = bytes;
+        stagedBlock.SourcePath = source;
+        stagedBlocksByIndex[block.Index] = stagedBlock;
     }
 
     public bool Unstage(int entryIndex)
     {
-        return staged.Remove(entryIndex);
+        return stagedBlocksByIndex.Remove(entryIndex);
     }
 
     public void ClearStaged()
     {
-        staged.Clear();
+        stagedBlocksByIndex.Clear();
     }
 
     public bool IsStaged(int entryIndex)
     {
-        return staged.ContainsKey(entryIndex);
+        return stagedBlocksByIndex.ContainsKey(entryIndex);
     }
 
-    // Lays replacements back into MODEL.MRG. Every block keeps its offset, so the ELF tables are
-    // untouched; a block that does not fit its slot is an error and nothing is written at all. A
-    // replacement equal to the retail block produces no change. Each replacement is written to
-    // every block that shared the edited block's retail content (the 22 DUEL packs), which is
-    // what the game needs to look edited everywhere.
+    /* Lays replacements back into MODEL.MRG. Every block keeps its offset, so the ELF tables are
+       untouched; a block that does not fit its slot is an error and nothing is written at all. A
+       replacement equal to the retail block produces no change. Each replacement is written to
+       every block that shared the edited block's retail content (the 22 DUEL packs), so the
+       edit shows everywhere in the game. */
     public BuildResult Build(List<StagedBlock> replacements)
     {
         var result = new BuildResult();
         var wantedBytes = new Dictionary<int, byte[]>();
         var wantedSource = new Dictionary<int, Block>();
 
-        foreach (StagedBlock r in replacements)
+        foreach (StagedBlock stagedReplacement in replacements)
         {
-            foreach (Block b in IdentityGroups[r.Block.IdentityGroup])
+            foreach (Block block in IdentityGroups[stagedReplacement.Block.IdentityGroup])
             {
-                if (wantedBytes.TryGetValue(b.Index, out byte[]? prev) && !prev.AsSpan().SequenceEqual(r.Bytes))
+                if (wantedBytes.TryGetValue(block.Index, out byte[]? previousBytes) && !previousBytes.AsSpan().SequenceEqual(stagedReplacement.Bytes))
                 {
-                    throw new ArgumentException($"two different replacements both apply to {b.Name} " +
-                        $"(model id {b.ModelId}); {wantedSource[b.Index].Name} and {r.Block.Name} hold " +
+                    throw new ArgumentException($"two different replacements both apply to {block.Name} " +
+                        $"(model id {block.ModelId}); {wantedSource[block.Index].Name} and {stagedReplacement.Block.Name} hold " +
                         "identical retail bytes, so each edit mirrors onto the other");
                 }
-                wantedBytes[b.Index] = r.Bytes;
-                wantedSource[b.Index] = r.Block;
+                wantedBytes[block.Index] = stagedReplacement.Bytes;
+                wantedSource[block.Index] = stagedReplacement.Block;
             }
         }
 
-        foreach (int idx in wantedBytes.Keys.OrderBy(k => k))
+        foreach (int blockIndex in wantedBytes.Keys.OrderBy(indexValue => indexValue))
         {
-            Block b = Blocks[idx];
-            byte[] bytes = wantedBytes[idx];
+            Block block = Blocks[blockIndex];
+            byte[] bytes = wantedBytes[blockIndex];
 
-            if (bytes.LongLength > b.Slot)
+            if (bytes.LongLength > block.Slot)
             {
                 string window = "";
-                if (b.IsWindow)
+                if (block.IsWindow)
                 {
                     window = ", window";
                 }
                 result.Errors.Add(
-                    $"{b.Name} (model id {b.ModelId}{window}): the new block is " +
-                    $"{bytes.LongLength:N0} B but its slot is only {b.Slot:N0} B " +
-                    $"({bytes.LongLength - b.Slot:N0} B over; retail block {b.Size:N0} B). " +
+                    $"{block.Name} (model id {block.ModelId}{window}): the new block is " +
+                    $"{bytes.LongLength:N0} B but its slot is only {block.Slot:N0} B " +
+                    $"({bytes.LongLength - block.Slot:N0} B over; retail block {block.Size:N0} B). " +
                     "Shrink it (fewer/smaller textures, less geometry) - growing a slot needs the " +
                     "pack repacked.");
                 continue;
             }
 
-            // Unchanged: the same content, same length, as retail. Compared over the block's own
-            // bytes rather than the whole slot, so retail's inter-block gap bytes (whatever they
-            // are) are left exactly as they were.
-            if (bytes.LongLength == b.Size &&
-                bytes.AsSpan().SequenceEqual(mrg.AsSpan((int)b.Offset, (int)b.Size)))
+            /* Unchanged: same content and length as retail. Compared over the block's own bytes,
+               not the whole slot, so retail's inter-block gap bytes are left as they were. */
+            if (bytes.LongLength == block.Size &&
+                bytes.AsSpan().SequenceEqual(mrgFileBytes.AsSpan((int)block.Offset, (int)block.Size)))
             {
-                result.Unchanged.Add(b);
+                result.Unchanged.Add(block);
                 continue;
             }
 
             // Edited: write the full slot, so no stale bytes of the old block survive in the gap.
-            byte[] buf = new byte[b.Slot];
-            bytes.CopyTo(buf, 0);
-            if (buf.AsSpan().SequenceEqual(mrg.AsSpan((int)b.Offset, (int)b.Slot)))
+            byte[] slotBytes = new byte[block.Slot];
+            bytes.CopyTo(slotBytes, 0);
+            if (slotBytes.AsSpan().SequenceEqual(mrgFileBytes.AsSpan((int)block.Offset, (int)block.Slot)))
             {
-                result.Unchanged.Add(b);
+                result.Unchanged.Add(block);
                 continue;
             }
 
-            result.Changes.Add(MrgPath, b.Offset, buf,
-                $"{b.Name} model id {b.ModelId} ({bytes.Length:N0} B in a {b.Slot:N0} B slot)");
-            if (b.Index == wantedSource[idx].Index)
+            result.Changes.Add(MrgPath, block.Offset, slotBytes,
+                $"{block.Name} model id {block.ModelId} ({bytes.Length:N0} B in a {block.Slot:N0} B slot)");
+            if (block.Index == wantedSource[blockIndex].Index)
             {
-                result.Written.Add(b);
+                result.Written.Add(block);
             }
             else
             {
-                result.Mirrored.Add(b);
+                result.Mirrored.Add(block);
             }
         }
 
@@ -752,7 +744,7 @@ public class ModelMrg : IDisposable
     // Turns everything staged into a ChangeSet (mirroring the identical DUEL copies).
     public BuildResult BuildChangeSet()
     {
-        return Build(staged.Values.OrderBy(s => s.Block.Index).ToList());
+        return Build(stagedBlocksByIndex.Values.OrderBy(stagedBlock => stagedBlock.Block.Index).ToList());
     }
 
     // The plan the Save button shows: writes, no-ops and errors. Reads the disc, writes nothing.
@@ -764,9 +756,9 @@ public class ModelMrg : IDisposable
         return plan;
     }
 
-    // Validates, then writes only the differing bytes. Writes nothing at all if the build or the
-    // writer reported any error. On a successful write with at least one byte changed, MODEL.MRG
-    // is re-read so the list and the hashes reflect the disc again.
+    /* Validates, then writes only the differing bytes. Writes nothing if the build or the writer
+       reported any error. After a write that changed a byte, MODEL.MRG is re-read so the list
+       and the hashes match the disc. */
     public ChangeSet.Plan Save(out BuildResult report)
     {
         report = BuildChangeSet();
@@ -786,9 +778,9 @@ public class ModelMrg : IDisposable
 
     public void Dispose()
     {
-        if (ownsDisc && disc != null)
+        if (ownsDisc && discLoader != null)
         {
-            disc.Dispose();
+            discLoader.Dispose();
         }
     }
 }

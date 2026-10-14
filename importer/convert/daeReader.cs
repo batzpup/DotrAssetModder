@@ -9,8 +9,8 @@ public static class DaeReader
 {
     public static Scene Read(string path, Action<string> warn)
     {
-        DaeRead r = new DaeRead(path, warn);
-        return r.Run();
+        DaeRead reader = new DaeRead(path, warn);
+        return reader.Run();
     }
 }
 
@@ -38,35 +38,35 @@ sealed class DaeXform
 {
     public string? Sid;
     public string Tag;
-    public double[] V;
+    public double[] Values;
 
-    public DaeXform(string? sid, string tag, double[] v)
+    public DaeXform(string? sid, string tag, double[] values)
     {
         Sid = sid;
         Tag = tag;
-        V = v;
+        Values = values;
     }
 }
 
 // A geometry read into corners, before welding.
-sealed class DaeGeom
+sealed class DaeGeometry
 {
-    public double[] Cp = Array.Empty<double>(); // control points, 3 each
-    public int[] CornerCp = Array.Empty<int>();
-    public double[]? Nrm; // 3 a corner
-    public double[]? Uv; // 2 a corner
-    public int[] Tris = Array.Empty<int>(); // corner indices, 3 a triangle
-    public int[] TMat = Array.Empty<int>(); // material a triangle
+    public double[] ControlPoints = Array.Empty<double>(); // control points, 3 each
+    public int[] CornerControlPoints = Array.Empty<int>();
+    public double[]? Normals; // 3 a corner
+    public double[]? Uvs; // 2 a corner
+    public int[] Triangles = Array.Empty<int>(); // corner indices, 3 a triangle
+    public int[] TriangleMaterials = Array.Empty<int>(); // material a triangle
 }
 
 // One input of a primitive: source url, offset in the index tuple, and <input set="">.
-sealed class DaeSem
+sealed class DaeSemantic
 {
     public string? Source;
     public int Offset;
     public int Set;
 
-    public DaeSem(string? source, int offset, int set)
+    public DaeSemantic(string? source, int offset, int set)
     {
         Source = source;
         Offset = offset;
@@ -79,11 +79,11 @@ sealed class DaeSem
 sealed class DaeSampled
 {
     public int Node;
-    public int K;
+    public int TransformIndex;
     public string? Member;
     public double[] Times = Array.Empty<double>();
-    public double[] Out = Array.Empty<double>();
-    public int Cols;
+    public double[] Outputs = Array.Empty<double>();
+    public int OutputColumns;
 }
 
 // The reader's state: toglb.py keeps these in read_dae's closures.
@@ -93,291 +93,291 @@ sealed class DaeRead
     readonly Action<string> warn;
     readonly XmlElement root;
     readonly Dictionary<string, XmlElement> byId = new Dictionary<string, XmlElement>();
-    readonly Scene sc = new Scene();
+    readonly Scene scene = new Scene();
     readonly SourceImages images;
     readonly Dictionary<string, DaeSource> sources = new Dictionary<string, DaeSource>();
-    readonly Dictionary<string, int> matIndex = new Dictionary<string, int>();
+    readonly Dictionary<string, int> materialIndexByKey = new Dictionary<string, int>();
     readonly Dictionary<string, int> nodeOfId = new Dictionary<string, int>();
-    readonly Dictionary<int, List<DaeXform>> xforms = new Dictionary<int, List<DaeXform>>();
-    readonly List<int> instNode = new List<int>();
-    readonly List<XmlElement> instEl = new List<XmlElement>();
+    readonly Dictionary<int, List<DaeXform>> nodeTransforms = new Dictionary<int, List<DaeXform>>();
+    readonly List<int> instanceNodes = new List<int>();
+    readonly List<XmlElement> instanceElements = new List<XmlElement>();
 
     public DaeRead(string file, Action<string> onWarn)
     {
         path = file;
         warn = onWarn;
-        XmlDocument doc = new XmlDocument();
-        doc.XmlResolver = null;
-        using (XmlReader xr = XmlReader.Create(file, new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null }))
+        XmlDocument document = new XmlDocument();
+        document.XmlResolver = null;
+        using (XmlReader xmlReader = XmlReader.Create(file, new XmlReaderSettings { DtdProcessing = DtdProcessing.Ignore, XmlResolver = null }))
         {
-            doc.Load(xr);
+            document.Load(xmlReader);
         }
-        if (doc.DocumentElement == null)
+        if (document.DocumentElement == null)
         {
             throw new InvalidDataException("empty COLLADA file");
         }
-        root = doc.DocumentElement;
+        root = document.DocumentElement;
         CollectIds(root);
-        string? dir = Path.GetDirectoryName(Path.GetFullPath(file));
-        if (dir == null)
+        string? directory = Path.GetDirectoryName(Path.GetFullPath(file));
+        if (directory == null)
         {
-            dir = ".";
+            directory = ".";
         }
-        images = new SourceImages(dir, onWarn);
+        images = new SourceImages(directory, onWarn);
     }
 
-    void CollectIds(XmlElement el)
+    void CollectIds(XmlElement element)
     {
-        string? id = Attr(el, "id");
+        string? id = Attr(element, "id");
         if (id != null && id.Length > 0 && !byId.ContainsKey(id))
         {
-            byId[id] = el;
+            byId[id] = element;
         }
-        foreach (XmlNode n in el.ChildNodes)
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            XmlElement? c = n as XmlElement;
-            if (c != null)
+            XmlElement? childElement = childNode as XmlElement;
+            if (childElement != null)
             {
-                CollectIds(c);
+                CollectIds(childElement);
             }
         }
     }
 
     // ---- small XML helpers (the Python strips the namespace off every tag and uses ET) ----
 
-    static string? Attr(XmlElement el, string name)
+    static string? Attr(XmlElement element, string name)
     {
-        XmlAttribute? a = el.Attributes[name];
-        if (a == null)
+        XmlAttribute? attribute = element.Attributes[name];
+        if (attribute == null)
         {
             return null;
         }
-        return a.Value;
+        return attribute.Value;
     }
 
-    static string Attr(XmlElement el, string name, string dflt)
+    static string Attr(XmlElement element, string name, string defaultValue)
     {
-        string? v = Attr(el, name);
-        if (v == null)
+        string? value = Attr(element, name);
+        if (value == null)
         {
-            return dflt;
+            return defaultValue;
         }
-        return v;
+        return value;
     }
 
-    static XmlElement? Find(XmlElement? el, string tag)
+    static XmlElement? Find(XmlElement? element, string tag)
     {
-        if (el == null)
+        if (element == null)
         {
             return null;
         }
-        foreach (XmlNode n in el.ChildNodes)
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            XmlElement? c = n as XmlElement;
-            if (c != null && c.LocalName == tag)
+            XmlElement? childElement = childNode as XmlElement;
+            if (childElement != null && childElement.LocalName == tag)
             {
-                return c;
+                return childElement;
             }
         }
         return null;
     }
 
-    static XmlElement? Find2(XmlElement? el, string a, string b)
+    static XmlElement? FindGrandchild(XmlElement? element, string childTag, string grandchildTag)
     {
-        return Find(Find(el, a), b);
+        return Find(Find(element, childTag), grandchildTag);
     }
 
-    static List<XmlElement> FindAll(XmlElement? el, string tag)
+    static List<XmlElement> FindAll(XmlElement? element, string tag)
     {
-        List<XmlElement> out_ = new List<XmlElement>();
-        if (el == null)
+        List<XmlElement> found = new List<XmlElement>();
+        if (element == null)
         {
-            return out_;
+            return found;
         }
-        foreach (XmlNode n in el.ChildNodes)
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            XmlElement? c = n as XmlElement;
-            if (c != null && c.LocalName == tag)
+            XmlElement? childElement = childNode as XmlElement;
+            if (childElement != null && childElement.LocalName == tag)
             {
-                out_.Add(c);
+                found.Add(childElement);
             }
         }
-        return out_;
+        return found;
     }
 
-    static List<XmlElement> Kids(XmlElement? el)
+    static List<XmlElement> Children(XmlElement? element)
     {
-        List<XmlElement> out_ = new List<XmlElement>();
-        if (el == null)
+        List<XmlElement> children = new List<XmlElement>();
+        if (element == null)
         {
-            return out_;
+            return children;
         }
-        foreach (XmlNode n in el.ChildNodes)
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            XmlElement? c = n as XmlElement;
-            if (c != null)
+            XmlElement? childElement = childNode as XmlElement;
+            if (childElement != null)
             {
-                out_.Add(c);
+                children.Add(childElement);
             }
         }
-        return out_;
+        return children;
     }
 
     // ET's el.iter(tag): the element itself and every descendant with that tag.
-    static void Iter(XmlElement el, string tag, List<XmlElement> hits)
+    static void CollectDescendants(XmlElement element, string tag, List<XmlElement> hits)
     {
-        if (el.LocalName == tag)
+        if (element.LocalName == tag)
         {
-            hits.Add(el);
+            hits.Add(element);
         }
-        foreach (XmlNode n in el.ChildNodes)
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            XmlElement? c = n as XmlElement;
-            if (c != null)
+            XmlElement? childElement = childNode as XmlElement;
+            if (childElement != null)
             {
-                Iter(c, tag, hits);
+                CollectDescendants(childElement, tag, hits);
             }
         }
     }
 
     // ET's el.text: the character data before the first child element.
-    static string? Text(XmlElement? el)
+    static string? Text(XmlElement? element)
     {
-        if (el == null)
+        if (element == null)
         {
             return null;
         }
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        foreach (XmlNode n in el.ChildNodes)
+        System.Text.StringBuilder textBuilder = new System.Text.StringBuilder();
+        foreach (XmlNode childNode in element.ChildNodes)
         {
-            if (n.NodeType == XmlNodeType.Text || n.NodeType == XmlNodeType.CDATA
-                || n.NodeType == XmlNodeType.Whitespace || n.NodeType == XmlNodeType.SignificantWhitespace)
+            if (childNode.NodeType == XmlNodeType.Text || childNode.NodeType == XmlNodeType.CDATA
+                || childNode.NodeType == XmlNodeType.Whitespace || childNode.NodeType == XmlNodeType.SignificantWhitespace)
             {
-                sb.Append(n.Value);
+                textBuilder.Append(childNode.Value);
             }
             else
             {
                 break;
             }
         }
-        if (sb.Length == 0)
+        if (textBuilder.Length == 0)
         {
             return null;
         }
-        return sb.ToString();
+        return textBuilder.ToString();
     }
 
-    static string? FindText(XmlElement? el, string tag)
+    static string? FindText(XmlElement? element, string tag)
     {
-        XmlElement? c = Find(el, tag);
-        if (c == null)
+        XmlElement? child = Find(element, tag);
+        if (child == null)
         {
             return null;
         }
-        return Text(c);
+        return Text(child);
     }
 
-    static int CountTokens(string s)
+    static int CountTokens(string text)
     {
-        int n = 0;
-        int p = 0;
-        while (p < s.Length)
+        int count = 0;
+        int position = 0;
+        while (position < text.Length)
         {
-            while (p < s.Length && char.IsWhiteSpace(s[p]))
+            while (position < text.Length && char.IsWhiteSpace(text[position]))
             {
-                p++;
+                position++;
             }
-            if (p >= s.Length)
+            if (position >= text.Length)
             {
                 break;
             }
-            n++;
-            while (p < s.Length && !char.IsWhiteSpace(s[p]))
+            count++;
+            while (position < text.Length && !char.IsWhiteSpace(text[position]))
             {
-                p++;
+                position++;
             }
         }
-        return n;
+        return count;
     }
 
-    static double[] Floats(XmlElement? el)
+    static double[] ReadFloats(XmlElement? element)
     {
-        string? s = Text(el);
-        if (el == null || s == null || s.Length == 0)
+        string? text = Text(element);
+        if (element == null || text == null || text.Length == 0)
         {
             return Array.Empty<double>();
         }
-        double[] o = new double[CountTokens(s)];
+        double[] values = new double[CountTokens(text)];
         int i = 0;
-        int p = 0;
-        while (p < s.Length)
+        int position = 0;
+        while (position < text.Length)
         {
-            while (p < s.Length && char.IsWhiteSpace(s[p]))
+            while (position < text.Length && char.IsWhiteSpace(text[position]))
             {
-                p++;
+                position++;
             }
-            if (p >= s.Length)
+            if (position >= text.Length)
             {
                 break;
             }
-            int q = p;
-            while (q < s.Length && !char.IsWhiteSpace(s[q]))
+            int tokenEnd = position;
+            while (tokenEnd < text.Length && !char.IsWhiteSpace(text[tokenEnd]))
             {
-                q++;
+                tokenEnd++;
             }
-            o[i++] = double.Parse(s.AsSpan(p, q - p), NumberStyles.Float, CultureInfo.InvariantCulture);
-            p = q;
+            values[i++] = double.Parse(text.AsSpan(position, tokenEnd - position), NumberStyles.Float, CultureInfo.InvariantCulture);
+            position = tokenEnd;
         }
-        return o;
+        return values;
     }
 
-    static int[] Ints(XmlElement? el)
+    static int[] ReadInts(XmlElement? element)
     {
-        string? s = Text(el);
-        if (el == null || s == null || s.Length == 0)
+        string? text = Text(element);
+        if (element == null || text == null || text.Length == 0)
         {
             return Array.Empty<int>();
         }
-        int[] o = new int[CountTokens(s)];
+        int[] values = new int[CountTokens(text)];
         int i = 0;
-        int p = 0;
-        while (p < s.Length)
+        int position = 0;
+        while (position < text.Length)
         {
-            while (p < s.Length && char.IsWhiteSpace(s[p]))
+            while (position < text.Length && char.IsWhiteSpace(text[position]))
             {
-                p++;
+                position++;
             }
-            if (p >= s.Length)
+            if (position >= text.Length)
             {
                 break;
             }
-            int q = p;
-            while (q < s.Length && !char.IsWhiteSpace(s[q]))
+            int tokenEnd = position;
+            while (tokenEnd < text.Length && !char.IsWhiteSpace(text[tokenEnd]))
             {
-                q++;
+                tokenEnd++;
             }
-            o[i++] = int.Parse(s.AsSpan(p, q - p), NumberStyles.Integer, CultureInfo.InvariantCulture);
-            p = q;
+            values[i++] = int.Parse(text.AsSpan(position, tokenEnd - position), NumberStyles.Integer, CultureInfo.InvariantCulture);
+            position = tokenEnd;
         }
-        return o;
+        return values;
     }
 
-    static string[] Tokens(string s)
+    static string[] SplitTokens(string text)
     {
-        return s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        return text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
     }
 
-    XmlElement? Ref(string? url)
+    XmlElement? ElementByUrl(string? url)
     {
         if (url == null || url.Length == 0)
         {
             return null;
         }
         string key = url.Trim().TrimStart('#');
-        XmlElement? el;
-        if (byId.TryGetValue(key, out el))
+        XmlElement? element;
+        if (byId.TryGetValue(key, out element))
         {
-            return el;
+            return element;
         }
         return null;
     }
@@ -389,174 +389,174 @@ sealed class DaeRead
         {
             key = url;
         }
-        DaeSource s;
-        if (sources.TryGetValue(key, out s!))
+        DaeSource source;
+        if (sources.TryGetValue(key, out source!))
         {
-            return s;
+            return source;
         }
-        XmlElement? el = Ref(url);
-        XmlElement? acc = Find2(el, "technique_common", "accessor");
+        XmlElement? element = ElementByUrl(url);
+        XmlElement? accessor = FindGrandchild(element, "technique_common", "accessor");
         int stride = 1;
-        if (acc != null)
+        if (accessor != null)
         {
-            stride = int.Parse(Attr(acc, "stride", "1"), CultureInfo.InvariantCulture);
+            stride = int.Parse(Attr(accessor, "stride", "1"), CultureInfo.InvariantCulture);
         }
-        s = new DaeSource();
-        s.Data = Floats(Find(el, "float_array"));
-        s.Stride = stride;
-        sources[key] = s;
-        return s;
+        source = new DaeSource();
+        source.Data = ReadFloats(Find(element, "float_array"));
+        source.Stride = stride;
+        sources[key] = source;
+        return source;
     }
 
     List<string> Names(string? url)
     {
-        XmlElement? el = Ref(url);
-        XmlElement? na = Find(el, "Name_array");
-        if (na == null)
+        XmlElement? element = ElementByUrl(url);
+        XmlElement? nameArray = Find(element, "Name_array");
+        if (nameArray == null)
         {
-            na = Find(el, "IDREF_array");
+            nameArray = Find(element, "IDREF_array");
         }
-        string? t = Text(na);
+        string? text = Text(nameArray);
         List<string> out_ = new List<string>();
-        if (na != null && t != null)
+        if (nameArray != null && text != null)
         {
-            out_.AddRange(Tokens(t));
+            out_.AddRange(SplitTokens(text));
         }
         return out_;
     }
 
-    SkiaSharp.SKBitmap? ImageOf(string? imgId)
+    SkiaSharp.SKBitmap? ImageOf(string? imageId)
     {
-        XmlElement? img = null;
-        if (imgId != null && imgId.Length > 0)
+        XmlElement? imageElement = null;
+        if (imageId != null && imageId.Length > 0)
         {
-            byId.TryGetValue(imgId, out img);
+            byId.TryGetValue(imageId, out imageElement);
         }
-        if (img == null)
-        {
-            return null;
-        }
-        string t = FindText(img, "init_from") ?? "";
-        if (t.Trim().Length == 0)
-        {
-            t = FindText(Find(img, "init_from"), "ref") ?? "";
-        }
-        t = Uri.UnescapeDataString(t.Trim());
-        if (t.StartsWith("file://", StringComparison.Ordinal))
-        {
-            t = t.Substring(7);
-        }
-        if (t.Length >= 3 && t[0] == '/' && char.IsAsciiLetter(t[1]) && t[2] == ':')
-        {
-            t = t.Substring(1);
-        }
-        if (t.Length == 0)
+        if (imageElement == null)
         {
             return null;
         }
-        return images.Load(new List<string> { t });
+        string imagePath = FindText(imageElement, "init_from") ?? "";
+        if (imagePath.Trim().Length == 0)
+        {
+            imagePath = FindText(Find(imageElement, "init_from"), "ref") ?? "";
+        }
+        imagePath = Uri.UnescapeDataString(imagePath.Trim());
+        if (imagePath.StartsWith("file://", StringComparison.Ordinal))
+        {
+            imagePath = imagePath.Substring(7);
+        }
+        if (imagePath.Length >= 3 && imagePath[0] == '/' && char.IsAsciiLetter(imagePath[1]) && imagePath[2] == ':')
+        {
+            imagePath = imagePath.Substring(1);
+        }
+        if (imagePath.Length == 0)
+        {
+            return null;
+        }
+        return images.Load(new List<string> { imagePath });
     }
 
     // Python can key a dict on None; "\u0000" stands in for it here.
-    static string MatKey(string? s)
+    static string KeyOf(string? nullableKey)
     {
-        if (s == null)
+        if (nullableKey == null)
         {
             return "\u0000";
         }
-        return s;
+        return nullableKey;
     }
 
     int Material(string? target)
     {
-        string key = MatKey(target);
-        int have;
-        if (matIndex.TryGetValue(key, out have))
+        string key = KeyOf(target);
+        int existingIndex;
+        if (materialIndexByKey.TryGetValue(key, out existingIndex))
         {
-            return have;
+            return existingIndex;
         }
         double[] color = new double[] { 1.0, 1.0, 1.0, 1.0 };
         SkiaSharp.SKBitmap? image = null;
-        XmlElement? mat = Ref(target);
-        XmlElement? eff = null;
-        if (mat != null)
+        XmlElement? materialElement = ElementByUrl(target);
+        XmlElement? effect = null;
+        if (materialElement != null)
         {
-            XmlElement? ie = Find(mat, "instance_effect");
-            if (ie != null)
+            XmlElement? instanceEffect = Find(materialElement, "instance_effect");
+            if (instanceEffect != null)
             {
-                eff = Ref(Attr(ie, "url"));
+                effect = ElementByUrl(Attr(instanceEffect, "url"));
             }
         }
-        XmlElement? prof = null;
-        if (eff != null)
+        XmlElement? profile = null;
+        if (effect != null)
         {
-            prof = Find(eff, "profile_COMMON");
+            profile = Find(effect, "profile_COMMON");
         }
-        if (prof != null)
+        if (profile != null)
         {
-            Dictionary<string, XmlElement> pars = new Dictionary<string, XmlElement>();
+            Dictionary<string, XmlElement> paramsBySid = new Dictionary<string, XmlElement>();
             List<XmlElement> newparams = new List<XmlElement>();
-            Iter(prof, "newparam", newparams);
-            foreach (XmlElement p in newparams)
+            CollectDescendants(profile, "newparam", newparams);
+            foreach (XmlElement newparam in newparams)
             {
-                pars[MatKey(Attr(p, "sid"))] = p;
+                paramsBySid[KeyOf(Attr(newparam, "sid"))] = newparam;
             }
-            XmlElement? tech = Find(prof, "technique");
+            XmlElement? technique = Find(profile, "technique");
             XmlElement? shader = null;
-            if (tech != null)
+            if (technique != null)
             {
-                foreach (XmlElement c in Kids(tech))
+                foreach (XmlElement child in Children(technique))
                 {
-                    if (c.LocalName == "phong" || c.LocalName == "lambert" || c.LocalName == "blinn" || c.LocalName == "constant")
+                    if (child.LocalName == "phong" || child.LocalName == "lambert" || child.LocalName == "blinn" || child.LocalName == "constant")
                     {
-                        shader = c;
+                        shader = child;
                         break;
                     }
                 }
             }
-            XmlElement? d = null;
+            XmlElement? diffuse = null;
             if (shader != null)
             {
-                d = Find(shader, "diffuse");
-                if (d == null)
+                diffuse = Find(shader, "diffuse");
+                if (diffuse == null)
                 {
-                    d = Find(shader, "emission");
+                    diffuse = Find(shader, "emission");
                 }
             }
-            if (d != null)
+            if (diffuse != null)
             {
-                XmlElement? c = Find(d, "color");
-                if (c != null)
+                XmlElement? colorElement = Find(diffuse, "color");
+                if (colorElement != null)
                 {
-                    double[] f = Floats(c);
+                    double[] rgba = ReadFloats(colorElement);
                     color = new double[] { 1.0, 1.0, 1.0, 1.0 };
-                    int take = Math.Min(4, f.Length);
+                    int take = Math.Min(4, rgba.Length);
                     for (int k = 0; k < take; k++)
                     {
-                        color[k] = f[k];
+                        color[k] = rgba[k];
                     }
                 }
-                XmlElement? t = Find(d, "texture");
-                if (t != null)
+                XmlElement? textureElement = Find(diffuse, "texture");
+                if (textureElement != null)
                 {
-                    string? tid = Attr(t, "texture");
-                    XmlElement? p;
-                    pars.TryGetValue(MatKey(tid), out p);
-                    if (p != null && Find(p, "sampler2D") != null)
+                    string? textureId = Attr(textureElement, "texture");
+                    XmlElement? samplerParam;
+                    paramsBySid.TryGetValue(KeyOf(textureId), out samplerParam);
+                    if (samplerParam != null && Find(samplerParam, "sampler2D") != null)
                     {
-                        string? s = FindText(Find(p, "sampler2D"), "source");
-                        XmlElement? ii = Find2(p, "sampler2D", "instance_image");
-                        XmlElement? surf;
-                        if (s != null && s.Length > 0 && pars.TryGetValue(s.Trim(), out surf!))
+                        string? surfaceSid = FindText(Find(samplerParam, "sampler2D"), "source");
+                        XmlElement? instanceImage = FindGrandchild(samplerParam, "sampler2D", "instance_image");
+                        XmlElement? surfaceParam;
+                        if (surfaceSid != null && surfaceSid.Length > 0 && paramsBySid.TryGetValue(surfaceSid.Trim(), out surfaceParam!))
                         {
-                            tid = (FindText(Find(surf, "surface"), "init_from") ?? "").Trim();
+                            textureId = (FindText(Find(surfaceParam, "surface"), "init_from") ?? "").Trim();
                         }
-                        else if (ii != null)
+                        else if (instanceImage != null)
                         {
-                            tid = Attr(ii, "url", "").TrimStart('#');
+                            textureId = Attr(instanceImage, "url", "").TrimStart('#');
                         }
                     }
-                    image = ImageOf(tid);
+                    image = ImageOf(textureId);
                 }
             }
         }
@@ -565,344 +565,344 @@ sealed class DaeRead
         {
             name = target.TrimStart('#');
         }
-        if (mat != null && Attr(mat, "name") != null)
+        if (materialElement != null && Attr(materialElement, "name") != null)
         {
-            name = Attr(mat, "name", "");
+            name = Attr(materialElement, "name", "");
         }
-        matIndex[key] = sc.AddMaterial(name, color, image);
-        return matIndex[key];
+        materialIndexByKey[key] = scene.AddMaterial(name, color, image);
+        return materialIndexByKey[key];
     }
 
-    static void Row(DaeSource s, int row, int take, double[] dst, int off)
+    static void CopyRow(DaeSource source, int row, int take, double[] destination, int destinationOffset)
     {
-        int n = Math.Min(take, s.Stride);
-        for (int k = 0; k < n; k++)
+        int count = Math.Min(take, source.Stride);
+        for (int k = 0; k < count; k++)
         {
-            dst[off + k] = s.Data[row * s.Stride + k];
+            destination[destinationOffset + k] = source.Data[row * source.Stride + k];
         }
     }
 
-    DaeGeom? Geometry(XmlElement? geom, Dictionary<string, string?> symbols)
+    DaeGeometry? Geometry(XmlElement? geometryElement, Dictionary<string, string?> symbols)
     {
-        XmlElement? mesh = Find(geom, "mesh");
+        XmlElement? mesh = Find(geometryElement, "mesh");
         if (mesh == null)
         {
             return null;
         }
         XmlElement? verts = Find(mesh, "vertices");
-        Dictionary<string, string?> vin = new Dictionary<string, string?>();
-        foreach (XmlElement i in FindAll(verts, "input"))
+        Dictionary<string, string?> vertexInputs = new Dictionary<string, string?>();
+        foreach (XmlElement input in FindAll(verts, "input"))
         {
-            vin[MatKey(Attr(i, "semantic"))] = Attr(i, "source");
+            vertexInputs[KeyOf(Attr(input, "semantic"))] = Attr(input, "source");
         }
-        DaeSource cpSrc = Source(vin["POSITION"]);
-        int ncp = cpSrc.Rows;
-        double[] cp = new double[ncp * 3];
-        for (int i = 0; i < ncp; i++)
+        DaeSource controlPointSource = Source(vertexInputs["POSITION"]);
+        int controlPointCount = controlPointSource.Rows;
+        double[] controlPoints = new double[controlPointCount * 3];
+        for (int i = 0; i < controlPointCount; i++)
         {
-            Row(cpSrc, i, 3, cp, i * 3);
+            CopyRow(controlPointSource, i, 3, controlPoints, i * 3);
         }
-        DaeSource? vnrm = null;
-        if (vin.ContainsKey("NORMAL"))
+        DaeSource? vertexNormals = null;
+        if (vertexInputs.ContainsKey("NORMAL"))
         {
-            vnrm = Source(vin["NORMAL"]);
+            vertexNormals = Source(vertexInputs["NORMAL"]);
         }
-        DaeSource? vuv = null;
-        if (vin.ContainsKey("TEXCOORD"))
+        DaeSource? vertexUvs = null;
+        if (vertexInputs.ContainsKey("TEXCOORD"))
         {
-            vuv = Source(vin["TEXCOORD"]);
+            vertexUvs = Source(vertexInputs["TEXCOORD"]);
         }
-        List<int> cornerCp = new List<int>();
-        List<double> cornerN = new List<double>();
-        List<double> cornerUv = new List<double>();
-        List<int> tris = new List<int>();
-        List<int> tmat = new List<int>();
-        bool hasN = true;
+        List<int> cornerControlPoints = new List<int>();
+        List<double> cornerNormals = new List<double>();
+        List<double> cornerUvs = new List<double>();
+        List<int> triangles = new List<int>();
+        List<int> triangleMaterials = new List<int>();
+        bool hasNormals = true;
         bool hasUv = true;
-        int base_ = 0;
-        foreach (XmlElement prim in Kids(mesh))
+        int firstCorner = 0;
+        foreach (XmlElement primitive in Children(mesh))
         {
-            if (prim.LocalName != "triangles" && prim.LocalName != "polylist" && prim.LocalName != "polygons")
+            if (primitive.LocalName != "triangles" && primitive.LocalName != "polylist" && primitive.LocalName != "polygons")
             {
-                if (prim.LocalName == "trifans" || prim.LocalName == "tristrips" || prim.LocalName == "lines" || prim.LocalName == "linestrips")
+                if (primitive.LocalName == "trifans" || primitive.LocalName == "tristrips" || primitive.LocalName == "lines" || primitive.LocalName == "linestrips")
                 {
-                    warn(Attr(geom!, "id", "") + ": <" + prim.LocalName + "> skipped");
+                    warn(Attr(geometryElement!, "id", "") + ": <" + primitive.LocalName + "> skipped");
                 }
                 continue;
             }
-            List<XmlElement> inputs = FindAll(prim, "input");
+            List<XmlElement> inputs = FindAll(primitive, "input");
             int stride = 1;
-            foreach (XmlElement i in inputs)
+            foreach (XmlElement input in inputs)
             {
-                int o = int.Parse(Attr(i, "offset", "0"), CultureInfo.InvariantCulture) + 1;
-                if (o > stride)
+                int offsetEnd = int.Parse(Attr(input, "offset", "0"), CultureInfo.InvariantCulture) + 1;
+                if (offsetEnd > stride)
                 {
-                    stride = o;
+                    stride = offsetEnd;
                 }
             }
-            Dictionary<string, DaeSem> sem = new Dictionary<string, DaeSem>();
-            foreach (XmlElement i in inputs)
+            Dictionary<string, DaeSemantic> semantics = new Dictionary<string, DaeSemantic>();
+            foreach (XmlElement input in inputs)
             {
-                string s = MatKey(Attr(i, "semantic"));
-                int set = int.Parse(Attr(i, "set", "0"), CultureInfo.InvariantCulture);
-                DaeSem have;
-                if (s == "TEXCOORD" && sem.TryGetValue(s, out have!) && set >= have.Set)
+                string semantic = KeyOf(Attr(input, "semantic"));
+                int set = int.Parse(Attr(input, "set", "0"), CultureInfo.InvariantCulture);
+                DaeSemantic existing;
+                if (semantic == "TEXCOORD" && semantics.TryGetValue(semantic, out existing!) && set >= existing.Set)
                 {
                     continue;
                 }
-                sem[s] = new DaeSem(Attr(i, "source"), int.Parse(Attr(i, "offset", "0"), CultureInfo.InvariantCulture), set);
+                semantics[semantic] = new DaeSemantic(Attr(input, "source"), int.Parse(Attr(input, "offset", "0"), CultureInfo.InvariantCulture), set);
             }
-            int[] idx;
+            int[] indices;
             int[] counts;
-            if (prim.LocalName == "polygons")
+            if (primitive.LocalName == "polygons")
             {
-                List<int[]> ps = new List<int[]>();
-                foreach (XmlElement p in FindAll(prim, "p"))
+                List<int[]> polygons = new List<int[]>();
+                foreach (XmlElement polygonElement in FindAll(primitive, "p"))
                 {
-                    ps.Add(Ints(p));
+                    polygons.Add(ReadInts(polygonElement));
                 }
-                counts = new int[ps.Count];
+                counts = new int[polygons.Count];
                 int total = 0;
-                for (int k = 0; k < ps.Count; k++)
+                for (int k = 0; k < polygons.Count; k++)
                 {
-                    counts[k] = ps[k].Length / stride;
-                    total += ps[k].Length;
+                    counts[k] = polygons[k].Length / stride;
+                    total += polygons[k].Length;
                 }
-                idx = new int[total];
-                int at = 0;
-                foreach (int[] p in ps)
+                indices = new int[total];
+                int copyPosition = 0;
+                foreach (int[] polygon in polygons)
                 {
-                    Array.Copy(p, 0, idx, at, p.Length);
-                    at += p.Length;
+                    Array.Copy(polygon, 0, indices, copyPosition, polygon.Length);
+                    copyPosition += polygon.Length;
                 }
             }
             else
             {
-                idx = Ints(Find(prim, "p"));
-                if (prim.LocalName == "triangles")
+                indices = ReadInts(Find(primitive, "p"));
+                if (primitive.LocalName == "triangles")
                 {
-                    counts = new int[idx.Length / (3 * stride)];
+                    counts = new int[indices.Length / (3 * stride)];
                     Array.Fill(counts, 3);
                 }
                 else
                 {
-                    counts = Ints(Find(prim, "vcount"));
+                    counts = ReadInts(Find(primitive, "vcount"));
                 }
             }
-            int corners = idx.Length / stride;
-            int[] vi = new int[corners];
-            int voff = sem["VERTEX"].Offset;
-            for (int c = 0; c < corners; c++)
+            int corners = indices.Length / stride;
+            int[] cornerVertices = new int[corners];
+            int vertexOffset = semantics["VERTEX"].Offset;
+            for (int corner = 0; corner < corners; corner++)
             {
-                vi[c] = idx[c * stride + voff];
+                cornerVertices[corner] = indices[corner * stride + vertexOffset];
             }
-            cornerCp.AddRange(vi);
-            if (sem.ContainsKey("NORMAL"))
+            cornerControlPoints.AddRange(cornerVertices);
+            if (semantics.ContainsKey("NORMAL"))
             {
-                DaeSource ns = Source(sem["NORMAL"].Source);
-                int noff = sem["NORMAL"].Offset;
-                double[] tmp = new double[3];
-                for (int c = 0; c < corners; c++)
+                DaeSource normalSource = Source(semantics["NORMAL"].Source);
+                int normalOffset = semantics["NORMAL"].Offset;
+                double[] normal = new double[3];
+                for (int corner = 0; corner < corners; corner++)
                 {
-                    tmp[0] = 0;
-                    tmp[1] = 0;
-                    tmp[2] = 0;
-                    Row(ns, idx[c * stride + noff], 3, tmp, 0);
-                    cornerN.Add(tmp[0]);
-                    cornerN.Add(tmp[1]);
-                    cornerN.Add(tmp[2]);
+                    normal[0] = 0;
+                    normal[1] = 0;
+                    normal[2] = 0;
+                    CopyRow(normalSource, indices[corner * stride + normalOffset], 3, normal, 0);
+                    cornerNormals.Add(normal[0]);
+                    cornerNormals.Add(normal[1]);
+                    cornerNormals.Add(normal[2]);
                 }
             }
-            else if (vnrm != null)
+            else if (vertexNormals != null)
             {
-                double[] tmp = new double[3];
-                for (int c = 0; c < corners; c++)
+                double[] normal = new double[3];
+                for (int corner = 0; corner < corners; corner++)
                 {
-                    tmp[0] = 0;
-                    tmp[1] = 0;
-                    tmp[2] = 0;
-                    Row(vnrm, vi[c], 3, tmp, 0);
-                    cornerN.Add(tmp[0]);
-                    cornerN.Add(tmp[1]);
-                    cornerN.Add(tmp[2]);
-                }
-            }
-            else
-            {
-                hasN = false;
-            }
-            if (sem.ContainsKey("TEXCOORD"))
-            {
-                DaeSource us = Source(sem["TEXCOORD"].Source);
-                int uoff = sem["TEXCOORD"].Offset;
-                double[] tmp = new double[2];
-                for (int c = 0; c < corners; c++)
-                {
-                    tmp[0] = 0;
-                    tmp[1] = 0;
-                    Row(us, idx[c * stride + uoff], 2, tmp, 0);
-                    cornerUv.Add(tmp[0]);
-                    cornerUv.Add(tmp[1]);
-                }
-            }
-            else if (vuv != null)
-            {
-                double[] tmp = new double[2];
-                for (int c = 0; c < corners; c++)
-                {
-                    tmp[0] = 0;
-                    tmp[1] = 0;
-                    Row(vuv, vi[c], 2, tmp, 0);
-                    cornerUv.Add(tmp[0]);
-                    cornerUv.Add(tmp[1]);
+                    normal[0] = 0;
+                    normal[1] = 0;
+                    normal[2] = 0;
+                    CopyRow(vertexNormals, cornerVertices[corner], 3, normal, 0);
+                    cornerNormals.Add(normal[0]);
+                    cornerNormals.Add(normal[1]);
+                    cornerNormals.Add(normal[2]);
                 }
             }
             else
             {
-                for (int c = 0; c < corners; c++)
+                hasNormals = false;
+            }
+            if (semantics.ContainsKey("TEXCOORD"))
+            {
+                DaeSource uvSource = Source(semantics["TEXCOORD"].Source);
+                int uvOffset = semantics["TEXCOORD"].Offset;
+                double[] uv = new double[2];
+                for (int corner = 0; corner < corners; corner++)
                 {
-                    cornerUv.Add(0);
-                    cornerUv.Add(0);
+                    uv[0] = 0;
+                    uv[1] = 0;
+                    CopyRow(uvSource, indices[corner * stride + uvOffset], 2, uv, 0);
+                    cornerUvs.Add(uv[0]);
+                    cornerUvs.Add(uv[1]);
+                }
+            }
+            else if (vertexUvs != null)
+            {
+                double[] uv = new double[2];
+                for (int corner = 0; corner < corners; corner++)
+                {
+                    uv[0] = 0;
+                    uv[1] = 0;
+                    CopyRow(vertexUvs, cornerVertices[corner], 2, uv, 0);
+                    cornerUvs.Add(uv[0]);
+                    cornerUvs.Add(uv[1]);
+                }
+            }
+            else
+            {
+                for (int corner = 0; corner < corners; corner++)
+                {
+                    cornerUvs.Add(0);
+                    cornerUvs.Add(0);
                 }
                 hasUv = false;
             }
-            int[] starts = new int[counts.Length];
-            int run = base_;
+            int[] polygonStarts = new int[counts.Length];
+            int cornerCursor = firstCorner;
             for (int k = 0; k < counts.Length; k++)
             {
-                starts[k] = run;
-                run += counts[k];
+                polygonStarts[k] = cornerCursor;
+                cornerCursor += counts[k];
             }
-            int[] t = MeshBuild.Fan(starts, counts);
-            tris.AddRange(t);
-            int mi = -1;
-            string? primMat = Attr(prim, "material");
+            int[] fanTriangles = MeshBuild.FanTriangulate(polygonStarts, counts);
+            triangles.AddRange(fanTriangles);
+            int materialIndex = -1;
+            string? primitiveMaterial = Attr(primitive, "material");
             string? target;
-            if (symbols.TryGetValue(MatKey(primMat), out target))
+            if (symbols.TryGetValue(KeyOf(primitiveMaterial), out target))
             {
-                mi = Material(target);
+                materialIndex = Material(target);
             }
             else
             {
-                mi = Material(primMat);
+                materialIndex = Material(primitiveMaterial);
             }
-            for (int k = 0; k < t.Length / 3; k++)
+            for (int k = 0; k < fanTriangles.Length / 3; k++)
             {
-                tmat.Add(mi);
+                triangleMaterials.Add(materialIndex);
             }
-            base_ += corners;
+            firstCorner += corners;
         }
-        if (tris.Count == 0)
+        if (triangles.Count == 0)
         {
             return null;
         }
-        DaeGeom g = new DaeGeom();
-        g.Cp = cp;
-        g.CornerCp = cornerCp.ToArray();
-        if (hasN)
+        DaeGeometry geometry = new DaeGeometry();
+        geometry.ControlPoints = controlPoints;
+        geometry.CornerControlPoints = cornerControlPoints.ToArray();
+        if (hasNormals)
         {
-            g.Nrm = cornerN.ToArray();
+            geometry.Normals = cornerNormals.ToArray();
         }
         if (hasUv)
         {
-            g.Uv = cornerUv.ToArray();
+            geometry.Uvs = cornerUvs.ToArray();
         }
-        g.Tris = tris.ToArray();
-        g.TMat = tmat.ToArray();
-        return g;
+        geometry.Triangles = triangles.ToArray();
+        geometry.TriangleMaterials = triangleMaterials.ToArray();
+        return geometry;
     }
 
-    static Mat4 Apply(Mat4 m, string tag, double[] v, int off)
+    static Matrix4 Apply(Matrix4 matrix, string tag, double[] values, int offset)
     {
         if (tag == "matrix")
         {
-            Mat4 b = new Mat4();
+            Matrix4 elementMatrix = new Matrix4();
             for (int k = 0; k < 16; k++)
             {
-                b.M[k] = v[off + k];
+                elementMatrix.Elements[k] = values[offset + k];
             }
-            return m * b;
+            return matrix * elementMatrix;
         }
         if (tag == "translate")
         {
-            return m * Mat4.Translation(v[off], v[off + 1], v[off + 2]);
+            return matrix * Matrix4.Translation(values[offset], values[offset + 1], values[offset + 2]);
         }
         if (tag == "rotate")
         {
-            return m * Mat4.Rotation(v[off], v[off + 1], v[off + 2], v[off + 3]);
+            return matrix * Matrix4.Rotation(values[offset], values[offset + 1], values[offset + 2], values[offset + 3]);
         }
         if (tag == "scale")
         {
-            return m * Mat4.Scale(v[off], v[off + 1], v[off + 2]);
+            return matrix * Matrix4.Scale(values[offset], values[offset + 1], values[offset + 2]);
         }
-        return m;
+        return matrix;
     }
 
-    static Mat4 Compose(List<DaeXform> xf)
+    static Matrix4 Compose(List<DaeXform> transforms)
     {
-        Mat4 m = Mat4.Identity();
-        foreach (DaeXform x in xf)
+        Matrix4 matrix = Matrix4.Identity();
+        foreach (DaeXform transform in transforms)
         {
-            m = Apply(m, x.Tag, x.V, 0);
+            matrix = Apply(matrix, transform.Tag, transform.Values, 0);
         }
-        return m;
+        return matrix;
     }
 
-    void Walk(XmlElement? el, int parent)
+    void Walk(XmlElement? parentElement, int parent)
     {
-        foreach (XmlElement n in FindAll(el, "node"))
+        foreach (XmlElement nodeElement in FindAll(parentElement, "node"))
         {
-            string? nm = Attr(n, "name");
-            if (nm == null || nm.Length == 0)
+            string? name = Attr(nodeElement, "name");
+            if (name == null || name.Length == 0)
             {
-                nm = Attr(n, "id");
+                name = Attr(nodeElement, "id");
             }
-            if (nm == null || nm.Length == 0)
+            if (name == null || name.Length == 0)
             {
-                nm = Attr(n, "sid");
+                name = Attr(nodeElement, "sid");
             }
-            if (nm == null || nm.Length == 0)
+            if (name == null || name.Length == 0)
             {
-                nm = "node";
+                name = "node";
             }
-            int i = sc.AddNode(nm, parent);
-            string? id = Attr(n, "id");
+            int nodeIndex = scene.AddNode(name, parent);
+            string? id = Attr(nodeElement, "id");
             if (id != null && id.Length > 0)
             {
-                nodeOfId[id] = i;
+                nodeOfId[id] = nodeIndex;
             }
-            List<DaeXform> xf = new List<DaeXform>();
-            foreach (XmlElement c in Kids(n))
+            List<DaeXform> transforms = new List<DaeXform>();
+            foreach (XmlElement child in Children(nodeElement))
             {
-                if (c.LocalName == "matrix" || c.LocalName == "translate" || c.LocalName == "rotate" || c.LocalName == "scale")
+                if (child.LocalName == "matrix" || child.LocalName == "translate" || child.LocalName == "rotate" || child.LocalName == "scale")
                 {
-                    xf.Add(new DaeXform(Attr(c, "sid"), c.LocalName, Floats(c)));
+                    transforms.Add(new DaeXform(Attr(child, "sid"), child.LocalName, ReadFloats(child)));
                 }
             }
-            xforms[i] = xf;
-            sc.Nodes[i].Local = Compose(xf);
-            sc.Nodes[i].Sid = Attr(n, "sid");
-            foreach (XmlElement c in Kids(n))
+            nodeTransforms[nodeIndex] = transforms;
+            scene.Nodes[nodeIndex].Local = Compose(transforms);
+            scene.Nodes[nodeIndex].Sid = Attr(nodeElement, "sid");
+            foreach (XmlElement child in Children(nodeElement))
             {
-                if (c.LocalName == "instance_geometry" || c.LocalName == "instance_controller")
+                if (child.LocalName == "instance_geometry" || child.LocalName == "instance_controller")
                 {
-                    instNode.Add(i);
-                    instEl.Add(c);
+                    instanceNodes.Add(nodeIndex);
+                    instanceElements.Add(child);
                 }
             }
-            Walk(n, i);
+            Walk(nodeElement, nodeIndex);
         }
     }
 
-    bool Under(int k, int rootNode)
+    bool IsUnder(int nodeIndex, int rootNode)
     {
-        while (k >= 0)
+        while (nodeIndex >= 0)
         {
-            if (k == rootNode)
+            if (nodeIndex == rootNode)
             {
                 return true;
             }
-            k = sc.Nodes[k].Parent;
+            nodeIndex = scene.Nodes[nodeIndex].Parent;
         }
         return false;
     }
@@ -910,18 +910,18 @@ sealed class DaeRead
     int ResolveJoint(string name, List<int> roots)
     {
         List<int> bySid = new List<int>();
-        for (int k = 0; k < sc.Nodes.Count; k++)
+        for (int k = 0; k < scene.Nodes.Count; k++)
         {
-            if (sc.Nodes[k].Sid == name)
+            if (scene.Nodes[k].Sid == name)
             {
                 bySid.Add(k);
             }
         }
         foreach (int k in bySid)
         {
-            foreach (int r in roots)
+            foreach (int rootNode in roots)
             {
-                if (Under(k, r))
+                if (IsUnder(k, rootNode))
                 {
                     return k;
                 }
@@ -931,14 +931,14 @@ sealed class DaeRead
         {
             return bySid[0];
         }
-        int hit;
-        if (nodeOfId.TryGetValue(name, out hit))
+        int nodeById;
+        if (nodeOfId.TryGetValue(name, out nodeById))
         {
-            return hit;
+            return nodeById;
         }
-        for (int k = 0; k < sc.Nodes.Count; k++)
+        for (int k = 0; k < scene.Nodes.Count; k++)
         {
-            if (sc.Nodes[k].Name == name)
+            if (scene.Nodes[k].Name == name)
             {
                 return k;
             }
@@ -948,59 +948,59 @@ sealed class DaeRead
 
     public Scene Run()
     {
-        string up = "Y_UP";
+        string upAxis = "Y_UP";
         string? upText = FindText(Find(root, "asset"), "up_axis");
         if (upText != null && upText.Trim().Length > 0)
         {
-            up = upText.Trim();
+            upAxis = upText.Trim();
         }
-        XmlElement? unit = Find2(root, "asset", "unit");
+        XmlElement? unit = FindGrandchild(root, "asset", "unit");
         if (unit != null && Attr(unit, "meter") != null)
         {
-            sc.Unit = double.Parse(Attr(unit, "meter", "1"), NumberStyles.Float, CultureInfo.InvariantCulture);
+            scene.Unit = double.Parse(Attr(unit, "meter", "1"), NumberStyles.Float, CultureInfo.InvariantCulture);
         }
-        sc.Axis = Mat4.Identity();
-        if (up == "Z_UP")
+        scene.Axis = Matrix4.Identity();
+        if (upAxis == "Z_UP")
         {
-            sc.Axis = AxisOf(1, 0, 0, 0, 0, 1, 0, -1, 0);
+            scene.Axis = AxisOf(1, 0, 0, 0, 0, 1, 0, -1, 0);
         }
-        else if (up == "X_UP")
+        else if (upAxis == "X_UP")
         {
-            sc.Axis = AxisOf(0, -1, 0, 1, 0, 0, 0, 0, 1);
+            scene.Axis = AxisOf(0, -1, 0, 1, 0, 0, 0, 0, 1);
         }
 
-        XmlElement? ivs = Find2(root, "scene", "instance_visual_scene");
-        XmlElement? vs = null;
-        if (ivs != null)
+        XmlElement? instanceVisualScene = FindGrandchild(root, "scene", "instance_visual_scene");
+        XmlElement? visualScene = null;
+        if (instanceVisualScene != null)
         {
-            vs = Ref(Attr(ivs, "url"));
+            visualScene = ElementByUrl(Attr(instanceVisualScene, "url"));
         }
-        if (vs == null)
+        if (visualScene == null)
         {
-            vs = Find2(root, "library_visual_scenes", "visual_scene");
+            visualScene = FindGrandchild(root, "library_visual_scenes", "visual_scene");
         }
-        if (vs == null)
+        if (visualScene == null)
         {
             warn("no visual scene");
-            return sc;
+            return scene;
         }
-        Walk(vs, -1);
+        Walk(visualScene, -1);
 
-        for (int n = 0; n < instNode.Count; n++)
+        for (int instanceIndex = 0; instanceIndex < instanceNodes.Count; instanceIndex++)
         {
-            int i = instNode[n];
-            XmlElement inst = instEl[n];
+            int nodeIndex = instanceNodes[instanceIndex];
+            XmlElement instance = instanceElements[instanceIndex];
             Dictionary<string, string?> symbols = new Dictionary<string, string?>();
-            List<XmlElement> ims = new List<XmlElement>();
-            Iter(inst, "instance_material", ims);
-            foreach (XmlElement im in ims)
+            List<XmlElement> instanceMaterials = new List<XmlElement>();
+            CollectDescendants(instance, "instance_material", instanceMaterials);
+            foreach (XmlElement instanceMaterial in instanceMaterials)
             {
-                symbols[MatKey(Attr(im, "symbol"))] = Attr(im, "target");
+                symbols[KeyOf(Attr(instanceMaterial, "symbol"))] = Attr(instanceMaterial, "target");
             }
-            if (inst.LocalName == "instance_geometry")
+            if (instance.LocalName == "instance_geometry")
             {
-                XmlElement? geom = Ref(Attr(inst, "url"));
-                DaeGeom? data = null;
+                XmlElement? geom = ElementByUrl(Attr(instance, "url"));
+                DaeGeometry? data = null;
                 if (geom != null)
                 {
                     data = Geometry(geom, symbols);
@@ -1009,513 +1009,513 @@ sealed class DaeRead
                 {
                     continue;
                 }
-                SceneMesh mesh = new SceneMesh(MeshName(geom!), i);
-                MeshBuild.Build(mesh, data.Cp, data.CornerCp, data.Nrm, data.Uv, data.Tris, data.TMat, null);
-                sc.Meshes.Add(mesh);
+                SceneMesh mesh = new SceneMesh(MeshName(geom!), nodeIndex);
+                MeshBuild.Build(mesh, data.ControlPoints, data.CornerControlPoints, data.Normals, data.Uvs, data.Triangles, data.TriangleMaterials, null);
+                scene.Meshes.Add(mesh);
                 continue;
             }
-            XmlElement? ctrl = Ref(Attr(inst, "url"));
-            XmlElement? skin = Find(ctrl, "skin");
+            XmlElement? controller = ElementByUrl(Attr(instance, "url"));
+            XmlElement? skin = Find(controller, "skin");
             if (skin == null)
             {
-                warn("controller " + Attr(inst, "url", "") + " is not a skin; skipped");
+                warn("controller " + Attr(instance, "url", "") + " is not a skin; skipped");
                 continue;
             }
-            XmlElement? sgeom = Ref(Attr(skin, "source"));
-            DaeGeom? sdata = null;
-            if (sgeom != null)
+            XmlElement? skinGeometryElement = ElementByUrl(Attr(skin, "source"));
+            DaeGeometry? skinGeometry = null;
+            if (skinGeometryElement != null)
             {
-                sdata = Geometry(sgeom, symbols);
+                skinGeometry = Geometry(skinGeometryElement, symbols);
             }
-            if (sdata == null)
+            if (skinGeometry == null)
             {
                 continue;
             }
-            double[] bsmv = Floats(Find(skin, "bind_shape_matrix"));
-            Mat4 bsm = Mat4.Identity();
-            if (bsmv.Length == 16)
+            double[] bindShapeValues = ReadFloats(Find(skin, "bind_shape_matrix"));
+            Matrix4 bindShapeMatrix = Matrix4.Identity();
+            if (bindShapeValues.Length == 16)
             {
-                bsm = new Mat4();
-                Array.Copy(bsmv, bsm.M, 16);
+                bindShapeMatrix = new Matrix4();
+                Array.Copy(bindShapeValues, bindShapeMatrix.Elements, 16);
             }
-            Dictionary<string, string?> jin = new Dictionary<string, string?>();
-            foreach (XmlElement x in FindAll(Find(skin, "joints"), "input"))
+            Dictionary<string, string?> jointInputs = new Dictionary<string, string?>();
+            foreach (XmlElement input in FindAll(Find(skin, "joints"), "input"))
             {
-                jin[MatKey(Attr(x, "semantic"))] = Attr(x, "source");
+                jointInputs[KeyOf(Attr(input, "semantic"))] = Attr(input, "source");
             }
-            List<string> jnames = Names(jin["JOINT"]);
-            DaeSource ibmSrc = Source(jin["INV_BIND_MATRIX"]);
+            List<string> jointNames = Names(jointInputs["JOINT"]);
+            DaeSource inverseBindSource = Source(jointInputs["INV_BIND_MATRIX"]);
             List<int> roots = new List<int>();
-            foreach (XmlElement s in FindAll(inst, "skeleton"))
+            foreach (XmlElement skeleton in FindAll(instance, "skeleton"))
             {
-                string? st = Text(s);
-                if (st == null)
+                string? skeletonText = Text(skeleton);
+                if (skeletonText == null)
                 {
                     continue;
                 }
-                string sid = st.Trim().TrimStart('#');
-                int rn;
-                if (nodeOfId.TryGetValue(sid, out rn))
+                string skeletonId = skeletonText.Trim().TrimStart('#');
+                int skeletonRoot;
+                if (nodeOfId.TryGetValue(skeletonId, out skeletonRoot))
                 {
-                    roots.Add(rn);
+                    roots.Add(skeletonRoot);
                 }
             }
-            List<int> jnode = new List<int>();
-            for (int k = 0; k < jnames.Count; k++)
+            List<int> jointNodes = new List<int>();
+            for (int k = 0; k < jointNames.Count; k++)
             {
-                int j = ResolveJoint(jnames[k], roots);
-                if (j < 0)
+                int jointNode = ResolveJoint(jointNames[k], roots);
+                if (jointNode < 0)
                 {
-                    warn("joint " + jnames[k] + " not found");
+                    warn("joint " + jointNames[k] + " not found");
                 }
-                else if (sc.Nodes[j].Bind == null)
+                else if (scene.Nodes[jointNode].Bind == null)
                 {
-                    Mat4 ib = new Mat4();
-                    Array.Copy(ibmSrc.Data, k * 16, ib.M, 0, 16);
-                    sc.Nodes[j].Bind = ib.Inverse();
+                    Matrix4 inverseBind = new Matrix4();
+                    Array.Copy(inverseBindSource.Data, k * 16, inverseBind.Elements, 0, 16);
+                    scene.Nodes[jointNode].Bind = inverseBind.Inverse();
                 }
-                jnode.Add(j);
+                jointNodes.Add(jointNode);
             }
-            XmlElement? vw = Find(skin, "vertex_weights");
-            Dictionary<string, DaeSem> win = new Dictionary<string, DaeSem>();
-            int wstride = 1;
-            foreach (XmlElement x in FindAll(vw, "input"))
+            XmlElement? vertexWeights = Find(skin, "vertex_weights");
+            Dictionary<string, DaeSemantic> weightInputs = new Dictionary<string, DaeSemantic>();
+            int weightStride = 1;
+            foreach (XmlElement input in FindAll(vertexWeights, "input"))
             {
-                int off = int.Parse(Attr(x, "offset", "0"), CultureInfo.InvariantCulture);
-                win[MatKey(Attr(x, "semantic"))] = new DaeSem(Attr(x, "source"), off, 0);
-                if (off + 1 > wstride)
+                int offset = int.Parse(Attr(input, "offset", "0"), CultureInfo.InvariantCulture);
+                weightInputs[KeyOf(Attr(input, "semantic"))] = new DaeSemantic(Attr(input, "source"), offset, 0);
+                if (offset + 1 > weightStride)
                 {
-                    wstride = off + 1;
+                    weightStride = offset + 1;
                 }
             }
-            double[] weights = Source(win["WEIGHT"].Source).Data;
-            int[] vcount = Ints(Find(vw, "vcount"));
-            int[] v = Ints(Find(vw, "v"));
-            int ncp = sdata.Cp.Length / 3;
-            List<Influence>[] cpInfl = new List<Influence>[ncp];
-            Dictionary<int, int>[] cpAt = new Dictionary<int, int>[ncp];
-            for (int c = 0; c < ncp; c++)
+            double[] weights = Source(weightInputs["WEIGHT"].Source).Data;
+            int[] influenceCounts = ReadInts(Find(vertexWeights, "vcount"));
+            int[] weightIndices = ReadInts(Find(vertexWeights, "v"));
+            int controlPointCount = skinGeometry.ControlPoints.Length / 3;
+            List<Influence>[] controlPointInfluences = new List<Influence>[controlPointCount];
+            Dictionary<int, int>[] influenceSlotByJoint = new Dictionary<int, int>[controlPointCount];
+            for (int controlPoint = 0; controlPoint < controlPointCount; controlPoint++)
             {
-                cpInfl[c] = new List<Influence>();
-                cpAt[c] = new Dictionary<int, int>();
+                controlPointInfluences[controlPoint] = new List<Influence>();
+                influenceSlotByJoint[controlPoint] = new Dictionary<int, int>();
             }
-            int joff = win["JOINT"].Offset;
-            int woff = win["WEIGHT"].Offset;
-            int row = 0;
-            for (int c = 0; c < vcount.Length; c++)
+            int jointOffset = weightInputs["JOINT"].Offset;
+            int weightOffset = weightInputs["WEIGHT"].Offset;
+            int weightRow = 0;
+            for (int controlPoint = 0; controlPoint < influenceCounts.Length; controlPoint++)
             {
-                int cnt = vcount[c];
-                for (int k = 0; k < cnt; k++)
+                int influenceCount = influenceCounts[controlPoint];
+                for (int k = 0; k < influenceCount; k++)
                 {
-                    int ji = v[(row + k) * wstride + joff];
-                    double w = weights[v[(row + k) * wstride + woff]];
-                    if (c < ncp && ji >= 0 && ji < jnode.Count && jnode[ji] >= 0 && w > 0)
+                    int jointSlot = weightIndices[(weightRow + k) * weightStride + jointOffset];
+                    double weight = weights[weightIndices[(weightRow + k) * weightStride + weightOffset]];
+                    if (controlPoint < controlPointCount && jointSlot >= 0 && jointSlot < jointNodes.Count && jointNodes[jointSlot] >= 0 && weight > 0)
                     {
-                        int jn = jnode[ji];
-                        int at;
-                        if (cpAt[c].TryGetValue(jn, out at))
+                        int influenceJoint = jointNodes[jointSlot];
+                        int influenceSlot;
+                        if (influenceSlotByJoint[controlPoint].TryGetValue(influenceJoint, out influenceSlot))
                         {
-                            cpInfl[c][at].Weight += w;
+                            controlPointInfluences[controlPoint][influenceSlot].Weight += weight;
                         }
                         else
                         {
-                            cpAt[c][jn] = cpInfl[c].Count;
-                            cpInfl[c].Add(new Influence(jn, w));
+                            influenceSlotByJoint[controlPoint][influenceJoint] = controlPointInfluences[controlPoint].Count;
+                            controlPointInfluences[controlPoint].Add(new Influence(influenceJoint, weight));
                         }
                     }
                 }
-                row += cnt;
+                weightRow += influenceCount;
             }
             // the bind shape matrix puts the control points (and normals) into bind-pose space
-            double[] cp2 = new double[ncp * 3];
-            for (int c = 0; c < ncp; c++)
+            double[] bindControlPoints = new double[controlPointCount * 3];
+            for (int controlPoint = 0; controlPoint < controlPointCount; controlPoint++)
             {
-                double ox;
-                double oy;
-                double oz;
-                bsm.TransformPoint(sdata.Cp[c * 3], sdata.Cp[c * 3 + 1], sdata.Cp[c * 3 + 2], out ox, out oy, out oz);
-                cp2[c * 3] = ox;
-                cp2[c * 3 + 1] = oy;
-                cp2[c * 3 + 2] = oz;
+                double transformedX;
+                double transformedY;
+                double transformedZ;
+                bindShapeMatrix.TransformPoint(skinGeometry.ControlPoints[controlPoint * 3], skinGeometry.ControlPoints[controlPoint * 3 + 1], skinGeometry.ControlPoints[controlPoint * 3 + 2], out transformedX, out transformedY, out transformedZ);
+                bindControlPoints[controlPoint * 3] = transformedX;
+                bindControlPoints[controlPoint * 3 + 1] = transformedY;
+                bindControlPoints[controlPoint * 3 + 2] = transformedZ;
             }
-            if (sdata.Nrm != null)
+            if (skinGeometry.Normals != null)
             {
-                int nn = sdata.Nrm.Length / 3;
-                double[] nrm2 = new double[nn * 3];
-                for (int c = 0; c < nn; c++)
+                int normalCount = skinGeometry.Normals.Length / 3;
+                double[] bindNormals = new double[normalCount * 3];
+                for (int normalIndex = 0; normalIndex < normalCount; normalIndex++)
                 {
-                    double ox;
-                    double oy;
-                    double oz;
-                    bsm.TransformDir(sdata.Nrm[c * 3], sdata.Nrm[c * 3 + 1], sdata.Nrm[c * 3 + 2], out ox, out oy, out oz);
-                    nrm2[c * 3] = ox;
-                    nrm2[c * 3 + 1] = oy;
-                    nrm2[c * 3 + 2] = oz;
+                    double transformedX;
+                    double transformedY;
+                    double transformedZ;
+                    bindShapeMatrix.TransformDir(skinGeometry.Normals[normalIndex * 3], skinGeometry.Normals[normalIndex * 3 + 1], skinGeometry.Normals[normalIndex * 3 + 2], out transformedX, out transformedY, out transformedZ);
+                    bindNormals[normalIndex * 3] = transformedX;
+                    bindNormals[normalIndex * 3 + 1] = transformedY;
+                    bindNormals[normalIndex * 3 + 2] = transformedZ;
                 }
-                sdata.Nrm = nrm2;
+                skinGeometry.Normals = bindNormals;
             }
-            for (int c = 0; c < ncp; c++)
+            for (int controlPoint = 0; controlPoint < controlPointCount; controlPoint++)
             {
-                if (cpInfl[c].Count == 0)
+                if (controlPointInfluences[controlPoint].Count == 0)
                 {
-                    cpInfl[c].Add(new Influence(i, 1.0));
+                    controlPointInfluences[controlPoint].Add(new Influence(nodeIndex, 1.0));
                 }
             }
-            SceneMesh smesh = new SceneMesh(MeshName(sgeom!), i);
-            MeshBuild.Build(smesh, cp2, sdata.CornerCp, sdata.Nrm, sdata.Uv, sdata.Tris, sdata.TMat, cpInfl);
-            sc.Meshes.Add(smesh);
+            SceneMesh skinnedMesh = new SceneMesh(MeshName(skinGeometryElement!), nodeIndex);
+            MeshBuild.Build(skinnedMesh, bindControlPoints, skinGeometry.CornerControlPoints, skinGeometry.Normals, skinGeometry.Uvs, skinGeometry.Triangles, skinGeometry.TriangleMaterials, controlPointInfluences);
+            scene.Meshes.Add(skinnedMesh);
         }
 
-        ReadAnims(Path.GetFileNameWithoutExtension(path));
-        return sc;
+        ReadAnimations(Path.GetFileNameWithoutExtension(path));
+        return scene;
     }
 
     static string MeshName(XmlElement geom)
     {
-        string? nm = Attr(geom, "name");
-        if (nm == null || nm.Length == 0)
+        string? name = Attr(geom, "name");
+        if (name == null || name.Length == 0)
         {
-            nm = Attr(geom, "id");
+            name = Attr(geom, "id");
         }
-        if (nm == null || nm.Length == 0)
+        if (name == null || name.Length == 0)
         {
-            nm = "mesh";
+            name = "mesh";
         }
-        return nm;
+        return name;
     }
 
-    static Mat4 AxisOf(double a, double b, double c, double d, double e, double f, double g, double h, double i)
+    static Matrix4 AxisOf(double m00, double m01, double m02, double m10, double m11, double m12, double m20, double m21, double m22)
     {
-        Mat4 m = Mat4.Identity();
-        m[0, 0] = a;
-        m[0, 1] = b;
-        m[0, 2] = c;
-        m[1, 0] = d;
-        m[1, 1] = e;
-        m[1, 2] = f;
-        m[2, 0] = g;
-        m[2, 1] = h;
-        m[2, 2] = i;
-        return m;
+        Matrix4 matrix = Matrix4.Identity();
+        matrix[0, 0] = m00;
+        matrix[0, 1] = m01;
+        matrix[0, 2] = m02;
+        matrix[1, 0] = m10;
+        matrix[1, 1] = m11;
+        matrix[1, 2] = m12;
+        matrix[2, 0] = m20;
+        matrix[2, 1] = m21;
+        matrix[2, 2] = m22;
+        return matrix;
     }
 
     // ---- animations (read_dae_anims) ----
 
-    readonly List<List<string?>> chanChain = new List<List<string?>>();
-    readonly List<XmlElement> chanEl = new List<XmlElement>();
+    readonly List<List<string?>> channelAnimationIds = new List<List<string?>>();
+    readonly List<XmlElement> channelElements = new List<XmlElement>();
 
-    void Collect(XmlElement a, List<string?> chain)
+    void Collect(XmlElement animation, List<string?> chain)
     {
         List<string?> next = new List<string?>(chain);
-        next.Add(Attr(a, "id"));
-        foreach (XmlElement ch in FindAll(a, "channel"))
+        next.Add(Attr(animation, "id"));
+        foreach (XmlElement channel in FindAll(animation, "channel"))
         {
-            chanChain.Add(next);
-            chanEl.Add(ch);
+            channelAnimationIds.Add(next);
+            channelElements.Add(channel);
         }
-        foreach (XmlElement sub in FindAll(a, "animation"))
+        foreach (XmlElement childAnimation in FindAll(animation, "animation"))
         {
-            Collect(sub, next);
+            Collect(childAnimation, next);
         }
     }
 
     // np.interp: linear between the keys, the end values outside them (times increasing)
-    static double Interp(double x, double[] xp, double[] fp, int off, int stride)
+    static double Interpolate(double time, double[] keyTimes, double[] keyValues, int valueOffset, int stride)
     {
-        int n = xp.Length;
-        if (x <= xp[0])
+        int keyCount = keyTimes.Length;
+        if (time <= keyTimes[0])
         {
-            return fp[off];
+            return keyValues[valueOffset];
         }
-        if (x >= xp[n - 1])
+        if (time >= keyTimes[keyCount - 1])
         {
-            return fp[off + (n - 1) * stride];
+            return keyValues[valueOffset + (keyCount - 1) * stride];
         }
-        int lo = 0;
-        int hi = n - 1;
-        while (hi - lo > 1)
+        int low = 0;
+        int high = keyCount - 1;
+        while (high - low > 1)
         {
-            int mid = (lo + hi) / 2;
-            if (xp[mid] <= x)
+            int middle = (low + high) / 2;
+            if (keyTimes[middle] <= time)
             {
-                lo = mid;
+                low = middle;
             }
             else
             {
-                hi = mid;
+                high = middle;
             }
         }
-        double t0 = xp[lo];
-        double t1 = xp[lo + 1];
-        if (t1 == t0)
+        double time0 = keyTimes[low];
+        double time1 = keyTimes[low + 1];
+        if (time1 == time0)
         {
-            return fp[off + lo * stride];
+            return keyValues[valueOffset + low * stride];
         }
-        double u = (x - t0) / (t1 - t0);
-        double a = fp[off + lo * stride];
-        double b = fp[off + (lo + 1) * stride];
-        return a + (b - a) * u;
+        double fraction = (time - time0) / (time1 - time0);
+        double value0 = keyValues[valueOffset + low * stride];
+        double value1 = keyValues[valueOffset + (low + 1) * stride];
+        return value0 + (value1 - value0) * fraction;
     }
 
-    void ReadAnims(string stem)
+    void ReadAnimations(string stem)
     {
-        XmlElement? lib = Find(root, "library_animations");
-        if (lib == null)
+        XmlElement? library = Find(root, "library_animations");
+        if (library == null)
         {
             return;
         }
-        foreach (XmlElement a in FindAll(lib, "animation"))
+        foreach (XmlElement animation in FindAll(library, "animation"))
         {
-            Collect(a, new List<string?>());
+            Collect(animation, new List<string?>());
         }
-        if (chanEl.Count == 0)
+        if (channelElements.Count == 0)
         {
             return;
         }
-        List<string> gname = new List<string>();
-        List<List<XmlElement>> gmembers = new List<List<XmlElement>>();
-        List<double[]?> grange = new List<double[]?>();
+        List<string> clipNames = new List<string>();
+        List<List<XmlElement>> clipChannels = new List<List<XmlElement>>();
+        List<double[]?> clipRanges = new List<double[]?>();
         foreach (XmlElement clip in FindAll(Find(root, "library_animation_clips"), "animation_clip"))
         {
-            HashSet<string> ids = new HashSet<string>();
-            foreach (XmlElement ia in FindAll(clip, "instance_animation"))
+            HashSet<string> animationIds = new HashSet<string>();
+            foreach (XmlElement instanceAnimation in FindAll(clip, "instance_animation"))
             {
-                ids.Add(Attr(ia, "url", "").TrimStart('#'));
+                animationIds.Add(Attr(instanceAnimation, "url", "").TrimStart('#'));
             }
             List<XmlElement> members = new List<XmlElement>();
-            for (int k = 0; k < chanEl.Count; k++)
+            for (int k = 0; k < channelElements.Count; k++)
             {
-                bool hit = false;
-                foreach (string? id in chanChain[k])
+                bool inClip = false;
+                foreach (string? animationId in channelAnimationIds[k])
                 {
-                    if (id != null && ids.Contains(id))
+                    if (animationId != null && animationIds.Contains(animationId))
                     {
-                        hit = true;
+                        inClip = true;
                         break;
                     }
                 }
-                if (hit)
+                if (inClip)
                 {
-                    members.Add(chanEl[k]);
+                    members.Add(channelElements[k]);
                 }
             }
-            double[]? rng = null;
+            double[]? range = null;
             if (Attr(clip, "end") != null)
             {
-                rng = new double[]
+                range = new double[]
                 {
                     double.Parse(Attr(clip, "start", "0"), NumberStyles.Float, CultureInfo.InvariantCulture),
                     double.Parse(Attr(clip, "end", "0"), NumberStyles.Float, CultureInfo.InvariantCulture),
                 };
             }
-            string nm = "clip";
+            string clipName = "clip";
             if (Attr(clip, "name") != null && Attr(clip, "name", "").Length > 0)
             {
-                nm = Attr(clip, "name", "");
+                clipName = Attr(clip, "name", "");
             }
             else if (Attr(clip, "id") != null && Attr(clip, "id", "").Length > 0)
             {
-                nm = Attr(clip, "id", "");
+                clipName = Attr(clip, "id", "");
             }
-            gname.Add(nm);
-            gmembers.Add(members);
-            grange.Add(rng);
+            clipNames.Add(clipName);
+            clipChannels.Add(members);
+            clipRanges.Add(range);
         }
-        if (gname.Count == 0)
+        if (clipNames.Count == 0)
         {
-            gname.Add(stem);
-            gmembers.Add(new List<XmlElement>(chanEl));
-            grange.Add(null);
+            clipNames.Add(stem);
+            clipChannels.Add(new List<XmlElement>(channelElements));
+            clipRanges.Add(null);
         }
 
-        for (int g = 0; g < gname.Count; g++)
+        for (int clipIndex = 0; clipIndex < clipNames.Count; clipIndex++)
         {
             List<DaeSampled> sampled = new List<DaeSampled>();
-            bool any = false;
-            double lo = 0;
-            double hi = 0;
-            foreach (XmlElement ch in gmembers[g])
+            bool anySampled = false;
+            double startTime = 0;
+            double endTime = 0;
+            foreach (XmlElement channel in clipChannels[clipIndex])
             {
-                string target = Attr(ch, "target", "");
+                string target = Attr(channel, "target", "");
                 int slash = target.IndexOf('/');
                 if (slash < 0)
                 {
                     continue;
                 }
-                string nid = target.Substring(0, slash);
+                string nodeId = target.Substring(0, slash);
                 string rest = target.Substring(slash + 1);
                 int node;
-                if (!nodeOfId.TryGetValue(nid, out node))
+                if (!nodeOfId.TryGetValue(nodeId, out node))
                 {
                     continue;
                 }
-                string sid = rest;
+                string transformSid = rest;
                 string? member = null;
-                int dot = rest.IndexOf('.');
-                if (dot >= 0)
+                int dotIndex = rest.IndexOf('.');
+                if (dotIndex >= 0)
                 {
-                    sid = rest.Substring(0, dot);
-                    member = rest.Substring(dot + 1);
+                    transformSid = rest.Substring(0, dotIndex);
+                    member = rest.Substring(dotIndex + 1);
                 }
                 else if (rest.Contains('('))
                 {
                     warn("animation target " + target + ": indexed members are not supported");
                     continue;
                 }
-                List<DaeXform> xf = xforms[node];
-                int k = -1;
-                for (int q = 0; q < xf.Count; q++)
+                List<DaeXform> transforms = nodeTransforms[node];
+                int transformIndex = -1;
+                for (int candidate = 0; candidate < transforms.Count; candidate++)
                 {
-                    if (xf[q].Sid == sid)
+                    if (transforms[candidate].Sid == transformSid)
                     {
-                        k = q;
+                        transformIndex = candidate;
                         break;
                     }
                 }
-                if (k < 0)
+                if (transformIndex < 0)
                 {
                     continue;
                 }
-                XmlElement? samp;
-                if (!byId.TryGetValue(Attr(ch, "source", "").TrimStart('#'), out samp))
+                XmlElement? sampler;
+                if (!byId.TryGetValue(Attr(channel, "source", "").TrimStart('#'), out sampler))
                 {
                     continue;
                 }
-                Dictionary<string, string?> sin = new Dictionary<string, string?>();
-                foreach (XmlElement x in FindAll(samp, "input"))
+                Dictionary<string, string?> samplerInputs = new Dictionary<string, string?>();
+                foreach (XmlElement x in FindAll(sampler, "input"))
                 {
-                    sin[MatKey(Attr(x, "semantic"))] = Attr(x, "source");
+                    samplerInputs[KeyOf(Attr(x, "semantic"))] = Attr(x, "source");
                 }
-                double[] times = Source(sin["INPUT"]).Data;
-                double[] outv = Source(sin["OUTPUT"]).Data;
+                double[] times = Source(samplerInputs["INPUT"]).Data;
+                double[] outputs = Source(samplerInputs["OUTPUT"]).Data;
                 if (times.Length == 0)
                 {
                     continue;
                 }
-                DaeSampled s = new DaeSampled();
-                s.Node = node;
-                s.K = k;
-                s.Member = member;
-                s.Times = times;
-                s.Out = outv;
-                s.Cols = outv.Length / times.Length;
-                sampled.Add(s);
-                if (!any)
+                DaeSampled sampledChannel = new DaeSampled();
+                sampledChannel.Node = node;
+                sampledChannel.TransformIndex = transformIndex;
+                sampledChannel.Member = member;
+                sampledChannel.Times = times;
+                sampledChannel.Outputs = outputs;
+                sampledChannel.OutputColumns = outputs.Length / times.Length;
+                sampled.Add(sampledChannel);
+                if (!anySampled)
                 {
-                    lo = times[0];
-                    hi = times[times.Length - 1];
-                    any = true;
+                    startTime = times[0];
+                    endTime = times[times.Length - 1];
+                    anySampled = true;
                 }
                 else
                 {
-                    lo = Math.Min(lo, times[0]);
-                    hi = Math.Max(hi, times[times.Length - 1]);
+                    startTime = Math.Min(startTime, times[0]);
+                    endTime = Math.Max(endTime, times[times.Length - 1]);
                 }
             }
             if (sampled.Count == 0)
             {
                 continue;
             }
-            double[]? rng2 = grange[g];
-            if (rng2 != null && rng2[1] > rng2[0])
+            double[]? clipRange = clipRanges[clipIndex];
+            if (clipRange != null && clipRange[1] > clipRange[0])
             {
-                lo = rng2[0];
-                hi = rng2[1];
+                startTime = clipRange[0];
+                endTime = clipRange[1];
             }
-            int frames = (int)Math.Round((hi - lo) * Scene.Fps, MidpointRounding.ToEven) + 1;
-            double[] t = new double[frames];
-            for (int f = 0; f < frames; f++)
+            int frames = (int)Math.Round((endTime - startTime) * Scene.Fps, MidpointRounding.ToEven) + 1;
+            double[] sampleTimes = new double[frames];
+            for (int frame = 0; frame < frames; frame++)
             {
-                t[f] = lo + (double)f / Scene.Fps;
+                sampleTimes[frame] = startTime + (double)frame / Scene.Fps;
             }
             List<int> nodeOrder = new List<int>();
             Dictionary<int, List<DaeSampled>> perNode = new Dictionary<int, List<DaeSampled>>();
-            foreach (DaeSampled s in sampled)
+            foreach (DaeSampled sampledChannel in sampled)
             {
                 List<DaeSampled> items;
-                if (!perNode.TryGetValue(s.Node, out items!))
+                if (!perNode.TryGetValue(sampledChannel.Node, out items!))
                 {
                     items = new List<DaeSampled>();
-                    perNode[s.Node] = items;
-                    nodeOrder.Add(s.Node);
+                    perNode[sampledChannel.Node] = items;
+                    nodeOrder.Add(sampledChannel.Node);
                 }
-                items.Add(s);
+                items.Add(sampledChannel);
             }
-            SceneAnim anim = new SceneAnim(gname[g], frames);
+            SceneAnim animation = new SceneAnim(clipNames[clipIndex], frames);
             foreach (int node in nodeOrder)
             {
-                List<DaeXform> xf = xforms[node];
-                int[] widths = new int[xf.Count];
-                double[][] vals = new double[xf.Count][];
-                for (int k = 0; k < xf.Count; k++)
+                List<DaeXform> transforms = nodeTransforms[node];
+                int[] widths = new int[transforms.Count];
+                double[][] transformValues = new double[transforms.Count][];
+                for (int k = 0; k < transforms.Count; k++)
                 {
-                    int w = xf[k].V.Length;
-                    widths[k] = w;
-                    vals[k] = new double[frames * w];
-                    for (int f = 0; f < frames; f++)
+                    int width = transforms[k].Values.Length;
+                    widths[k] = width;
+                    transformValues[k] = new double[frames * width];
+                    for (int frame = 0; frame < frames; frame++)
                     {
-                        Array.Copy(xf[k].V, 0, vals[k], f * w, w);
+                        Array.Copy(transforms[k].Values, 0, transformValues[k], frame * width, width);
                     }
                 }
-                foreach (DaeSampled s in perNode[node])
+                foreach (DaeSampled sampledChannel in perNode[node])
                 {
-                    int w = widths[s.K];
-                    if (s.Member == null)
+                    int width = widths[sampledChannel.TransformIndex];
+                    if (sampledChannel.Member == null)
                     {
-                        int cols = Math.Min(s.Cols, w);
-                        for (int c = 0; c < cols; c++)
+                        int columns = Math.Min(sampledChannel.OutputColumns, width);
+                        for (int column = 0; column < columns; column++)
                         {
-                            for (int f = 0; f < frames; f++)
+                            for (int frame = 0; frame < frames; frame++)
                             {
-                                vals[s.K][f * w + c] = Interp(t[f], s.Times, s.Out, c, s.Cols);
+                                transformValues[sampledChannel.TransformIndex][frame * width + column] = Interpolate(sampleTimes[frame], sampledChannel.Times, sampledChannel.Outputs, column, sampledChannel.OutputColumns);
                             }
                         }
                     }
                     else
                     {
-                        int c = MemberIndex(s.Member);
-                        if (c < 0 || c >= w)
+                        int column = MemberIndex(sampledChannel.Member);
+                        if (column < 0 || column >= width)
                         {
                             continue;
                         }
-                        for (int f = 0; f < frames; f++)
+                        for (int frame = 0; frame < frames; frame++)
                         {
-                            vals[s.K][f * w + c] = Interp(t[f], s.Times, s.Out, 0, s.Cols);
+                            transformValues[sampledChannel.TransformIndex][frame * width + column] = Interpolate(sampleTimes[frame], sampledChannel.Times, sampledChannel.Outputs, 0, sampledChannel.OutputColumns);
                         }
                     }
                 }
-                Mat4[] mats = new Mat4[frames];
-                for (int f = 0; f < frames; f++)
+                Matrix4[] frameMatrices = new Matrix4[frames];
+                for (int frame = 0; frame < frames; frame++)
                 {
-                    Mat4 m = Mat4.Identity();
-                    for (int k = 0; k < xf.Count; k++)
+                    Matrix4 matrix = Matrix4.Identity();
+                    for (int k = 0; k < transforms.Count; k++)
                     {
-                        m = Apply(m, xf[k].Tag, vals[k], f * widths[k]);
+                        matrix = Apply(matrix, transforms[k].Tag, transformValues[k], frame * widths[k]);
                     }
-                    mats[f] = m;
+                    frameMatrices[frame] = matrix;
                 }
-                anim.Tracks[node] = mats;
+                animation.Tracks[node] = frameMatrices;
             }
-            sc.Anims.Add(anim);
+            scene.Anims.Add(animation);
         }
     }
 
     static int MemberIndex(string member)
     {
-        string m = member.ToUpperInvariant();
-        if (m == "X")
+        string upperMember = member.ToUpperInvariant();
+        if (upperMember == "X")
         {
             return 0;
         }
-        if (m == "Y")
+        if (upperMember == "Y")
         {
             return 1;
         }
-        if (m == "Z")
+        if (upperMember == "Z")
         {
             return 2;
         }
-        if (m == "ANGLE")
+        if (upperMember == "ANGLE")
         {
             return 3;
         }

@@ -94,9 +94,9 @@ public class MovieExtractorWindow
                     UseShellExecute = true
                 });
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                Console.WriteLine("Failed to open URL: " + ex.Message);
+                Console.WriteLine("Failed to open URL: " + exception.Message);
             }
         }
     }

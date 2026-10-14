@@ -1,5 +1,4 @@
-﻿using System.Buffers.Binary;
-namespace DotrAssetModder;
+﻿namespace DotrAssetModder;
 
 public enum AssetKind
 {
@@ -22,57 +21,48 @@ public sealed record ExtractResult(
 
 public class AssetExtractor
 {
-    public ExtractResult Extract(byte[] data, string outDir, string stem,
-        IList<string>? names = null,
+    public ExtractResult Extract(byte[] assetBytes, string outputDirectory, string fileNameStem,
+        IList<string>? assetNames = null,
         ExtractionProgress? progress = null)
     {
-        Directory.CreateDirectory(outDir);
-        var kind = DetectKind(data);
+        Directory.CreateDirectory(outputDirectory);
+        var kind = DetectKind(assetBytes);
         return kind switch {
-            AssetKind.Rh0Model => ModelExtractor.Extract(data, outDir, stem, names, progress),
-            AssetKind.Rh2Textures => TextureExtractor.Extract(data, outDir, stem, names, progress),
-            AssetKind.Ps2Icon => IconExtractor.Extract(data, outDir, stem),
+            AssetKind.Rh0Model => ModelExtractor.Extract(assetBytes, outputDirectory, fileNameStem, assetNames, progress),
+            AssetKind.Rh2Textures => TextureExtractor.Extract(assetBytes, outputDirectory, fileNameStem, assetNames, progress),
+            AssetKind.Ps2Icon => IconExtractor.Extract(assetBytes, outputDirectory, fileNameStem),
             _ => new ExtractResult(AssetKind.Unknown, 0, 0, 0),
         };
     }
 
    
 
-    public static AssetKind DetectKind(ReadOnlySpan<byte> data)
+    public static AssetKind DetectKind(ReadOnlySpan<byte> assetBytes)
     {
-        if (data.Length < 4) return AssetKind.Unknown;
-        uint magic = BinaryPrimitives.ReadUInt32LittleEndian(data);
-        if (magic == 0x00304852) return AssetKind.Rh0Model; // RH0\0
-        if (data.IndexOf(Rh2Magic) >= 0) return AssetKind.Rh2Textures;
+        if (assetBytes.Length < 4) return AssetKind.Unknown;
+        uint magic = Bin.ReadU32(assetBytes, 0);
+        if (magic == Rh0Assembler.Rh0Magic) return AssetKind.Rh0Model;
+        if (assetBytes.IndexOf(Rh2Magic) >= 0) return AssetKind.Rh2Textures;
         // PS2 save icon: contains ICN magic 0x010000 as a uint32
         ReadOnlySpan<byte> icnMagic = stackalloc byte[] { 0x00, 0x00, 0x01, 0x00 };
-        if (data.IndexOf(icnMagic) >= 0) return AssetKind.Ps2Icon;
+        if (assetBytes.IndexOf(icnMagic) >= 0) return AssetKind.Ps2Icon;
         return AssetKind.Unknown;
     }
 
     internal static ReadOnlySpan<byte> Rh2Magic =>
         new byte[] { 0x52, 0x48, 0x32, 0x00 };
 
-    public static List<uint> FindAllRh2Offsets(ReadOnlySpan<byte> data)
+    public static List<uint> FindAllRh2Offsets(ReadOnlySpan<byte> assetBytes)
     {
-        var result = new List<uint>();
-        int pos = 0;
+        var offsets = new List<uint>();
+        int searchStart = 0;
         while (true)
         {
-            int found = data.Slice(pos).IndexOf(Rh2Magic);
-            if (found < 0) break;
-            result.Add((uint)(pos + found));
-            pos += found + 4;
+            int foundIndex = assetBytes.Slice(searchStart).IndexOf(Rh2Magic);
+            if (foundIndex < 0) break;
+            offsets.Add((uint)(searchStart + foundIndex));
+            searchStart += foundIndex + 4;
         }
-        return result;
+        return offsets;
     }
-}
-
-static class Bin
-{
-    public static uint U32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt32LittleEndian(d.Slice(o, 4));
-    public static int I32(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt32LittleEndian(d.Slice(o, 4));
-    public static ushort U16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadUInt16LittleEndian(d.Slice(o, 2));
-    public static short I16(ReadOnlySpan<byte> d, int o) => BinaryPrimitives.ReadInt16LittleEndian(d.Slice(o, 2));
-    public static float U32f(ReadOnlySpan<byte> d, int o) => BitConverter.Int32BitsToSingle(I32(d, o));
 }

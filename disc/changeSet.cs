@@ -1,10 +1,10 @@
 namespace DotrAssetModder;
 
-// Importers never touch the disc. They describe what they want changed - a run of bytes at an
-// offset inside one file on the disc - and this turns that into disc bytes, or refuses.
-//
-// The disc is patched where it lies: every change must fit inside the byte size its file already
-// has, because nothing here rewrites a directory record.
+/* Importers never touch the disc. They describe what they want changed - a run of bytes at an
+   offset inside one file on the disc - and this turns that into disc bytes, or refuses.
+
+   The disc is patched where it lies: every change must fit inside the byte size its file already
+   has, because nothing here rewrites a directory record. */
 public class ChangeSet
 {
     // Offset is inside the file, not inside the image. Source is free text for the validation
@@ -49,9 +49,9 @@ public class ChangeSet
             get
             {
                 long total = 0;
-                foreach (Change c in Writes)
+                foreach (Change change in Writes)
                 {
-                    total += c.Bytes.Length;
+                    total += change.Bytes.Length;
                 }
                 return total;
             }
@@ -67,12 +67,12 @@ public class ChangeSet
 
     public void Add(string filePath, long offset, byte[] bytes, string source = "")
     {
-        var c = new Change();
-        c.FilePath = filePath;
-        c.Offset = offset;
-        c.Bytes = bytes;
-        c.Source = source;
-        Changes.Add(c);
+        var change = new Change();
+        change.FilePath = filePath;
+        change.Offset = offset;
+        change.Bytes = bytes;
+        change.Source = source;
+        Changes.Add(change);
     }
 
     // Replace a whole file's contents (still subject to the fit check).
@@ -92,48 +92,48 @@ public class ChangeSet
     {
         var plan = new Plan();
 
-        foreach (Change c in Changes)
+        foreach (Change change in Changes)
         {
-            var f = disc.Find(c.FilePath);
-            if (f == null)
+            var discFile = disc.Find(change.FilePath);
+            if (discFile == null)
             {
-                plan.Errors.Add($"{c}: no such file on the disc");
+                plan.Errors.Add($"{change}: no such file on the disc");
                 continue;
             }
 
-            if (c.End > f.Size)
+            if (change.End > discFile.Size)
             {
-                long over = c.End - f.Size;
-                string room = "; the extent has no spare sectors";
-                if (f.Capacity > f.Size)
+                long overflowBytes = change.End - discFile.Size;
+                string spareRoomNote = "; the extent has no spare sectors";
+                if (discFile.Capacity > discFile.Size)
                 {
-                    room = $"; the extent has {f.Capacity - f.Size} spare bytes, but using them needs the directory record rewritten (IsoRebuilder)";
+                    spareRoomNote = $"; the extent has {discFile.Capacity - discFile.Size} spare bytes, but using them needs the directory record rewritten (IsoRebuilder)";
                 }
-                plan.Errors.Add($"{c}: overflows {f.IsoPath} ({f.Size} B) by {over} B{room}");
+                plan.Errors.Add($"{change}: overflows {discFile.IsoPath} ({discFile.Size} B) by {overflowBytes} B{spareRoomNote}");
                 continue;
             }
 
-            if (c.Bytes.Length == 0)
+            if (change.Bytes.Length == 0)
             {
-                plan.NoOps.Add(c);
+                plan.NoOps.Add(change);
                 continue;
             }
 
-            c.ImageOffset = f.ImageOffset + c.Offset;
-            byte[] current = new byte[c.Bytes.Length];
-            disc.ReadAt(c.ImageOffset, current, 0, current.Length);
-            if (current.AsSpan().SequenceEqual(c.Bytes))
+            change.ImageOffset = discFile.ImageOffset + change.Offset;
+            byte[] current = new byte[change.Bytes.Length];
+            disc.ReadAt(change.ImageOffset, current, 0, current.Length);
+            if (current.AsSpan().SequenceEqual(change.Bytes))
             {
-                plan.NoOps.Add(c);
+                plan.NoOps.Add(change);
                 continue;
             }
 
-            plan.Writes.Add(c);
+            plan.Writes.Add(change);
         }
 
         // Two importers writing the same bytes differently is a bug in the caller, not something
         // to resolve by write order.
-        List<Change> sorted = plan.Writes.OrderBy(w => w.ImageOffset).ToList();
+        List<Change> sorted = plan.Writes.OrderBy(plannedWrite => plannedWrite.ImageOffset).ToList();
         for (int i = 1; i < sorted.Count; i++)
         {
             if (sorted[i].ImageOffset < sorted[i - 1].ImageOffset + sorted[i - 1].Bytes.Length)
@@ -155,14 +155,14 @@ public class ChangeSet
             return plan;
         }
 
-        using (var fs = new FileStream(disc.ImagePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+        using (var imageStream = new FileStream(disc.ImagePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
         {
-            foreach (Change c in plan.Writes)
+            foreach (Change change in plan.Writes)
             {
-                fs.Seek(c.ImageOffset, SeekOrigin.Begin);
-                fs.Write(c.Bytes, 0, c.Bytes.Length);
+                imageStream.Seek(change.ImageOffset, SeekOrigin.Begin);
+                imageStream.Write(change.Bytes, 0, change.Bytes.Length);
             }
-            fs.Flush(true);
+            imageStream.Flush(true);
         }
         return plan;
     }

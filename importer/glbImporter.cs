@@ -1,27 +1,25 @@
 ﻿using System.IO;
-using System.Buffers.Binary;
 using System.Numerics;
 using Raylib_cs;
 using SharpGLTF.Schema2;
 using Buffer = System.Buffer;
 using Image = Raylib_cs.Image;
 using Material = SharpGLTF.Schema2.Material;
+using static DotrAssetModder.Bin;
 
 namespace DotrAssetModder;
 // Mostly AI
 
 
-// === Step 6 — GLB parser =============================================================
-// Loads a .glb (via SharpGLTF 1.0.6) and flattens it into a clean intermediate the
-// rebuilder pipeline consumes. The extractor wrote skinned meshes with an identity mesh
-// transform, so the POSITION accessor already holds world-space *bind* positions; joints
-// carry their world matrix directly (node scales are 1, so WorldMatrix == the read-side
-// `world`; the global scale S is re-introduced later in the root node). Material names are
-// `mat_tex{N}` (+`_alt`), encoding the texture index + alt-mesh flag.
-//
-// Validation targets (Blue-Eyes_White_Dragon.glb): 133 nodes, 1 skin / 71 joints,
-// 4 primitives (mat_tex0..3), 4818 triangles, 3951 verts.
-// =====================================================================================
+/* GLB parser. Loads a .glb (SharpGLTF 1.0.6) and flattens it into the intermediate the
+   rebuilder pipeline consumes. The extractor wrote skinned meshes with an identity mesh
+   transform, so the POSITION accessor already holds world-space bind positions; joints
+   carry their world matrix directly (node scales are 1; the global scale S is
+   re-introduced later in the root node). Material names are `mat_tex{N}` (+`_alt`),
+   encoding the texture index and the alt-mesh flag.
+
+   Validation targets (Blue-Eyes_White_Dragon.glb): 133 nodes, 1 skin / 71 joints,
+   4 primitives (mat_tex0..3), 4818 triangles, 3951 verts. */
 
 public sealed class ImportedNode
 {
@@ -53,11 +51,10 @@ public sealed class ImportedVertex
     /// Position used by the geometry/skinning encoder.
     /// For skinned meshes this stays in the mesh/skin bind space so animation remains coherent.
     /// For unskinned meshes this is already world-baked.
-    public Vector3 Pos;
+    public Vector3 Position;
 
     /// Frame-generation position (bounds/pivot/radius diagnostics in RebuildPipeline).
-    /// Always equal to Pos - kept as a separate field since some diagnostics historically
-    /// read a different source; do not use this for skinning.
+    /// Always equal to Position; not for skinning.
     public Vector3 FramePos;
 
     public Vector3 Normal;                  // normal used by the geometry encoder
@@ -66,7 +63,7 @@ public sealed class ImportedVertex
 
     /// Extracted glbs: the vertex's influences as RH0 stored them (ModelExtractor's
     /// VertexTexture1Game; Bone = the joint's glb node), in the game's order with zero weights
-    /// kept, while they still match the vertex; null = derive them from Pos as for any glb.
+    /// kept, while they still match the vertex; null = derive them from Position as for any glb.
     internal List<StripWeight>? Game;
 }
 
@@ -75,7 +72,7 @@ public sealed class ImportedPrimitive
     /// glb logical node that instanced this mesh (-1 if unknown). For unskinned prims the
     /// vertices are world-baked at import and rigidly rigged to this node.
     public int NodeIndex = -1;
-    public int TexIdx;
+    public int TextureIndex;
     public bool IsAlt;
     /// GS ALPHA_1 low byte: 0x44 normal (Cs-Cd)*As+Cd, 0x48 additive Cs*As+Cd, 0x42 subtract.
     public byte GsAlpha = 0x44;
@@ -92,16 +89,16 @@ public sealed class ImportedPrimitive
     /// An extracted "mat_untextured" page: its strips are drawn with PRIM TME off.
     public bool Untextured;
     public List<ImportedVertex> Vertices = new();
-    public List<(int A, int B, int C)> Triangles = new();
+    public List<(int First, int Second, int Third)> Triangles = new();
 }
 
 /// Every channel is resampled at every integer frame 0..FrameCount-1 (t = frame / 30) with
 /// its own sampler's interpolation (STEP, LINEAR or CUBICSPLINE), so entry i is frame i.
 public sealed class ImportedAnimChannel
 {
-    public List<(float Time, Vector3 V)>? Translation;
-    public List<(float Time, Quaternion Q)>? Rotation;
-    public List<(float Time, Vector3 V)>? Scale;
+    public List<(float Time, Vector3 Value)>? Translation;
+    public List<(float Time, Quaternion Rotation)>? Rotation;
+    public List<(float Time, Vector3 Value)>? Scale;
 }
 
 public sealed class ImportedAnimation
@@ -125,32 +122,26 @@ public sealed class ImportedModel
     /// animation frame where it is not). Keyed by the joint's glb node index.
     public Dictionary<int, Matrix4x4> JointBind = new();
 
-    /// Embedded base-colour images per texture index (from material names "mat_texN"),
-    /// kept as SharpGLTF MemoryImage (PNG/JPEG bytes). Decode + pass to the assembler as
-    /// Rh0Assembler.TextureInput to re-encode them into the RH2 blocks; textures absent
-    /// here keep the template model's RH2 verbatim.
+    /// Embedded base-colour images per texture index (from material names "mat_texN"), as
+    /// SharpGLTF MemoryImage (PNG/JPEG bytes). They are decoded and passed to the assembler
+    /// as Rh0Assembler.TextureInput; textures absent here keep the template model's RH2.
     public Dictionary<int, SharpGLTF.Memory.MemoryImage> TextureImages = new();
 
     /// Animated-texture frame sequences, keyed by the same texIdx as TextureImages. Frames
-    /// are sourced from extra embedded glb images named "tex{N}_anim{frame}" (frame =
-    /// 0,1,2... any width, any count) - a naming convention chosen because glTF has no
-    /// native concept of an image sequence / flipbook texture, so Blender's "Image
-    /// Sequence" texture node needs flattening into individually-named still images at
-    /// export time (give each frame's Image datablock that name in Blender before export).
-    /// Frames are sorted by trailing frame number and packed into one sprite-sheet by
-    /// GlbImporter.DecodeGlbTextures, which Rh0Assembler then uses to synthesize the
-    /// matching TexAnm flipbook entry. A texIdx with no matching images falls through to
-    /// the normal static TextureImages[texIdx] path unchanged - purely additive. Fewer
-    /// than 2 frames found = not treated as animated (ignored, likely a naming accident);
-    /// frame 0's image is harvested into TextureImages too either way so the slot still
-    /// imports fine as a static texture.
+    /// come from extra embedded glb images named "tex{N}_anim{frame}" (any width, any count);
+    /// glTF has no image-sequence texture, so a Blender "Image Sequence" node must be flattened
+    /// into individually named stills (name each frame's Image datablock that way before export).
+    /// Frames are sorted by trailing frame number and packed into one sprite sheet by
+    /// GlbImporter.DecodeGlbTextures, which Rh0Assembler uses to synthesize the TexAnm
+    /// flipbook entry. A texIdx with no such images uses the static TextureImages path.
+    /// Fewer than 2 frames is not treated as animated; frame 0's image is also harvested into
+    /// TextureImages either way, so the slot imports as a static texture.
     public Dictionary<int, List<SharpGLTF.Memory.MemoryImage>> TextureAnimFrames = new();
 
-    /// Per-texture flipbook tick rate (hold time per frame, forwarded into the ANM
-    /// entry's aux0/aux1 - see Rh0Assembler.BuildCustomTexAnimEntry), parsed from an
-    /// optional "_tN" suffix on any of that slot's "tex{N}_anim{frame}" image names,
-    /// e.g. "tex0_anim0_t10" = 10 ticks/frame. Defaults to 5 (matching the one real
-    /// retail sample) for any texIdx with no explicit suffix found.
+    /// Per-texture flipbook tick rate (hold time per frame, written to the ANM entry's
+    /// aux0/aux1, see Rh0Assembler.BuildCustomTexAnimEntry), parsed from an optional "_tN"
+    /// suffix on the slot's "tex{N}_anim{frame}" image names ("tex0_anim0_t10" = 10 ticks per
+    /// frame). Default 5, matching the one retail sample.
     public Dictionary<int, int> TextureAnimTicks = new();
 
     /// UV scale of each packed flipbook slot (DecodeGlbTextures): its faces sample only cell 0 of
@@ -160,10 +151,9 @@ public sealed class ImportedModel
     /// Set once RebuildPipeline.ApplyTexAnimUv has rewritten the UVs (Build may run twice).
     public bool AppliedTexAnimUv;
 
-    /// Auto-assigned texture index per glb material (LogicalIndex), used when a material is
-    /// not explicitly named "mat_texN". Pre-assigned deterministically in material
-    /// (LogicalIndex) order, skipping slots taken by explicit mat_texN names — so the
-    /// glb's materials array order IS the slot order, independent of node/mesh iteration.
+    /// Auto-assigned texture index per glb material (LogicalIndex), for materials not named
+    /// "mat_texN". Assigned in LogicalIndex order, skipping slots taken by explicit mat_texN
+    /// names, so the glb's materials array order is the slot order.
     public Dictionary<int, int> MaterialTexAuto = new();
 
     /// Dense renumbering of explicitly named "mat_texN" materials, for CUSTOM (non-extracted)
@@ -208,19 +198,18 @@ public sealed class ImportedModel
     public List<string> TexSlotWarnings = new();
 
     /// Skinned vertices of an extracted glb that kept their game influences, and those that
-    /// carried them but no longer matched (edited elsewhere) and were derived from Pos.
+    /// carried them but no longer matched (edited elsewhere) and were derived from Position.
     public int GameVertices;
     public int GameVerticesDropped;
 
-    /// Set by RebuildPipeline.ApplyTexMerges after it rewrites primitive UVs/TexIdx for
-    /// UV-atlas slot merging; guards against double-applying when Build runs twice on the
-    /// same instance. Carries the merge plan (base slot -> member slots in band order).
+    /// Set by RebuildPipeline.ApplyTexMerges after it rewrites primitive UVs/TextureIndex for
+    /// UV-atlas slot merging (guards against applying twice when Build runs twice). Holds the
+    /// merge plan: base slot -> member slots in band order.
     public List<(int BaseSlot, List<int> MemberSlots)>? AppliedTexMerges;
 
-    /// True for GLBs produced by this project's extractor. Extracted GLBs contain an
-    /// `MrgRoot` wrapper and already have skinned positions baked into the extractor's
-    /// round-trip coordinate space, so the importer must not treat them like generic
-    /// Blender/Sketchfab GLBs.
+    /// True for GLBs produced by this project's extractor: they contain an `MrgRoot` wrapper
+    /// and have skinned positions already baked into the extractor's round-trip coordinate
+    /// space, so they are not handled like generic Blender/Sketchfab GLBs.
     public bool IsDotrExtractedGlb;
 
     /// Inverse of the extractor's MrgRoot world, when RebuildPipeline.PrepareRoot dropped it
@@ -236,493 +225,462 @@ public static class GlbImporter
 
     private static ImportedModel FromModel(ModelRoot model)
     {
-        var im = new ImportedModel
+        var importedModel = new ImportedModel
         {
-            IsDotrExtractedGlb = model.LogicalNodes.Any(n =>
-                string.Equals(n.Name, "MrgRoot", StringComparison.Ordinal))
+            IsDotrExtractedGlb = model.LogicalNodes.Any(node =>
+                string.Equals(node.Name, "MrgRoot", StringComparison.Ordinal))
         };
 
-        // --- nodes / hierarchy ---
-        var byLogical = new Dictionary<int, int>(); // logical index -> position in im.Nodes
-        foreach (var n in model.LogicalNodes)
+        var byLogical = new Dictionary<int, int>(); // logical index -> position in importedModel.Nodes
+        foreach (var gltfNode in model.LogicalNodes)
         {
-            var lt = n.LocalTransform;
+            var localTransform = gltfNode.LocalTransform;
             var node = new ImportedNode
             {
-                Index = n.LogicalIndex,
-                Name = n.Name ?? "",
-                Translation = lt.Translation,
-                Rotation = lt.Rotation,
-                Scale = lt.Scale,
-                WorldMatrix = WorldOf(n),
+                Index = gltfNode.LogicalIndex,
+                Name = gltfNode.Name ?? "",
+                Translation = localTransform.Translation,
+                Rotation = localTransform.Rotation,
+                Scale = localTransform.Scale,
+                WorldMatrix = WorldOf(gltfNode),
             };
-            byLogical[n.LogicalIndex] = im.Nodes.Count;
-            im.Nodes.Add(node);
+            byLogical[gltfNode.LogicalIndex] = importedModel.Nodes.Count;
+            importedModel.Nodes.Add(node);
         }
-        foreach (var n in model.LogicalNodes)
+        foreach (var gltfNode in model.LogicalNodes)
         {
-            var node = im.Nodes[byLogical[n.LogicalIndex]];
-            node.Parent = n.VisualParent != null ? n.VisualParent.LogicalIndex : -1;
-            if (node.Parent < 0) im.RootNodes.Add(node.Index);
-            foreach (var c in n.VisualChildren) node.Children.Add(c.LogicalIndex);
+            var node = importedModel.Nodes[byLogical[gltfNode.LogicalIndex]];
+            node.Parent = gltfNode.VisualParent != null ? gltfNode.VisualParent.LogicalIndex : -1;
+            if (node.Parent < 0) importedModel.RootNodes.Add(node.Index);
+            foreach (var child in gltfNode.VisualChildren) node.Children.Add(child.LogicalIndex);
         }
 
-        // --- extracted `_bone` scale nodes (ModelExtractor.WriteGlb) ---
-        // A slot node's accumulated scale rides a `_bone` child so that, as in RH0, it reaches
-        // only that node's own matrix. Fold each one back into its node: the RH0 tree has no
-        // such node, and the skin joint and any rigid mesh on it belong to the node.
-        // RebuildPipeline reads the child's scale (rest and animated) as the node's
-        // accumulated scale.
+        /* Extracted `_bone` scale nodes (ModelExtractor.WriteGlb): a slot node's accumulated
+           scale rides a `_bone` child so that, as in RH0, it reaches only that node's own
+           matrix. Each is folded back into its node (the RH0 tree has no such node); the skin
+           joint and any rigid mesh on it belong to the node. RebuildPipeline reads the child's
+           scale (rest and animated) as the node's accumulated scale. */
         var boneOwner = new Dictionary<int, int>(); // `_bone` glb index -> owning node
-        if (im.IsDotrExtractedGlb)
+        if (importedModel.IsDotrExtractedGlb)
         {
-            foreach (var n in im.Nodes)
+            foreach (var importedNode in importedModel.Nodes)
             {
-                if (n.Parent < 0 || n.Children.Count != 0) continue;
-                if (!System.Text.RegularExpressions.Regex.IsMatch(n.Name, @"_bone(?:\.\d+)?$")) continue;
-                var owner = im.Nodes[byLogical[n.Parent]];
+                if (importedNode.Parent < 0 || importedNode.Children.Count != 0) continue;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(importedNode.Name, @"_bone(?:\.\d+)?$")) continue;
+                var owner = importedModel.Nodes[byLogical[importedNode.Parent]];
                 if (owner.ScaleBone >= 0) continue;
-                owner.ScaleBone = n.Index;
-                owner.Children.Remove(n.Index);
-                boneOwner[n.Index] = owner.Index;
+                owner.ScaleBone = importedNode.Index;
+                owner.Children.Remove(importedNode.Index);
+                boneOwner[importedNode.Index] = owner.Index;
             }
         }
-        int Owner(int g) => boneOwner.TryGetValue(g, out int o) ? o : g;
+        int OwnerOf(int glbIndex) => boneOwner.TryGetValue(glbIndex, out int ownerIndex) ? ownerIndex : glbIndex;
 
-        // --- skin joints ---
         if (model.LogicalSkins.Count > 0)
         {
             var skin = model.LogicalSkins[0];
             for (int i = 0; i < skin.JointsCount; i++)
             {
                 var (joint, inverseBind) = skin.GetJoint(i);
-                int idx = Owner(joint.LogicalIndex);
-                im.JointNodeIndices.Add(idx);
-                im.Nodes[byLogical[idx]].IsJoint = true;
-                // A `_bone` joint is bound where its part is visible, which for a part at
-                // scale 0 at rest is not the rest pose: take the bind from the skin.
-                if (idx != joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out var bindWorld))
-                    im.JointBind[idx] = bindWorld;
-                // Any other joint whose bind pose is not its rest pose (DoD exports: every
-                // joint is bound away from the node rest values) must encode its vertices
-                // against the bind, or the mesh is skinned with the wrong offsets and limbs
-                // stretch once the motion moves them.
-                else if (idx == joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out bindWorld) &&
+                int jointOwner = OwnerOf(joint.LogicalIndex);
+                importedModel.JointNodeIndices.Add(jointOwner);
+                importedModel.Nodes[byLogical[jointOwner]].IsJoint = true;
+                // A `_bone` joint is bound where its part is visible, not at the scale-0 rest pose.
+                if (jointOwner != joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out var bindWorld))
+                    importedModel.JointBind[jointOwner] = bindWorld;
+                /* A joint whose bind pose is not its rest pose (DoD exports bind every joint away
+                   from the node rest values) must encode its vertices against the bind, or limbs
+                   stretch once the motion moves them. */
+                else if (jointOwner == joint.LogicalIndex && Matrix4x4.Invert(inverseBind, out bindWorld) &&
                          !NearlyEqual(bindWorld, joint.WorldMatrix))
-                    im.JointBind[idx] = bindWorld;
+                    importedModel.JointBind[jointOwner] = bindWorld;
             }
         }
 
-        // --- animations: every channel resampled at every integer frame ---
-        // Sampling with each sampler's own interpolation turns STEP and CUBICSPLINE into
-        // plain per-frame values (CUBICSPLINE outputs are tangent/value/tangent triplets,
-        // which must never be read as keys), and lets RebuildPipeline fit the game's key
-        // lists (per-axis Euler lerp, a list under 3 keys plays key 0 only) to the motion
-        // rather than copying glTF keys one for one.
-        // CreateCurveSampler(true) copies the keys out once; without it every sample re-reads
-        // the accessors (card 60: 1 s instead of 17 ms).
+        /* Every channel is resampled at every integer frame with its sampler's own interpolation.
+           This turns STEP and CUBICSPLINE into plain per-frame values (CUBICSPLINE outputs are
+           tangent/value/tangent triplets, never keys) and lets RebuildPipeline fit the game's
+           key lists (per-axis Euler lerp, a list under 3 keys plays key 0 only) to the motion.
+           CreateCurveSampler(true) copies the keys out once; without it every sample re-reads
+           the accessors (card 60: 1 s instead of 17 ms). */
         foreach (var anim in model.LogicalAnimations)
         {
             int frames = (int)MathF.Round(anim.Duration * AnimFps) + 1;
-            var ia = new ImportedAnimation { Name = anim.Name ?? "", FrameCount = frames };
-            foreach (var ch in anim.Channels)
+            var importedAnimation = new ImportedAnimation { Name = anim.Name ?? "", FrameCount = frames };
+            foreach (var channel in anim.Channels)
             {
-                if (ch.TargetNode == null) continue;
-                int node = ch.TargetNode.LogicalIndex;
-                if (!ia.Channels.TryGetValue(node, out var c)) { c = new ImportedAnimChannel(); ia.Channels[node] = c; }
-                switch (ch.TargetNodePath)
+                if (channel.TargetNode == null) continue;
+                int node = channel.TargetNode.LogicalIndex;
+                if (!importedAnimation.Channels.TryGetValue(node, out var channels)) { channels = new ImportedAnimChannel(); importedAnimation.Channels[node] = channels; }
+                switch (channel.TargetNodePath)
                 {
                     case PropertyPath.translation:
-                        c.Translation = Resample(ch.GetTranslationSampler()?.CreateCurveSampler(true), frames);
+                        channels.Translation = Resample(channel.GetTranslationSampler()?.CreateCurveSampler(true), frames);
                         break;
                     case PropertyPath.rotation:
-                        c.Rotation = Resample(ch.GetRotationSampler()?.CreateCurveSampler(true), frames);
+                        channels.Rotation = Resample(channel.GetRotationSampler()?.CreateCurveSampler(true), frames);
                         break;
                     case PropertyPath.scale:
-                        c.Scale = Resample(ch.GetScaleSampler()?.CreateCurveSampler(true), frames);
+                        channels.Scale = Resample(channel.GetScaleSampler()?.CreateCurveSampler(true), frames);
                         break;
                 }
             }
             // no node channel (e.g. texture-scroll animations through KHR_animation_pointer): not a motion
-            if (ia.Channels.Count == 0) continue;
-            im.Animations.Add(ia);
+            if (importedAnimation.Channels.Count == 0) continue;
+            importedModel.Animations.Add(importedAnimation);
         }
 
-        // Rigid extractor output (ModelExtractor.WriteGlb's rigid mode): no skin; each bone's
-        // mesh sits on the bone's own node, which carries a `_m<slot>` name suffix. Rebuild the
-        // joint set the skinned export would have declared - every slot node, in slot order -
-        // so the pipeline sees the same shape (joint nodes, not mesh nodes) and a round trip
-        // keeps the original matrix slots, including slots with no geometry.
-        bool rigidDotr = im.IsDotrExtractedGlb && model.LogicalSkins.Count == 0;
+        /* Rigid extractor output (ModelExtractor.WriteGlb's rigid mode) has no skin; each bone's
+           mesh sits on the bone's own node, named with a `_m<slot>` suffix. The joint set the
+           skinned export would declare (every slot node, in slot order) is rebuilt, so a round
+           trip keeps the original matrix slots, including slots with no geometry. */
+        bool rigidDotr = importedModel.IsDotrExtractedGlb && model.LogicalSkins.Count == 0;
         if (rigidDotr)
         {
             var slotted = new List<(int Slot, int Node)>();
-            foreach (var n in model.LogicalNodes)
+            foreach (var gltfNode in model.LogicalNodes)
             {
-                var m = System.Text.RegularExpressions.Regex.Match(n.Name ?? "", @"_m(\d+)(?:\.\d+)?$");
-                if (m.Success) slotted.Add((int.Parse(m.Groups[1].Value), n.LogicalIndex));
+                var slotMatch = System.Text.RegularExpressions.Regex.Match(gltfNode.Name ?? "", @"_m(\d+)(?:\.\d+)?$");
+                if (slotMatch.Success) slotted.Add((int.Parse(slotMatch.Groups[1].Value), gltfNode.LogicalIndex));
             }
-            foreach (var (_, idx) in slotted.OrderBy(s => s.Slot))
+            foreach (var (_, nodeIndex) in slotted.OrderBy(entry => entry.Slot))
             {
-                im.JointNodeIndices.Add(idx);
-                im.Nodes[byLogical[idx]].IsJoint = true;
+                importedModel.JointNodeIndices.Add(nodeIndex);
+                importedModel.Nodes[byLogical[nodeIndex]].IsJoint = true;
             }
         }
 
-        // --- deterministic auto texture-slot assignment (material LogicalIndex order) ---
-        // Explicitly named mat_texN materials own their slots; every other material gets
-        // the next free slot in materials-array order. Doing this as a pre-pass (instead
-        // of first-seen-during-node-iteration) makes the material -> slot mapping stable
-        // and predictable from the glb alone.
-        //
-        // A slot number indexes the template model's RH2 blocks, and a slot nothing supplies
-        // costs a 9 KB white placeholder (Rh0Assembler), so a gap is pure waste. An extracted
-        // glb's mat_texN numbers ARE the retail slot numbers, so they are kept exactly and a
-        // round trip is unchanged. A custom glb's numbers are only the author's labels, so
-        // they are compacted to a dense 0..k-1 in ascending mat_texN order; unnamed materials
-        // then take k, k+1, ... in materials-array order as before (sharing a slot when they
-        // share a base-colour image or flat colour). A duplicate or out-of-range mat_texN is
-        // reported in TexSlotWarnings.
-        // mat_texN label -> dense slot for a custom glb (empty for an extracted one). The
-        // "tex{N}_anim{frame}" pass below is keyed by the same author labels, so it has to
-        // follow the same remap.
+        /* Auto texture-slot assignment, a pre-pass in material LogicalIndex order so the
+           material -> slot mapping depends on the glb alone. Explicitly named mat_texN
+           materials own their slots; every other material gets the next free slot.
+
+           A slot number indexes the template model's RH2 blocks, and a slot nothing supplies
+           costs a 9 KB white placeholder (Rh0Assembler), so a gap is pure waste. An extracted
+           glb's mat_texN numbers are the retail slot numbers and are kept exactly. A custom
+           glb's numbers are only the author's labels, so they are compacted to a dense 0..k-1
+           in ascending mat_texN order; unnamed materials then take k, k+1, ... (sharing a slot
+           when they share a base-colour image or flat colour). A duplicate or out-of-range
+           mat_texN is reported in TexSlotWarnings.
+           texLabelRemap maps mat_texN label -> dense slot for a custom glb (empty for an
+           extracted one); the "tex{N}_anim{frame}" pass below uses the same author labels and
+           follows the same remap. */
         var texLabelRemap = new Dictionary<int, int>();
         {
             var explicitSlot = new Dictionary<int, int>();  // material LogicalIndex -> mat_texN
-            // mat_texN -> first material naming it and its image/colour. Several materials on
-            // one slot is normal (retail splits a slot by alpha/GS state, and the extractor
-            // writes one material per page), but two DIFFERENT images on one slot is a real
-            // clash: only the first is harvested into TextureImages, the other is dropped.
+            /* mat_texN -> first material naming it and its image/colour. Several materials on one
+               slot is normal (retail splits a slot by alpha/GS state; the extractor writes one
+               material per page), but two different images on one slot clash: only the first is
+               harvested into TextureImages. */
             var firstOwner = new Dictionary<int, (int Mat, string Key)>();
-            foreach (var m in model.LogicalMaterials)
+            foreach (var material in model.LogicalMaterials)
             {
-                if (!TryParseMatTexIndex(m.Name, out int t)) continue;
-                if (t < 0 || t > MaxTexSlot)
-                    im.TexSlotWarnings.Add($"material {m.LogicalIndex} \"{m.Name}\": texture slot {t} is out of range 0..{MaxTexSlot}");
-                string key = MaterialShareKey(m);
-                if (firstOwner.TryGetValue(t, out var first))
+                if (!TryParseMatTexIndex(material.Name, out int slot)) continue;
+                if (slot < 0 || slot > MaxTexSlot)
+                    importedModel.TexSlotWarnings.Add($"material {material.LogicalIndex} \"{material.Name}\": texture slot {slot} is out of range 0..{MaxTexSlot}");
+                string key = MaterialShareKey(material);
+                if (firstOwner.TryGetValue(slot, out var first))
                 {
                     if (first.Key != key)
-                        im.TexSlotWarnings.Add($"material {m.LogicalIndex} \"{m.Name}\": texture slot {t} already holds a different image from material {first.Mat}; only material {first.Mat}'s image is imported");
+                        importedModel.TexSlotWarnings.Add($"material {material.LogicalIndex} \"{material.Name}\": texture slot {slot} already holds a different image from material {first.Mat}; only material {first.Mat}'s image is imported");
                 }
-                else firstOwner[t] = (m.LogicalIndex, key);
-                explicitSlot[m.LogicalIndex] = t;
+                else firstOwner[slot] = (material.LogicalIndex, key);
+                explicitSlot[material.LogicalIndex] = slot;
             }
-            if (!im.IsDotrExtractedGlb && explicitSlot.Count != 0)
+            if (!importedModel.IsDotrExtractedGlb && explicitSlot.Count != 0)
             {
                 // custom glb: compact the named slots (an out-of-range one lands in range here)
                 var compact = new Dictionary<int, int>();
                 int dense = 0;
-                foreach (int s in new SortedSet<int>(explicitSlot.Values)) compact[s] = dense++;
-                foreach (var kv in explicitSlot)
-                    if (compact[kv.Value] != kv.Value) im.MatTexRemap[kv.Key] = compact[kv.Value];
-                foreach (var kv in compact)
-                    if (kv.Key != kv.Value) texLabelRemap[kv.Key] = kv.Value;
+                foreach (int slot in new SortedSet<int>(explicitSlot.Values)) compact[slot] = dense++;
+                foreach (var entry in explicitSlot)
+                    if (compact[entry.Value] != entry.Value) importedModel.MatTexRemap[entry.Key] = compact[entry.Value];
+                foreach (var entry in compact)
+                    if (entry.Key != entry.Value) texLabelRemap[entry.Key] = entry.Value;
             }
-            foreach (var w in im.TexSlotWarnings) Console.Error.WriteLine("GlbImporter: " + w);
-            // the slots the named materials hold after that remap; auto assignment steps over them
+            foreach (var warning in importedModel.TexSlotWarnings) Console.Error.WriteLine("GlbImporter: " + warning);
+            // slots held by named materials after the remap; auto assignment skips them
             var explicitSlots = new HashSet<int>();
-            foreach (var kv in explicitSlot)
-                explicitSlots.Add(im.MatTexRemap.TryGetValue(kv.Key, out int d) ? d : kv.Value);
+            foreach (var entry in explicitSlot)
+                explicitSlots.Add(importedModel.MatTexRemap.TryGetValue(entry.Key, out int remapped) ? remapped : entry.Value);
             int nextAuto = 0;
             var slotByKey = new Dictionary<string, int>();   // image/colour dedupe
-            foreach (var m in model.LogicalMaterials)
+            foreach (var material in model.LogicalMaterials)
             {
-                if (explicitSlot.ContainsKey(m.LogicalIndex)) continue;
-                if (IsUntexturedMaterial(m.Name)) continue;   // draws with TME off: no slot of its own
-                // A custom glb's flat-colour material (no base-colour texture) is handled the
-                // same way by ParseMaterial - drawn with TME off, its colour carried as the
-                // page colour - so it must not be counted here either.
-                if (!HasBaseColorTexture(m)) continue;
-                // materials sharing the same base-colour image (or the same flat colour)
-                // share one texture slot - texture slots are a scarce resource (template
-                // RH2 count) and duplicating identical images wastes them
-                string key = MaterialShareKey(m);
+                if (explicitSlot.ContainsKey(material.LogicalIndex)) continue;
+                if (IsUntexturedMaterial(material.Name)) continue;   // draws with TME off: no slot of its own
+                // A flat-colour material (no base-colour texture) is drawn with TME off, its colour
+                // carried as the page colour (ParseMaterial), so it takes no slot either.
+                if (!HasBaseColorTexture(material)) continue;
+                // materials with the same base-colour image or flat colour share one slot (slots are scarce)
+                string key = MaterialShareKey(material);
                 if (slotByKey.TryGetValue(key, out int shared))
                 {
-                    im.MaterialTexAuto[m.LogicalIndex] = shared;
+                    importedModel.MaterialTexAuto[material.LogicalIndex] = shared;
                     continue;
                 }
                 while (explicitSlots.Contains(nextAuto)) nextAuto++;
                 slotByKey[key] = nextAuto;
-                im.MaterialTexAuto[m.LogicalIndex] = nextAuto++;
+                importedModel.MaterialTexAuto[material.LogicalIndex] = nextAuto++;
             }
         }
 
-        // --- mesh primitives (iterated per node instance, so the node transform is known) ---
-        // Skinned prims: vertices are already in skin space (glTF ignores the node transform
-        // for skinned meshes) -> keep as-is, influences come from JOINTS_0/WEIGHTS_0.
-        // Unskinned prims (static models like props/vehicles): bake the node's world
-        // transform into the vertices and rig them rigidly to that node, so the pipeline can
-        // treat every vertex uniformly (the node becomes a one-bone "joint" downstream).
+        /* Mesh primitives, iterated per node instance so the node transform is known.
+           Skinned prims: vertices are already in skin space (glTF ignores the node transform
+           for skinned meshes), so they are kept as-is; influences come from JOINTS_0/WEIGHTS_0.
+           Unskinned prims (static props/vehicles): the node's world transform is baked into the
+           vertices and they are rigged rigidly to that node (a one-bone "joint" downstream). */
         foreach (var meshNode in model.LogicalNodes)
         {
             if (meshNode.Mesh == null) continue;
             // a rigid mesh on an extracted `_bone` belongs to the bone's node
-            int meshOwner = Owner(meshNode.LogicalIndex);
-            // A rigid-extract joint keeps joint-only status (as in the skinned export), so the
-            // root/wrapper detection in RebuildPipeline treats both export shapes alike.
+            int meshOwner = OwnerOf(meshNode.LogicalIndex);
+            // A rigid-extract joint keeps joint-only status, as in the skinned export (RebuildPipeline root detection).
             if (byLogical.TryGetValue(meshOwner, out int meshNodePos)
-                && !(rigidDotr && im.Nodes[meshNodePos].IsJoint))
-                im.Nodes[meshNodePos].HasMesh = true;
+                && !(rigidDotr && importedModel.Nodes[meshNodePos].IsJoint))
+                importedModel.Nodes[meshNodePos].HasMesh = true;
             bool nodeSkinned = meshNode.Skin != null;
             Matrix4x4 nodeWorld = WorldOf(meshNode);
             if (!nodeSkinned)
             {
-                // A node at scale 0 is how DotR models keep a part hidden until a motion
-                // scales it up (Meteor Dragon's head and limbs), so it is not dropped: its
-                // vertices are bound at the first animation frame where it is visible, and
-                // the pipeline encodes them against that same matrix. Only a node that is
-                // invisible in every frame is skipped.
-                var bind = FirstVisibleWorld(im, meshNode.LogicalIndex, nodeWorld);
+                /* A node at scale 0 is how DotR models hide a part until a motion scales it up
+                   (Meteor Dragon's head and limbs). Its vertices are bound at the first animation
+                   frame where it is visible, and the pipeline encodes them against that matrix.
+                   Only a node invisible in every frame is skipped. */
+                var bind = FirstVisibleWorld(importedModel, meshNode.LogicalIndex, nodeWorld);
                 if (bind is not { } bindWorld) continue;
                 if (meshOwner != meshNode.LogicalIndex || bindWorld != nodeWorld)
-                    im.JointBind[meshOwner] = bindWorld;
+                    importedModel.JointBind[meshOwner] = bindWorld;
                 nodeWorld = bindWorld;
             }
             foreach (var prim in meshNode.Mesh.Primitives)
             {
-                var ip = new ImportedPrimitive { NodeIndex = meshOwner };
-                ParseMaterial(prim.Material, ip, im);
+                var importedPrimitive = new ImportedPrimitive { NodeIndex = meshOwner };
+                ParseMaterial(prim.Material, importedPrimitive, importedModel);
 
-                var pos = prim.GetVertexAccessor("POSITION")?.AsVector3Array();
-                if (pos == null) continue; // nothing to do without positions
-                var nrm = prim.GetVertexAccessor("NORMAL")?.AsVector3Array();
-                var uv = prim.GetVertexAccessor("TEXCOORD_0")?.AsVector2Array();
-                var jnt = prim.GetVertexAccessor("JOINTS_0")?.AsVector4Array();
-                var wgt = prim.GetVertexAccessor("WEIGHTS_0")?.AsVector4Array();
+                var positions = prim.GetVertexAccessor("POSITION")?.AsVector3Array();
+                if (positions == null) continue;
+                var normals = prim.GetVertexAccessor("NORMAL")?.AsVector3Array();
+                var uvs = prim.GetVertexAccessor("TEXCOORD_0")?.AsVector2Array();
+                var joints0 = prim.GetVertexAccessor("JOINTS_0")?.AsVector4Array();
+                var weights0 = prim.GetVertexAccessor("WEIGHTS_0")?.AsVector4Array();
                 // a vertex may carry up to 8 influences (ModelExtractor writes a second set)
-                var jnt1 = prim.GetVertexAccessor("JOINTS_1")?.AsVector4Array();
-                var wgt1 = prim.GetVertexAccessor("WEIGHTS_1")?.AsVector4Array();
+                var joints1 = prim.GetVertexAccessor("JOINTS_1")?.AsVector4Array();
+                var weights1 = prim.GetVertexAccessor("WEIGHTS_1")?.AsVector4Array();
 
-                bool skinnedPrim = nodeSkinned && jnt != null && wgt != null;
-                int vcount = pos.Count;
-                var game = skinnedPrim && im.IsDotrExtractedGlb ? GameAccessors(prim) : null;
-                for (int v = 0; v < vcount; v++)
+                bool skinnedPrim = nodeSkinned && joints0 != null && weights0 != null;
+                int vertexCount = positions.Count;
+                var game = skinnedPrim && importedModel.IsDotrExtractedGlb ? GameAccessors(prim) : null;
+                for (int vertexIndex = 0; vertexIndex < vertexCount; vertexIndex++)
                 {
-                    var iv = new ImportedVertex();
+                    var vertex = new ImportedVertex();
                     if (skinnedPrim)
                     {
-                        // Skinned vertex positions must stay in skin/bind space for the encoder.
-                        // Baking the mesh node world matrix here can make the skeleton/rest basis
-                        // disagree with the vertices, causing 90-degree rotation or broken animation
-                        // on external Armature-rooted GLBs.
-                        iv.Pos = pos[v];
-                        iv.Normal = nrm != null ? SafeNormalize(nrm[v]) : Vector3.UnitY;
-                        iv.FramePos = iv.Pos;
+                        /* Skinned positions stay in skin/bind space; baking the mesh node world matrix
+                           here makes the skeleton/rest basis disagree with the vertices (90-degree
+                           rotation or broken animation on external Armature-rooted GLBs). */
+                        vertex.Position = positions[vertexIndex];
+                        vertex.Normal = normals != null ? SafeNormalize(normals[vertexIndex]) : Vector3.UnitY;
+                        vertex.FramePos = vertex.Position;
                     }
                     else
                     {
-                        // Static/unskinned meshes are rigidly attached to their mesh node, so bake
-                        // the node world transform directly into the encoded vertices.
-                        iv.Pos = Vector3.Transform(pos[v], nodeWorld);
-                        iv.FramePos = iv.Pos;
-                        iv.Normal = nrm != null ? SafeNormalize(Vector3.TransformNormal(nrm[v], nodeWorld)) : Vector3.UnitY;
+                        // unskinned: rigid on the mesh node, so bake its world transform
+                        vertex.Position = Vector3.Transform(positions[vertexIndex], nodeWorld);
+                        vertex.FramePos = vertex.Position;
+                        vertex.Normal = normals != null ? SafeNormalize(Vector3.TransformNormal(normals[vertexIndex], nodeWorld)) : Vector3.UnitY;
                     }
-                    iv.Uv = uv != null ? uv[v] : Vector2.Zero;
+                    vertex.Uv = uvs != null ? uvs[vertexIndex] : Vector2.Zero;
 
                     if (skinnedPrim)
                     {
-                        var j = jnt[v]; var w = wgt[v];
-                        AddInfluence(iv, im, (int)j.X, w.X);
-                        AddInfluence(iv, im, (int)j.Y, w.Y);
-                        AddInfluence(iv, im, (int)j.Z, w.Z);
-                        AddInfluence(iv, im, (int)j.W, w.W);
-                        if (jnt1 != null && wgt1 != null)
+                        var jointIndices = joints0[vertexIndex]; var weights = weights0[vertexIndex];
+                        AddInfluence(vertex, importedModel, (int)jointIndices.X, weights.X);
+                        AddInfluence(vertex, importedModel, (int)jointIndices.Y, weights.Y);
+                        AddInfluence(vertex, importedModel, (int)jointIndices.Z, weights.Z);
+                        AddInfluence(vertex, importedModel, (int)jointIndices.W, weights.W);
+                        if (joints1 != null && weights1 != null)
                         {
-                            var j1 = jnt1[v]; var w1 = wgt1[v];
-                            AddInfluence(iv, im, (int)j1.X, w1.X);
-                            AddInfluence(iv, im, (int)j1.Y, w1.Y);
-                            AddInfluence(iv, im, (int)j1.Z, w1.Z);
-                            AddInfluence(iv, im, (int)j1.W, w1.W);
+                            var jointIndicesSet1 = joints1[vertexIndex]; var weightsSet1 = weights1[vertexIndex];
+                            AddInfluence(vertex, importedModel, (int)jointIndicesSet1.X, weightsSet1.X);
+                            AddInfluence(vertex, importedModel, (int)jointIndicesSet1.Y, weightsSet1.Y);
+                            AddInfluence(vertex, importedModel, (int)jointIndicesSet1.Z, weightsSet1.Z);
+                            AddInfluence(vertex, importedModel, (int)jointIndicesSet1.W, weightsSet1.W);
                         }
                     }
                     else
                     {
-                        iv.Influences.Add(new ImportedInfluence { JointNode = meshOwner, Weight = 1f });
+                        vertex.Influences.Add(new ImportedInfluence { JointNode = meshOwner, Weight = 1f });
                     }
-                    if (game != null && game.Jw[0][v].X >= 0)
+                    if (game != null && game.JointWeights[0][vertexIndex].X >= 0)
                     {
-                        iv.Game = GameInfluences(im, iv, game, v);
-                        if (iv.Game != null) im.GameVertices++;
-                        else im.GameVerticesDropped++;
+                        vertex.Game = GameInfluences(importedModel, vertex, game, vertexIndex);
+                        if (vertex.Game != null) importedModel.GameVertices++;
+                        else importedModel.GameVerticesDropped++;
                     }
-                    ip.Vertices.Add(iv);
+                    importedPrimitive.Vertices.Add(vertex);
                 }
 
-                foreach (var (a, b, c) in prim.GetTriangleIndices())
-                    ip.Triangles.Add((a, b, c));
+                foreach (var (corner0, corner1, corner2) in prim.GetTriangleIndices())
+                    importedPrimitive.Triangles.Add((corner0, corner1, corner2));
 
                 // KHR_texture_transform on the base colour (an atlas cell picked by scale/offset,
                 // as DoD exports do): the GS samples the UVs as they are, so bake it into them.
-                ApplyBaseTextureTransform(prim.Material, ip);
-                ApplyDotrImageUv(prim.Material, ip);
-                if (!im.IsDotrExtractedGlb) ParsePlainAlpha(prim.Material, ip, im);
+                ApplyBaseTextureTransform(prim.Material, importedPrimitive);
+                ApplyDotrImageUv(prim.Material, importedPrimitive);
+                if (!importedModel.IsDotrExtractedGlb) ParsePlainAlpha(prim.Material, importedPrimitive, importedModel);
 
-                // Fold out-of-[0,1] UVs into tiles only on axes the GS really clamps. The
-                // extractor writes the page's GS CLAMP byte into the material name as "_cN"
-                // (ModelExtractor's matName), and a stage model's pages are usually REPEAT on
-                // both axes: there, tiling UVs reproduce exactly (4.12 UV reaches +-8), so
-                // folding them would both change the picture and duplicate every vertex that
-                // straddles a tile - which destroys the adjacency the stripifier needs and
-                // blew section 2/4 up to one strip per triangle on MODEL.MRG scenery. A glb
-                // with no such tag (an outside authoring tool) keeps the old fold on both axes.
+                /* Out-of-[0,1] UVs are folded into tiles only on axes the GS really clamps. The
+                   extractor writes the page's GS CLAMP byte into the material name as "_cN"
+                   (ModelExtractor's matName); a stage model's pages are usually REPEAT on both
+                   axes, where tiling UVs reproduce exactly (4.12 UV reaches +-8). Folding them
+                   would change the picture and duplicate every vertex straddling a tile, which
+                   destroys the adjacency the stripifier needs (section 2/4 became one strip per
+                   triangle on MODEL.MRG scenery). A glb without the tag folds both axes. */
                 bool foldS = true, foldT = true;
                 if (ParseGsClampTag(prim.Material?.Name, out int clampTag))
                 {
                     foldS = (clampTag & 0x3) == 1;
                     foldT = ((clampTag >> 2) & 0x3) == 1;
                 }
-                WrapPrimitiveUvs(ip, foldS, foldT);
+                WrapPrimitiveUvs(importedPrimitive, foldS, foldT);
 
-                im.Primitives.Add(ip);
+                importedModel.Primitives.Add(importedPrimitive);
             }
         }
 
-        // --- animated-texture frame sequences ("tex{N}_anim{frame}" image naming) ---
-        // Scans ALL embedded images, not just ones a material currently references, since
-        // Blender's glTF exporter can leave extra-frame images attached only via the
-        // Image datablock name (only frame 0 needs a real material link so the mesh has
-        // something to preview/shade with in Blender). Purely additive.
+        /* Animated-texture frame sequences ("tex{N}_anim{frame}" image names). All embedded images
+           are scanned, not only those a material references: Blender's glTF exporter can leave
+           extra-frame images attached only via the Image datablock name. */
         {
-            var byTex = new Dictionary<int, List<(int frame, SharpGLTF.Memory.MemoryImage img)>>();
-            var ticksByTex = new Dictionary<int, int>();
-            foreach (var img in model.LogicalImages)
+            var framesByTexture = new Dictionary<int, List<(int frame, SharpGLTF.Memory.MemoryImage img)>>();
+            var ticksByTexture = new Dictionary<int, int>();
+            foreach (var image in model.LogicalImages)
             {
-                if (TryParseAnimImageName(img.Name, out int texIdx, out int frame, out int ticks) && img.Content.IsValid)
+                if (TryParseAnimImageName(image.Name, out int textureIndex, out int frame, out int ticks) && image.Content.IsValid)
                 {
-                    // N is the author's mat_texN label; a custom glb's labels were compacted
-                    // above, so the frames have to move with their slot (an extracted glb's
-                    // table is empty, so its names are kept exactly)
-                    if (texLabelRemap.TryGetValue(texIdx, out int denseTex)) texIdx = denseTex;
-                    // An extracted glb's frames are views of the base image the retail
-                    // records copy from, not a flipbook to repack: keep them aside so the
-                    // records (and the texture's size) stay retail's, and let
-                    // ApplyEditedAnimFrames push an edited frame back into its source cell.
-                    if (im.TextureAnimRecords.ContainsKey(texIdx))
+                    // N is the author's mat_texN label: frames follow their slot's remap (empty for an extracted glb)
+                    if (texLabelRemap.TryGetValue(textureIndex, out int denseTexture)) textureIndex = denseTexture;
+                    /* An extracted glb's frames are views of the base image the retail records copy
+                       from, not a flipbook to repack. They are kept aside so the records and the
+                       texture size stay retail's; ApplyEditedAnimFrames pushes an edited frame
+                       back into its source cell. */
+                    if (importedModel.TextureAnimRecords.ContainsKey(textureIndex))
                     {
-                        if (!im.TextureAnimEditFrames.TryGetValue(texIdx, out var ef))
-                            im.TextureAnimEditFrames[texIdx] = ef = new();
-                        ef[frame] = img.Content;
+                        if (!importedModel.TextureAnimEditFrames.TryGetValue(textureIndex, out var editFrames))
+                            importedModel.TextureAnimEditFrames[textureIndex] = editFrames = new();
+                        editFrames[frame] = image.Content;
                         continue;
                     }
-                    if (!byTex.TryGetValue(texIdx, out var list))
-                        byTex[texIdx] = list = new();
-                    list.Add((frame, img.Content));
-                    if (ticks > 0) ticksByTex[texIdx] = ticks; // last one found wins if multiple frames specify it differently
+                    if (!framesByTexture.TryGetValue(textureIndex, out var frameList))
+                        framesByTexture[textureIndex] = frameList = new();
+                    frameList.Add((frame, image.Content));
+                    if (ticks > 0) ticksByTexture[textureIndex] = ticks; // the last frame that gives one wins
                 }
             }
-            foreach (var (texIdx, frames) in byTex)
+            foreach (var (animatedTexture, frames) in framesByTexture)
             {
-                if (frames.Count < 2) continue; // see TextureAnimFrames remarks - ignore accidental singletons
-                frames.Sort((a, b) => a.frame.CompareTo(b.frame));
-                im.TextureAnimFrames[texIdx] = frames.Select(f => f.img).ToList();
-                if (ticksByTex.TryGetValue(texIdx, out int t)) im.TextureAnimTicks[texIdx] = t;
-                // Frame 0 also becomes (or overrides) the static fallback image for this
-                // slot, so a path that ignores TextureAnimFrames entirely still gets a
-                // sane single texture instead of whatever the material channel happened
-                // to reference.
-                im.TextureImages[texIdx] = frames[0].img;
+                if (frames.Count < 2) continue; // a single frame is a naming accident
+                frames.Sort((first, second) => first.frame.CompareTo(second.frame));
+                importedModel.TextureAnimFrames[animatedTexture] = frames.Select(frame => frame.img).ToList();
+                if (ticksByTexture.TryGetValue(animatedTexture, out int ticks)) importedModel.TextureAnimTicks[animatedTexture] = ticks;
+                // frame 0 is also the slot's static fallback image
+                importedModel.TextureImages[animatedTexture] = frames[0].img;
             }
         }
 
-        return im;
+        return importedModel;
     }
 
     public const float AnimFps = 30f;
 
     // Node.WorldMatrix rejects a node whose local matrix is not invertible; DotR models hide
     // parts with tiny or zero scales (card 83 nests 1e-5 per level down to ~1e-24).
-    private static Matrix4x4 WorldOf(Node n) =>
-        n.VisualParent == null ? n.LocalTransform.Matrix : n.LocalTransform.Matrix * WorldOf(n.VisualParent);
+    private static Matrix4x4 WorldOf(Node node) =>
+        node.VisualParent == null ? node.LocalTransform.Matrix : node.LocalTransform.Matrix * WorldOf(node.VisualParent);
 
-    private static List<(float Time, T V)>? Resample<T>(SharpGLTF.Animations.ICurveSampler<T>? sampler, int frames)
+    private static List<(float Time, T Value)>? Resample<T>(SharpGLTF.Animations.ICurveSampler<T>? sampler, int frames)
     {
         if (sampler == null) return null;
-        var outp = new List<(float, T)>(frames);
-        for (int f = 0; f < frames; f++)
+        var samples = new List<(float, T)>(frames);
+        for (int frame = 0; frame < frames; frame++)
         {
-            float t = f / AnimFps;
-            outp.Add((t, sampler.GetPoint(t)));
+            float time = frame / AnimFps;
+            samples.Add((time, sampler.GetPoint(time)));
         }
-        return outp;
+        return samples;
     }
 
-    /// glb world matrix of node g at a frame of an animation (rest values where it has no
+    /// glb world matrix of the node at a frame of an animation (rest values where it has no
     /// channel); anim == null is the rest pose.
-    public static Matrix4x4 WorldAt(ImportedModel im, int g, ImportedAnimation? anim, int frame)
+    public static Matrix4x4 WorldAt(ImportedModel importedModel, int glbIndex, ImportedAnimation? anim, int frame)
     {
-        var n = im.Nodes[g];
-        var t = n.Translation;
-        var r = n.Rotation;
-        var s = n.Scale;
-        if (anim != null && anim.Channels.TryGetValue(g, out var c))
+        var node = importedModel.Nodes[glbIndex];
+        var translation = node.Translation;
+        var rotation = node.Rotation;
+        var scale = node.Scale;
+        if (anim != null && anim.Channels.TryGetValue(glbIndex, out var channels))
         {
-            if (c.Translation is { Count: > 0 } ct) t = ct[Math.Min(frame, ct.Count - 1)].V;
-            if (c.Rotation is { Count: > 0 } cr) r = cr[Math.Min(frame, cr.Count - 1)].Q;
-            if (c.Scale is { Count: > 0 } cs) s = cs[Math.Min(frame, cs.Count - 1)].V;
+            if (channels.Translation is { Count: > 0 } translationKeys) translation = translationKeys[Math.Min(frame, translationKeys.Count - 1)].Value;
+            if (channels.Rotation is { Count: > 0 } rotationKeys) rotation = rotationKeys[Math.Min(frame, rotationKeys.Count - 1)].Rotation;
+            if (channels.Scale is { Count: > 0 } scaleKeys) scale = scaleKeys[Math.Min(frame, scaleKeys.Count - 1)].Value;
         }
-        var local = Matrix4x4.CreateScale(s) * Matrix4x4.CreateFromQuaternion(r) * Matrix4x4.CreateTranslation(t);
-        return n.Parent < 0 ? local : local * WorldAt(im, n.Parent, anim, frame);
+        var local = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation);
+        return node.Parent < 0 ? local : local * WorldAt(importedModel, node.Parent, anim, frame);
     }
 
     /// The rest world matrix if it is invertible, else the first animation frame's that is;
     /// null when the node is at scale 0 in every frame.
-    private static Matrix4x4? FirstVisibleWorld(ImportedModel im, int g, Matrix4x4 rest)
+    private static Matrix4x4? FirstVisibleWorld(ImportedModel importedModel, int glbIndex, Matrix4x4 rest)
     {
         if (!IsSingular(rest)) return rest;
-        foreach (var anim in im.Animations)
-            for (int f = 0; f < anim.FrameCount; f++)
+        foreach (var anim in importedModel.Animations)
+            for (int frame = 0; frame < anim.FrameCount; frame++)
             {
-                var w = WorldAt(im, g, anim, f);
-                if (!IsSingular(w)) return w;
+                var world = WorldAt(importedModel, glbIndex, anim, frame);
+                if (!IsSingular(world)) return world;
             }
         return null;
     }
 
     /// Scale 0 on some axis. Relative to the largest axis, since DotR worlds carry the model's
     /// root scale (often ~1e-3) and an absolute determinant test would trip on whole models.
-    public static bool IsSingular(Matrix4x4 m)
+    public static bool IsSingular(Matrix4x4 matrix)
     {
-        float a = new Vector3(m.M11, m.M12, m.M13).Length();
-        float b = new Vector3(m.M21, m.M22, m.M23).Length();
-        float c = new Vector3(m.M31, m.M32, m.M33).Length();
-        float max = Math.Max(a, Math.Max(b, c));
-        return !(max > 0f) || Math.Min(a, Math.Min(b, c)) < max * 1e-6f;
+        float row1Length = new Vector3(matrix.M11, matrix.M12, matrix.M13).Length();
+        float row2Length = new Vector3(matrix.M21, matrix.M22, matrix.M23).Length();
+        float row3Length = new Vector3(matrix.M31, matrix.M32, matrix.M33).Length();
+        float largest = Math.Max(row1Length, Math.Max(row2Length, row3Length));
+        return !(largest > 0f) || Math.Min(row1Length, Math.Min(row2Length, row3Length)) < largest * 1e-6f;
     }
 
-    /// Matches image names of the form "tex{N}_anim{frame}" (case-insensitive), with an
-    /// optional trailing "_tN" tick-rate suffix, e.g. "tex1_anim0", "tex1_anim0_t10"
-    /// (10 ticks/frame hold time), "TEX2_ANIM03_T3". N, frame, and the tick count are
-    /// plain non-negative integers. Returns false for anything else, including the
-    /// unrelated "mat_texN" material-naming convention (different prefix, different
-    /// purpose). `ticks` is -1 when no "_tN" suffix is present (caller should fall back
-    /// to a default in that case, not treat -1 as a real value).
-    private static bool TryParseAnimImageName(string? name, out int texIdx, out int frame, out int ticks)
+    /// Matches image names "tex{N}_anim{frame}" (case-insensitive) with an optional trailing
+    /// "_tN" tick-rate suffix: "tex1_anim0", "tex1_anim0_t10", "TEX2_ANIM03_T3". N, frame and
+    /// the tick count are plain non-negative integers. `ticks` is -1 when there is no suffix.
+    private static bool TryParseAnimImageName(string? name, out int textureIndex, out int frame, out int ticks)
     {
-        texIdx = -1; frame = -1; ticks = -1;
+        textureIndex = -1; frame = -1; ticks = -1;
         if (string.IsNullOrEmpty(name)) return false;
-        int p = name.IndexOf("tex", StringComparison.OrdinalIgnoreCase);
-        if (p < 0) return false;
-        int i = p + 3, texStart = i;
-        while (i < name.Length && char.IsDigit(name[i])) i++;
-        if (i == texStart) return false;
-        if (!int.TryParse(name.AsSpan(texStart, i - texStart), out texIdx)) return false;
+        int texPosition = name.IndexOf("tex", StringComparison.OrdinalIgnoreCase);
+        if (texPosition < 0) return false;
+        int texCursor = texPosition + 3, texStart = texCursor;
+        while (texCursor < name.Length && char.IsDigit(name[texCursor])) texCursor++;
+        if (texCursor == texStart) return false;
+        if (!int.TryParse(name.AsSpan(texStart, texCursor - texStart), out textureIndex)) return false;
 
-        int a = name.IndexOf("anim", i, StringComparison.OrdinalIgnoreCase);
-        if (a < 0) { texIdx = -1; return false; }
-        int j = a + 4, frameStart = j;
-        while (j < name.Length && char.IsDigit(name[j])) j++;
-        if (j == frameStart) { texIdx = -1; return false; }
-        if (!int.TryParse(name.AsSpan(frameStart, j - frameStart), out frame)) { texIdx = -1; return false; }
+        int animPosition = name.IndexOf("anim", texCursor, StringComparison.OrdinalIgnoreCase);
+        if (animPosition < 0) { textureIndex = -1; return false; }
+        int frameCursor = animPosition + 4, frameStart = frameCursor;
+        while (frameCursor < name.Length && char.IsDigit(name[frameCursor])) frameCursor++;
+        if (frameCursor == frameStart) { textureIndex = -1; return false; }
+        if (!int.TryParse(name.AsSpan(frameStart, frameCursor - frameStart), out frame)) { textureIndex = -1; return false; }
 
         // optional "_tN" suffix anywhere after the frame number
-        int t = name.IndexOf("_t", j, StringComparison.OrdinalIgnoreCase);
-        if (t >= 0)
+        int tickPosition = name.IndexOf("_t", frameCursor, StringComparison.OrdinalIgnoreCase);
+        if (tickPosition >= 0)
         {
-            int k = t + 2, tickStart = k;
-            while (k < name.Length && char.IsDigit(name[k])) k++;
-            if (k > tickStart && int.TryParse(name.AsSpan(tickStart, k - tickStart), out int parsedTicks))
+            int tickCursor = tickPosition + 2, tickStart = tickCursor;
+            while (tickCursor < name.Length && char.IsDigit(name[tickCursor])) tickCursor++;
+            if (tickCursor > tickStart && int.TryParse(name.AsSpan(tickStart, tickCursor - tickStart), out int parsedTicks))
                 ticks = Math.Max(1, parsedTicks);
         }
         return true;
@@ -730,282 +688,266 @@ public static class GlbImporter
 
     // Element-wise compare, tolerance relative to the matrices' largest entry (translations
     // can be large) so float noise in an inverse bind matrix never counts as a different bind.
-    private static bool NearlyEqual(Matrix4x4 a, Matrix4x4 b)
+    private static bool NearlyEqual(Matrix4x4 first, Matrix4x4 second)
     {
-        float mag = 1f, diff = 0f;
-        for (int r = 0; r < 4; r++)
-        for (int c = 0; c < 4; c++)
+        float magnitude = 1f, difference = 0f;
+        for (int row = 0; row < 4; row++)
+        for (int column = 0; column < 4; column++)
         {
-            mag = MathF.Max(mag, MathF.Max(MathF.Abs(a[r, c]), MathF.Abs(b[r, c])));
-            diff = MathF.Max(diff, MathF.Abs(a[r, c] - b[r, c]));
+            magnitude = MathF.Max(magnitude, MathF.Max(MathF.Abs(first[row, column]), MathF.Abs(second[row, column])));
+            difference = MathF.Max(difference, MathF.Abs(first[row, column] - second[row, column]));
         }
-        return diff <= 1e-4f * mag;
+        return difference <= 1e-4f * magnitude;
     }
 
     internal sealed class GameData
     {
-        public IList<Vector3> RefPos = null!;
-        public IList<Vector3>[] Pos = null!;
-        public IList<Vector3>[] Nrm = null!;
-        public IList<Vector2>[] Jw = null!;
+        public IList<Vector3> ReferencePositions = null!;
+        public IList<Vector3>[] Positions = null!;
+        public IList<Vector3>[] Normals = null!;
+        public IList<Vector2>[] JointWeights = null!;
     }
 
     // ModelExtractor's per-influence attributes (VertexTexture1Game), or null without them.
-    // A mesh carries 4 or 8 slots; the slots read are 0.. up to the first absent one.
-    // AnimatedGltfModel skins the preview with them too.
-    internal static GameData? GameAccessors(MeshPrimitive prim)
+    // A mesh carries 4 or 8 slots; slots are read from 0 up to the first absent one.
+    internal static GameData? GameAccessors(MeshPrimitive primitive)
     {
-        var refPos = prim.GetVertexAccessor(VertexTexture1Game.RefPosName);
-        if (refPos == null) return null;
-        var pos = new List<IList<Vector3>>();
-        var nrm = new List<IList<Vector3>>();
-        var jws = new List<IList<Vector2>>();
+        var referencePositions = primitive.GetVertexAccessor(VertexTexture1Game.RefPosName);
+        if (referencePositions == null) return null;
+        var positions = new List<IList<Vector3>>();
+        var normals = new List<IList<Vector3>>();
+        var jointWeights = new List<IList<Vector2>>();
         for (int k = 0; k < VertexTexture1Game.Slots; k++)
         {
-            var p = prim.GetVertexAccessor(VertexTexture1Game.PosName + k);
-            var n = prim.GetVertexAccessor(VertexTexture1Game.NrmName + k);
-            var jw = prim.GetVertexAccessor(VertexTexture1Game.JointWeightName + k);
-            if (p == null && n == null && jw == null) break;
-            if (p == null || n == null || jw == null) return null;
-            pos.Add(p.AsVector3Array());
-            nrm.Add(n.AsVector3Array());
-            jws.Add(jw.AsVector2Array());
+            var positionAccessor = primitive.GetVertexAccessor(VertexTexture1Game.PosName + k);
+            var normalAccessor = primitive.GetVertexAccessor(VertexTexture1Game.NrmName + k);
+            var jointWeightAccessor = primitive.GetVertexAccessor(VertexTexture1Game.JointWeightName + k);
+            if (positionAccessor == null && normalAccessor == null && jointWeightAccessor == null) break;
+            if (positionAccessor == null || normalAccessor == null || jointWeightAccessor == null) return null;
+            positions.Add(positionAccessor.AsVector3Array());
+            normals.Add(normalAccessor.AsVector3Array());
+            jointWeights.Add(jointWeightAccessor.AsVector2Array());
         }
-        if (jws.Count == 0) return null;
-        return new GameData { RefPos = refPos.AsVector3Array(), Pos = pos.ToArray(), Nrm = nrm.ToArray(), Jw = jws.ToArray() };
+        if (jointWeights.Count == 0) return null;
+        return new GameData { ReferencePositions = referencePositions.AsVector3Array(), Positions = positions.ToArray(), Normals = normals.ToArray(), JointWeights = jointWeights.ToArray() };
     }
 
-    // Vertex v's game influences, kept only while they still describe it: every joint a `_bone`
-    // joint (encoded against its bind, so the stored bone-local values are what the importer
-    // would write), the same weight per joint as JOINTS/WEIGHTS, and POSITION still where the
-    // extractor wrote it in the first influence's bone space (an edit made with the bind
-    // matrices, as ExtractedGlbEdit does, keeps that). Otherwise null.
-    private static List<StripWeight>? GameInfluences(ImportedModel im, ImportedVertex iv, GameData g, int v)
+    /* The vertex's game influences, kept only while they still describe it: every joint is a
+       `_bone` joint (encoded against its bind, so the stored bone-local values are what the
+       importer would write), each joint has the same weight as in JOINTS/WEIGHTS, and POSITION
+       is still where the extractor wrote it in the first influence's bone space (an edit made
+       with the bind matrices, as ExtractedGlbEdit does, keeps that). Otherwise null. */
+    private static List<StripWeight>? GameInfluences(ImportedModel importedModel, ImportedVertex vertex, GameData gameData, int vertexIndex)
     {
-        var list = new List<StripWeight>();
-        var gameW = new Dictionary<int, float>();
-        int wsum = 0;
-        for (int k = 0; k < g.Jw.Length && g.Jw[k][v].X >= 0; k++)
+        var influences = new List<StripWeight>();
+        var gameWeights = new Dictionary<int, float>();
+        int weightSum = 0;
+        for (int k = 0; k < gameData.JointWeights.Length && gameData.JointWeights[k][vertexIndex].X >= 0; k++)
         {
-            int j = (int)g.Jw[k][v].X;
-            if (j >= im.JointNodeIndices.Count) return null;
-            int node = im.JointNodeIndices[j];
-            if (!im.JointBind.ContainsKey(node) || im.Nodes[node].ScaleBone < 0) return null;
-            var p = g.Pos[k][v];
-            var n = g.Nrm[k][v];
-            short w = (short)g.Jw[k][v].Y;
-            list.Add(new StripWeight(node, w, ((short)p.X, (short)p.Y, (short)p.Z), ((short)n.X, (short)n.Y, (short)n.Z)));
-            // JOINTS/WEIGHTS hold the positive weights normalised over their sum (retail has a
-            // few negative ones, card 291), so compare against those only.
-            if (w <= 0) continue;
-            gameW[node] = gameW.GetValueOrDefault(node) + w;
-            wsum += w;
+            int skinJoint = (int)gameData.JointWeights[k][vertexIndex].X;
+            if (skinJoint >= importedModel.JointNodeIndices.Count) return null;
+            int node = importedModel.JointNodeIndices[skinJoint];
+            if (!importedModel.JointBind.ContainsKey(node) || importedModel.Nodes[node].ScaleBone < 0) return null;
+            var position = gameData.Positions[k][vertexIndex];
+            var normal = gameData.Normals[k][vertexIndex];
+            short weight = (short)gameData.JointWeights[k][vertexIndex].Y;
+            influences.Add(new StripWeight(node, weight, ((short)position.X, (short)position.Y, (short)position.Z), ((short)normal.X, (short)normal.Y, (short)normal.Z)));
+            // JOINTS/WEIGHTS hold the positive weights normalised over their sum (retail has a few negative ones, card 291)
+            if (weight <= 0) continue;
+            gameWeights[node] = gameWeights.GetValueOrDefault(node) + weight;
+            weightSum += weight;
         }
-        var glbW = new Dictionary<int, float>();
-        foreach (var inf in iv.Influences)
+        var glbWeights = new Dictionary<int, float>();
+        foreach (var influence in vertex.Influences)
         {
-            glbW[inf.JointNode] = glbW.GetValueOrDefault(inf.JointNode) + inf.Weight;
+            glbWeights[influence.JointNode] = glbWeights.GetValueOrDefault(influence.JointNode) + influence.Weight;
         }
-        if (!GameWeightsMatch(gameW, wsum, glbW)) return null;
-        if (!Matrix4x4.Invert(im.JointBind[list[0].Bone], out var inv)) return null;
-        if (!GameRefPosMatches(Vector3.Transform(iv.Pos, inv), g.RefPos[v])) return null;
-        return list;
+        if (!GameWeightsMatch(gameWeights, weightSum, glbWeights)) return null;
+        if (!Matrix4x4.Invert(importedModel.JointBind[influences[0].Bone], out var inverse)) return null;
+        if (!GameRefPosMatches(Vector3.Transform(vertex.Position, inverse), gameData.ReferencePositions[vertexIndex])) return null;
+        return influences;
     }
 
-    // The stored influences' positive raw weights (summing to wsum) per joint, against the
+    // The stored influences' positive raw weights (summing to weightSum) per joint against the
     // glb's JOINTS/WEIGHTS per joint: the same joints, each weight within 1e-3.
-    internal static bool GameWeightsMatch(Dictionary<int, float> gameW, int wsum, Dictionary<int, float> glbW)
+    internal static bool GameWeightsMatch(Dictionary<int, float> gameWeights, int weightSum, Dictionary<int, float> glbWeights)
     {
-        if (wsum <= 0) return false;
-        foreach (var (joint, w) in gameW)
+        if (weightSum <= 0) return false;
+        foreach (var (joint, weight) in gameWeights)
         {
-            if (w > 0 && !glbW.ContainsKey(joint)) return false;
+            if (weight > 0 && !glbWeights.ContainsKey(joint)) return false;
         }
-        foreach (var (joint, w) in glbW)
+        foreach (var (joint, glbWeight) in glbWeights)
         {
-            if (MathF.Abs(w - gameW.GetValueOrDefault(joint) / wsum) > 1e-3f) return false;
+            if (MathF.Abs(glbWeight - gameWeights.GetValueOrDefault(joint) / weightSum) > 1e-3f) return false;
         }
         return true;
     }
 
     // POSITION taken into the first influence's bone space, still where the extractor wrote it.
-    internal static bool GameRefPosMatches(Vector3 inBone, Vector3 refPos) =>
-        Vector3.Distance(inBone, refPos) <= 0.01f + 1e-5f * refPos.Length();
+    internal static bool GameRefPosMatches(Vector3 inBone, Vector3 referencePosition) =>
+        Vector3.Distance(inBone, referencePosition) <= 0.01f + 1e-5f * referencePosition.Length();
 
     // JOINTS_0 holds skin-joint indices; map to the actual glb node index via the skin order.
-    private static void AddInfluence(ImportedVertex iv, ImportedModel im, int skinJointIndex, float weight)
+    private static void AddInfluence(ImportedVertex vertex, ImportedModel importedModel, int skinJointIndex, float weight)
     {
         if (weight <= 0f) return;
-        if (skinJointIndex < 0 || skinJointIndex >= im.JointNodeIndices.Count) return;
-        iv.Influences.Add(new ImportedInfluence { JointNode = im.JointNodeIndices[skinJointIndex], Weight = weight });
+        if (skinJointIndex < 0 || skinJointIndex >= importedModel.JointNodeIndices.Count) return;
+        vertex.Influences.Add(new ImportedInfluence { JointNode = importedModel.JointNodeIndices[skinJointIndex], Weight = weight });
     }
 
-    private static void ParseMaterial(Material? mat, ImportedPrimitive ip, ImportedModel im)
+    private static void ParseMaterial(Material? material, ImportedPrimitive primitive, ImportedModel importedModel)
     {
-        if (mat == null)
+        if (material == null)
         {
-            // Primitive with no material at all: like a flat-colour material, draw it with
-            // PRIM TME off on slot 0 so no texture slot and no slot-0 image are spent on it
-            // (a solid image here used to win over the real slot-0 texture when the
-            // material-less primitive happened to be parsed first). Its page colour is the
-            // neutral grey MatKey maps White onto.
-            ip.TexIdx = 0;
-            ip.Untextured = true;
-            ip.BaseColor = Vector4.One;
+            // No material: drawn like a flat-colour material, PRIM TME off on slot 0, so no texture
+            // slot or slot-0 image is spent on it. Its page colour is the neutral grey MatKey maps White onto.
+            primitive.TextureIndex = 0;
+            primitive.Untextured = true;
+            primitive.BaseColor = Vector4.One;
             return;
         }
-        string name = mat.Name ?? "";
-        ip.IsAlt = name.EndsWith("_alt", StringComparison.OrdinalIgnoreCase);
-        // A page the extractor wrote as "mat_untextured" is drawn with TME off, so it has no
-        // texture of its own; the extractor clamps it to slot 0 (ModelExtractor's GetMaterial).
-        // It must not claim a texture slot: an extracted model's own untextured materials would
-        // otherwise push the slot count past the template's RH2 count, and RebuildPipeline's
-        // ApplyTexMerges would fold real textures into atlas bands (card 682: slots 6 and 7
-        // merged onto slots 0 and 1, wrecking both).
+        string name = material.Name ?? "";
+        primitive.IsAlt = name.EndsWith("_alt", StringComparison.OrdinalIgnoreCase);
+        /* A page the extractor wrote as "mat_untextured" is drawn with TME off and has no texture;
+           the extractor clamps it to slot 0 (ModelExtractor's GetMaterial). It must not claim a
+           texture slot: it would push the slot count past the template's RH2 count and
+           RebuildPipeline's ApplyTexMerges would fold real textures into atlas bands (card 682:
+           slots 6 and 7 merged onto slots 0 and 1, wrecking both). */
         bool untextured = IsUntexturedMaterial(name);
-        ip.Untextured = untextured;
-        // Needed before the slot decision below: a material with no base-colour texture
-        // claims no slot either (see the !named branch).
-        bool hasTexture = HasBaseColorTexture(mat);
-        int p = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
+        primitive.Untextured = untextured;
+        bool hasTexture = HasBaseColorTexture(material);
+        int texPosition = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
         bool named = false;
         if (untextured)
         {
-            ip.TexIdx = 0;
+            primitive.TextureIndex = 0;
             named = true;
-            p = -1;
+            texPosition = -1;
         }
-        if (p >= 0)
+        if (texPosition >= 0)
         {
-            int start = p + "mat_tex".Length, end = start;
+            int start = texPosition + "mat_tex".Length, end = start;
             while (end < name.Length && char.IsDigit(name[end])) end++;
-            if (end > start && int.TryParse(name.AsSpan(start, end - start), out int tex))
+            if (end > start && int.TryParse(name.AsSpan(start, end - start), out int textureNumber))
             {
                 // a custom glb's named slots are renumbered densely by the pre-pass in FromModel
-                ip.TexIdx = im.MatTexRemap.TryGetValue(mat.LogicalIndex, out int dense) ? dense : tex;
+                primitive.TextureIndex = importedModel.MatTexRemap.TryGetValue(material.LogicalIndex, out int dense) ? dense : textureNumber;
                 named = true;
             }
         }
         if (!named && !hasTexture)
         {
-            // A custom glb's flat-colour material: no base-colour texture, so there is nothing
-            // to put in a texture slot. Treat it exactly like the extractor's `mat_untextured`
-            // - park it on slot 0, draw it with PRIM TME off and carry its base colour as the
-            // page colour (MatKey's c1) - instead of baking a solid image into an auto slot.
-            // Those auto slots used to push the slot count past the template's RH2 count and
-            // make RebuildPipeline atlas-merge real textures (card 682).
+            /* A custom glb's flat-colour material has no base-colour texture. It is treated like
+               the extractor's `mat_untextured`: parked on slot 0, drawn with PRIM TME off, its base
+               colour carried as the page colour (MatKey's c1). An auto slot would push the slot
+               count past the template's RH2 count and make RebuildPipeline atlas-merge real
+               textures (card 682). */
             untextured = true;
-            ip.Untextured = true;
-            ip.TexIdx = 0;
+            primitive.Untextured = true;
+            primitive.TextureIndex = 0;
             named = true;
         }
         if (!named)
         {
-            // Unnamed material: give each DISTINCT material its own texture slot (stable per
-            // material LogicalIndex), instead of collapsing everything onto slot 0.
-            if (!im.MaterialTexAuto.TryGetValue(mat.LogicalIndex, out int auto_))
+            // unnamed material: each distinct material gets its own slot (stable per LogicalIndex)
+            if (!importedModel.MaterialTexAuto.TryGetValue(material.LogicalIndex, out int autoSlot))
             {
-                var taken = new HashSet<int>(im.MaterialTexAuto.Values);
-                auto_ = 0;
-                while (taken.Contains(auto_)) auto_++;
-                im.MaterialTexAuto[mat.LogicalIndex] = auto_;
+                var taken = new HashSet<int>(importedModel.MaterialTexAuto.Values);
+                autoSlot = 0;
+                while (taken.Contains(autoSlot)) autoSlot++;
+                importedModel.MaterialTexAuto[material.LogicalIndex] = autoSlot;
             }
-            ip.TexIdx = auto_;
+            primitive.TextureIndex = autoSlot;
         }
-        // Base colour factor feeds the RH0 material record's +0x20 row - a lighting input
-        // the engine scales at runtime (lRhModel_SetMaterialIntensity SET/ADD/MUL modes);
-        // retail neutral is (178,178,178)/alpha 128, which the pipeline maps White onto.
-        ip.BaseColor = Vector4.One;
+        /* The base colour factor feeds the RH0 material record's +0x20 row, a lighting input the
+           engine scales at runtime (lRhModel_SetMaterialIntensity SET/ADD/MUL modes). Retail
+           neutral is (178,178,178)/alpha 128, which the pipeline maps White onto. */
+        primitive.BaseColor = Vector4.One;
         try
         {
-            var bc = mat.FindChannel("BaseColor");
-            if (bc.HasValue) ip.BaseColor = bc.Value.Color;
+            var baseColor = material.FindChannel("BaseColor");
+            if (baseColor.HasValue) primitive.BaseColor = baseColor.Value.Color;
         }
         catch { }
-        RestoreColourBlock(mat, ip);
-        if (!im.IsDotrExtractedGlb) ParseDotrColors(mat, ip);
-        ParseBlend(mat, name, ip, im, untextured);
+        RestoreColourBlock(material, primitive);
+        if (!importedModel.IsDotrExtractedGlb) ParseDotrColors(material, primitive);
+        ParseBlend(material, name, primitive, importedModel, untextured);
 
-        // Harvest the material's base-colour image for texture reimport (best-effort;
-        // first material seen per texture slot wins - slots are deduped by image upstream).
+        // Harvest the base-colour image for texture reimport; the first material seen per slot wins.
         try
         {
-            if (ip.TexIdx >= 0 && !untextured)
+            if (primitive.TextureIndex >= 0 && !untextured)
             {
                 if (hasTexture)
                 {
-                    if (!im.TextureImages.ContainsKey(ip.TexIdx))
+                    if (!importedModel.TextureImages.ContainsKey(primitive.TextureIndex))
                     {
-                        var img = mat.FindChannel("BaseColor")!.Value.Texture!.PrimaryImage!.Content;
-                        if (img.IsValid) im.TextureImages[ip.TexIdx] = img;
+                        var image = material.FindChannel("BaseColor")!.Value.Texture!.PrimaryImage!.Content;
+                        if (image.IsValid) importedModel.TextureImages[primitive.TextureIndex] = image;
                     }
                 }
                 else
                 {
-                    // Textureless (flat-colour) material: the engine has no untextured path -
-                    // every page's texture-context record samples a texture - so without an
-                    // image the slot keeps the TEMPLATE's texture ("old model texture" bleeding
-                    // through). Bake the base colour into a small solid image instead, and
-                    // neutralise the page colour so the tint isn't applied twice
-                    // (texel * page colour).
-                    if (!im.TextureImages.ContainsKey(ip.TexIdx))
+                    /* Flat-colour material: every page's texture-context record samples a texture,
+                       so without an image the slot keeps the template's texture. The base colour
+                       is baked into a small solid image and the page colour neutralised, so the
+                       tint is not applied twice (texel * page colour). */
+                    if (!importedModel.TextureImages.ContainsKey(primitive.TextureIndex))
                     {
-                        var c = ip.BaseColor;
-                        byte rr = (byte)Math.Clamp((int)MathF.Round(c.X * 255f), 0, 255);
-                        byte gg = (byte)Math.Clamp((int)MathF.Round(c.Y * 255f), 0, 255);
-                        byte bb = (byte)Math.Clamp((int)MathF.Round(c.Z * 255f), 0, 255);
-                        byte aa = (byte)Math.Clamp((int)MathF.Round(c.W * 255f), 0, 255);
-                        im.TextureImages[ip.TexIdx] = SolidImage(rr, gg, bb, aa);
+                        var colour = primitive.BaseColor;
+                        byte red = (byte)Math.Clamp((int)MathF.Round(colour.X * 255f), 0, 255);
+                        byte green = (byte)Math.Clamp((int)MathF.Round(colour.Y * 255f), 0, 255);
+                        byte blue = (byte)Math.Clamp((int)MathF.Round(colour.Z * 255f), 0, 255);
+                        byte alpha = (byte)Math.Clamp((int)MathF.Round(colour.W * 255f), 0, 255);
+                        importedModel.TextureImages[primitive.TextureIndex] = SolidImage(red, green, blue, alpha);
                     }
-                    ip.BaseColor = Vector4.One;
+                    primitive.BaseColor = Vector4.One;
                 }
             }
         }
         catch { /* texture harvest must never break geometry import */ }
 
         // A DotR-only copy of the texture (DoD exporter: animated mask positions baked into extra
-        // cells, which the slot's records copy from): it replaces the base-colour image as the slot's
-        // picture, whichever material of the slot was seen first.
+        // cells the slot's records copy from) replaces the slot's base-colour image.
         try
         {
-            if (ip.TexIdx >= 0 && !untextured && DotrImage(mat) is { } di && di.Content.IsValid)
-                im.TextureImages[ip.TexIdx] = di.Content;
+            if (primitive.TextureIndex >= 0 && !untextured && DotrImage(material) is { } dotrImage && dotrImage.Content.IsValid)
+                importedModel.TextureImages[primitive.TextureIndex] = dotrImage.Content;
         }
         catch { }
 
-        // The slot's retail texture animation, carried on the extracted glb's material
-        // (ModelExtractor.InjectTextureAnimationRecords). Re-embedded verbatim by the
-        // assembler, so an unedited round trip keeps the animation the extractor baked away.
+        // The slot's retail texture animation on the extracted glb's material
+        // (ModelExtractor.InjectTextureAnimationRecords); the assembler re-embeds it verbatim.
         try
         {
-            if (ip.TexIdx >= 0 && !untextured && !im.TextureAnimRecords.ContainsKey(ip.TexIdx)
-                && mat.Extras is System.Text.Json.Nodes.JsonObject mex
-                && mex["DOTR_texAnimRecords"] is System.Text.Json.Nodes.JsonArray recs && recs.Count > 0)
-                im.TextureAnimRecords[ip.TexIdx] = PackTexAnimRecords(recs);
+            if (primitive.TextureIndex >= 0 && !untextured && !importedModel.TextureAnimRecords.ContainsKey(primitive.TextureIndex)
+                && material.Extras is System.Text.Json.Nodes.JsonObject extras
+                && extras["DOTR_texAnimRecords"] is System.Text.Json.Nodes.JsonArray records && records.Count > 0)
+                importedModel.TextureAnimRecords[primitive.TextureIndex] = PackTexAnimRecords(records);
         }
         catch { /* a malformed extras block just means no animation */ }
 
-        // Which record and cell each baked frame image came from, so an edited frame can be
-        // written back into its source cell (see TextureAnimStamps / ApplyEditedAnimFrames).
+        // Record and cell each baked frame image came from (TextureAnimStamps / ApplyEditedAnimFrames).
         try
         {
-            if (ip.TexIdx >= 0 && !untextured && !im.TextureAnimStamps.ContainsKey(ip.TexIdx)
-                && mat.Extras is System.Text.Json.Nodes.JsonObject aex
-                && aex["DOTR_texAnim"] is System.Text.Json.Nodes.JsonObject anim
-                && anim["frames"] is System.Text.Json.Nodes.JsonArray frames)
+            if (primitive.TextureIndex >= 0 && !untextured && !importedModel.TextureAnimStamps.ContainsKey(primitive.TextureIndex)
+                && material.Extras is System.Text.Json.Nodes.JsonObject extras
+                && extras["DOTR_texAnim"] is System.Text.Json.Nodes.JsonObject textureAnimation
+                && textureAnimation["frames"] is System.Text.Json.Nodes.JsonArray frames)
             {
                 var byFrame = new Dictionary<int, List<(int Rec, int Cell, uint Hash)>>();
-                for (int f = 0; f < frames.Count; f++)
+                for (int frame = 0; frame < frames.Count; frame++)
                 {
-                    if (frames[f] is not System.Text.Json.Nodes.JsonObject fo
-                        || fo["stamps"] is not System.Text.Json.Nodes.JsonArray sts) continue;
+                    if (frames[frame] is not System.Text.Json.Nodes.JsonObject frameObject
+                        || frameObject["stamps"] is not System.Text.Json.Nodes.JsonArray stamps) continue;
                     var list = new List<(int, int, uint)>();
-                    foreach (var st in sts)
-                        if (st is System.Text.Json.Nodes.JsonObject so)
-                            list.Add(((int)so["rec"]!, (int)so["cell"]!, (uint)so["hash"]!));
-                    if (list.Count > 0) byFrame[f] = list;
+                    foreach (var stamp in stamps)
+                        if (stamp is System.Text.Json.Nodes.JsonObject stampObject)
+                            list.Add(((int)stampObject["rec"]!, (int)stampObject["cell"]!, (uint)stampObject["hash"]!));
+                    if (list.Count > 0) byFrame[frame] = list;
                 }
-                if (byFrame.Count > 0) im.TextureAnimStamps[ip.TexIdx] = byFrame;
+                if (byFrame.Count > 0) importedModel.TextureAnimStamps[primitive.TextureIndex] = byFrame;
             }
         }
         catch { /* a malformed extras block just means no write-back */ }
@@ -1013,62 +955,62 @@ public static class GlbImporter
 
     /// uv' = offset + R(rotation) * (scale * uv), the KHR_texture_transform matrix, when the base
     /// colour texture has one and samples TEXCOORD_0 (the only set the importer reads).
-    private static void ApplyBaseTextureTransform(Material? mat, ImportedPrimitive ip)
+    private static void ApplyBaseTextureTransform(Material? material, ImportedPrimitive primitive)
     {
         try
         {
-            var ch = mat?.FindChannel("BaseColor");
-            if (ch is not { } c || c.Texture == null || c.TextureCoordinate != 0) return;
-            var tt = c.TextureTransform;
-            if (tt == null || (tt.TextureCoordinateOverride ?? 0) != 0) return;
-            var s = tt.Scale; var o = tt.Offset; float r = tt.Rotation;
-            if (s == Vector2.One && o == Vector2.Zero && r == 0f) return;
-            float cs = MathF.Cos(r), sn = MathF.Sin(r);
-            foreach (var v in ip.Vertices)
+            var channel = material?.FindChannel("BaseColor");
+            if (channel is not { } baseChannel || baseChannel.Texture == null || baseChannel.TextureCoordinate != 0) return;
+            var transform = baseChannel.TextureTransform;
+            if (transform == null || (transform.TextureCoordinateOverride ?? 0) != 0) return;
+            var scale = transform.Scale; var offset = transform.Offset; float rotation = transform.Rotation;
+            if (scale == Vector2.One && offset == Vector2.Zero && rotation == 0f) return;
+            float cosine = MathF.Cos(rotation), sine = MathF.Sin(rotation);
+            foreach (var vertex in primitive.Vertices)
             {
-                float u = v.Uv.X * s.X, w = v.Uv.Y * s.Y;
-                v.Uv = new Vector2(cs * u + sn * w + o.X, -sn * u + cs * w + o.Y);
+                float scaledU = vertex.Uv.X * scale.X, scaledV = vertex.Uv.Y * scale.Y;
+                vertex.Uv = new Vector2(cosine * scaledU + sine * scaledV + offset.X, -sine * scaledU + cosine * scaledV + offset.Y);
             }
         }
         catch { /* a malformed transform just leaves the UVs as they are */ }
     }
 
     /// The material's "DOTR_image" extras: a glb image to encode for its slot instead of the base colour.
-    private static SharpGLTF.Schema2.Image? DotrImage(Material? mat)
+    private static SharpGLTF.Schema2.Image? DotrImage(Material? material)
     {
-        if (mat?.Extras is not System.Text.Json.Nodes.JsonObject ex
-            || ex["DOTR_image"] is not System.Text.Json.Nodes.JsonObject di
-            || di["image"] is not { } idx) return null;
-        int i = idx.GetValue<int>();
-        var imgs = mat.LogicalParent.LogicalImages;
-        return i >= 0 && i < imgs.Count ? imgs[i] : null;
+        if (material?.Extras is not System.Text.Json.Nodes.JsonObject extras
+            || extras["DOTR_image"] is not System.Text.Json.Nodes.JsonObject dotrImage
+            || dotrImage["image"] is not { } imageNode) return null;
+        int imageIndex = imageNode.GetValue<int>();
+        var images = material.LogicalParent.LogicalImages;
+        return imageIndex >= 0 && imageIndex < images.Count ? images[imageIndex] : null;
     }
 
     /// With a DOTR_image the base-colour texture sits at the top left of a larger image: its
     /// "uvScale" (base size / image size) maps the faces' UVs onto it, and an optional "uvOffset"
     /// (image UV) moves them to their own cell there (an atlas flipbook's display cell).
-    private static void ApplyDotrImageUv(Material? mat, ImportedPrimitive ip)
+    private static void ApplyDotrImageUv(Material? material, ImportedPrimitive primitive)
     {
         try
         {
-            if (DotrImage(mat) == null
-                || mat!.Extras is not System.Text.Json.Nodes.JsonObject ex
-                || ex["DOTR_image"]?["uvScale"] is not System.Text.Json.Nodes.JsonArray s || s.Count != 2) return;
-            var k = new Vector2(s[0]!.GetValue<float>(), s[1]!.GetValue<float>());
-            var o = ex["DOTR_image"]?["uvOffset"] is System.Text.Json.Nodes.JsonArray oa && oa.Count == 2
-                ? new Vector2(oa[0]!.GetValue<float>(), oa[1]!.GetValue<float>()) : Vector2.Zero;
-            foreach (var v in ip.Vertices) v.Uv = v.Uv * k + o;
+            if (DotrImage(material) == null
+                || material!.Extras is not System.Text.Json.Nodes.JsonObject extras
+                || extras["DOTR_image"]?["uvScale"] is not System.Text.Json.Nodes.JsonArray uvScale || uvScale.Count != 2) return;
+            var uvScaleVector = new Vector2(uvScale[0]!.GetValue<float>(), uvScale[1]!.GetValue<float>());
+            var offset = extras["DOTR_image"]?["uvOffset"] is System.Text.Json.Nodes.JsonArray offsetArray && offsetArray.Count == 2
+                ? new Vector2(offsetArray[0]!.GetValue<float>(), offsetArray[1]!.GetValue<float>()) : Vector2.Zero;
+            foreach (var vertex in primitive.Vertices) vertex.Uv = vertex.Uv * uvScaleVector + offset;
         }
         catch { }
     }
 
     /// True when the material's base-colour channel carries an actual image.
-    private static bool HasBaseColorTexture(Material m)
+    private static bool HasBaseColorTexture(Material material)
     {
         try
         {
-            var ch = m.FindChannel("BaseColor");
-            return ch.HasValue && ch.Value.Texture?.PrimaryImage != null;
+            var channel = material.FindChannel("BaseColor");
+            return channel.HasValue && channel.Value.Texture?.PrimaryImage != null;
         }
         catch { return false; }
     }
@@ -1077,89 +1019,89 @@ public static class GlbImporter
     private static bool IsUntexturedMaterial(string? name) =>
         name != null && name.StartsWith("mat_untextured", StringComparison.OrdinalIgnoreCase);
 
-    /// Pack "DOTR_texAnimRecords" back into the 24-byte entries SzModel_LoadTexAnim_Pipe
-    /// reads, the inverse of ModelExtractor.TexAnimRecords: flags@0 (bit0 last, bit1 own
+    /// Packs "DOTR_texAnimRecords" into the 24-byte entries SzModel_LoadTexAnim_Pipe
+    /// reads (inverse of ModelExtractor.TexAnimRecords): flags@0 (bit0 last, bit1 own
     /// clock, bits 2-4 mode, bits 5+ direction), motions@1, cols|rows<<4 @2, state@3,
     /// p0@4, p1@6, size@8, src@0xC, dst@0x10; own clock @0x14 from "clock" (default zero).
-    private static byte[] PackTexAnimRecords(System.Text.Json.Nodes.JsonArray recs)
+    private static byte[] PackTexAnimRecords(System.Text.Json.Nodes.JsonArray records)
     {
         const int EntrySize = 0x18;
-        var o = new byte[recs.Count * EntrySize];
-        for (int i = 0; i < recs.Count; i++)
+        var packed = new byte[records.Count * EntrySize];
+        for (int i = 0; i < records.Count; i++)
         {
-            if (recs[i] is not System.Text.Json.Nodes.JsonObject r) continue;
-            int b = i * EntrySize;
-            int I(string k) => r[k] is { } v ? v.GetValue<int>() : 0;
-            int Pair(string k, int j) => r[k] is System.Text.Json.Nodes.JsonArray a && a.Count > j
-                ? a[j]!.GetValue<int>() : 0;
-            bool ownClock = r["ownClock"] is { } oc && oc.GetValue<bool>();
-            o[b] = (byte)((i == recs.Count - 1 ? 1 : 0) | (ownClock ? 2 : 0)
-                          | ((I("mode") & 7) << 2) | ((I("direction") & 7) << 5));
-            o[b + 1] = (byte)I("motions");
-            o[b + 2] = (byte)((I("cols") & 15) | ((I("rows") & 15) << 4));
-            o[b + 3] = (byte)I("state");
-            void W16(int at, int v) => BinaryPrimitives.WriteUInt16LittleEndian(o.AsSpan(b + at), (ushort)v);
-            W16(0x04, I("p0"));
-            W16(0x06, I("p1"));
-            W16(0x08, Pair("size", 0));
-            W16(0x0A, Pair("size", 1));
-            W16(0x0C, Pair("src", 0));
-            W16(0x0E, Pair("src", 1));
-            W16(0x10, Pair("dst", 0));
-            W16(0x12, Pair("dst", 1));
+            if (records[i] is not System.Text.Json.Nodes.JsonObject record) continue;
+            int entryStart = i * EntrySize;
+            int IntField(string field) => record[field] is { } value ? value.GetValue<int>() : 0;
+            int PairElement(string field, int index) => record[field] is System.Text.Json.Nodes.JsonArray array && array.Count > index
+                ? array[index]!.GetValue<int>() : 0;
+            bool ownClock = record["ownClock"] is { } ownClockNode && ownClockNode.GetValue<bool>();
+            packed[entryStart] = (byte)((i == records.Count - 1 ? 1 : 0) | (ownClock ? 2 : 0)
+                          | ((IntField("mode") & 7) << 2) | ((IntField("direction") & 7) << 5));
+            packed[entryStart + 1] = (byte)IntField("motions");
+            packed[entryStart + 2] = (byte)((IntField("cols") & 15) | ((IntField("rows") & 15) << 4));
+            packed[entryStart + 3] = (byte)IntField("state");
+            void WriteUInt16At(int offset, int wordValue) => Bin.WriteU16(packed, entryStart + offset, (ushort)wordValue);
+            WriteUInt16At(0x04, IntField("p0"));
+            WriteUInt16At(0x06, IntField("p1"));
+            WriteUInt16At(0x08, PairElement("size", 0));
+            WriteUInt16At(0x0A, PairElement("size", 1));
+            WriteUInt16At(0x0C, PairElement("src", 0));
+            WriteUInt16At(0x0E, PairElement("src", 1));
+            WriteUInt16At(0x10, PairElement("dst", 0));
+            WriteUInt16At(0x12, PairElement("dst", 1));
             // own clock's starting value: phases a blink record (mode 6 copies when clock % p0 == 0)
-            BinaryPrimitives.WriteUInt32LittleEndian(o.AsSpan(b + 0x14), (uint)I("clock"));
+            WriteU32(packed, entryStart + 0x14, (uint)IntField("clock"));
         }
-        return o;
+        return packed;
     }
 
-    /// Put back the colour block (c0, c1, c2) the extractor saved in DOTR_blend. c0 and c2
-    /// have no glb field and are always restored. The base colour is only a display of c1
-    /// (an alpha-chain material shows c0 + c1/2, an opaque neutral or zero c1 shows white),
-    /// so while it is still the one the extractor wrote, the raw c1 is restored as well.
-    private static void RestoreColourBlock(Material mat, ImportedPrimitive ip)
+    /// Restores the colour block (c0, c1, c2) the extractor saved in DOTR_blend. c0 and c2
+    /// have no glb field and are always restored. The base colour only displays c1 (an
+    /// alpha-chain material shows c0 + c1/2, an opaque neutral or zero c1 shows white), so
+    /// while it is still the one the extractor wrote, the raw c1 is restored too.
+    private static void RestoreColourBlock(Material material, ImportedPrimitive primitive)
     {
         try
         {
-            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex) return;
-            if (ex["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend) return;
-            static (int, int, int)? Rgb(System.Text.Json.Nodes.JsonNode? n) =>
-                n is System.Text.Json.Nodes.JsonArray a && a.Count == 3
-                    ? (a[0]!.GetValue<int>(), a[1]!.GetValue<int>(), a[2]!.GetValue<int>()) : null;
-            if (Rgb(blend["materialColor0"]) is { } c0) ip.Color0 = c0;
-            if (Rgb(blend["materialColor2"]) is { } c2) ip.Color2 = c2;
+            if (material.Extras is not System.Text.Json.Nodes.JsonObject extras) return;
+            if (extras["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend) return;
+            static (int, int, int)? ReadRgb(System.Text.Json.Nodes.JsonNode? node) =>
+                node is System.Text.Json.Nodes.JsonArray array && array.Count == 3
+                    ? (array[0]!.GetValue<int>(), array[1]!.GetValue<int>(), array[2]!.GetValue<int>()) : null;
+            if (ReadRgb(blend["materialColor0"]) is { } color0) primitive.Color0 = color0;
+            if (ReadRgb(blend["materialColor2"]) is { } color2) primitive.Color2 = color2;
             if (blend["displayColor"] is not System.Text.Json.Nodes.JsonArray shown || shown.Count != 3) return;
-            var c = ip.BaseColor;
-            const float tol = 1.5f / 255f;
-            if (MathF.Abs(c.X - shown[0]!.GetValue<float>()) > tol ||
-                MathF.Abs(c.Y - shown[1]!.GetValue<float>()) > tol ||
-                MathF.Abs(c.Z - shown[2]!.GetValue<float>()) > tol) return; // edited: keep it
-            ip.RawColor1 = (blend["materialColorR"]!.GetValue<int>(),
+            var baseColor = primitive.BaseColor;
+            const float tolerance = 1.5f / 255f;
+            if (MathF.Abs(baseColor.X - shown[0]!.GetValue<float>()) > tolerance ||
+                MathF.Abs(baseColor.Y - shown[1]!.GetValue<float>()) > tolerance ||
+                MathF.Abs(baseColor.Z - shown[2]!.GetValue<float>()) > tolerance) return; // edited: keep it
+            primitive.RawColor1 = (blend["materialColorR"]!.GetValue<int>(),
                             blend["materialColorG"]!.GetValue<int>(),
                             blend["materialColorB"]!.GetValue<int>());
-            // an opaque page's alpha still matters to its alpha test (card 53's alpha-0
-            // untextured pages are never drawn); keep c1.w unless the glb alpha was edited
-            if (blend["materialAlpha"] is { } ma && MathF.Abs(c.W - ma.GetValue<float>()) <= tol
-                && blend["materialAlphaW"] is { } aw)
-                ip.BaseColor = c with { W = aw.GetValue<float>() / 128f };
+            // an opaque page's alpha still feeds its alpha test (card 53's alpha-0 untextured pages are
+            // never drawn): restore the raw c1.w unless the glb alpha was edited
+            if (blend["materialAlpha"] is { } materialAlpha && MathF.Abs(baseColor.W - materialAlpha.GetValue<float>()) <= tolerance
+                && blend["materialAlphaW"] is { } alphaW)
+                primitive.BaseColor = baseColor with { W = alphaW.GetValue<float>() / 128f };
         }
         catch { }
     }
 
     /// A custom glb's "DOTR_colors" extras {c0, c1}: the material record's c0 (+0x10) and c1 (+0x20)
     /// rows, 0-255 (the DoD exporter writes DoD's ambient and diffuse: neutral 127 / 178).
-    private static void ParseDotrColors(Material mat, ImportedPrimitive ip)
+    private static void ParseDotrColors(Material material, ImportedPrimitive primitive)
     {
         try
         {
-            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex
-                || ex["DOTR_colors"] is not System.Text.Json.Nodes.JsonObject col) return;
-            static (int, int, int)? Rgb(System.Text.Json.Nodes.JsonNode? n) =>
-                n is System.Text.Json.Nodes.JsonArray a && a.Count == 3
-                    ? (Math.Clamp(a[0]!.GetValue<int>(), 0, 255), Math.Clamp(a[1]!.GetValue<int>(), 0, 255),
-                       Math.Clamp(a[2]!.GetValue<int>(), 0, 255)) : null;
-            if (Rgb(col["c0"]) is { } c0) ip.Color0 = c0;
-            if (Rgb(col["c1"]) is { } c1) ip.RawColor1 = c1;
+            if (material.Extras is not System.Text.Json.Nodes.JsonObject extras
+                || extras["DOTR_colors"] is not System.Text.Json.Nodes.JsonObject colors) return;
+            static (int, int, int)? ReadRgb(System.Text.Json.Nodes.JsonNode? node) =>
+                node is System.Text.Json.Nodes.JsonArray array && array.Count == 3
+                    ? (Math.Clamp(array[0]!.GetValue<int>(), 0, 255), Math.Clamp(array[1]!.GetValue<int>(), 0, 255),
+                       Math.Clamp(array[2]!.GetValue<int>(), 0, 255)) : null;
+            if (ReadRgb(colors["c0"]) is { } color0) primitive.Color0 = color0;
+            if (ReadRgb(colors["c1"]) is { } color1) primitive.RawColor1 = color1;
         }
         catch { }
     }
@@ -1168,23 +1110,23 @@ public static class GlbImporter
     /// marks it in DOTR_blend {"mode": "additive"} without the extractor's raw "gsAlpha" (the DoD
     /// exporter does): drawn in the alpha chain with retail Ameba's additive colour block
     /// (c1 178, c0 127, full alpha), its texture alpha dropped (see OpaqueAlphaSlots).
-    private static void ParseBlend(Material mat, string name, ImportedPrimitive ip, ImportedModel im, bool untextured)
+    private static void ParseBlend(Material material, string name, ImportedPrimitive primitive, ImportedModel importedModel, bool untextured)
     {
-        var tst = System.Text.RegularExpressions.Regex.Match(name, @"_t([0-9A-Fa-f]{5})(?:_|$)");
-        if (tst.Success) ip.GsTest = Convert.ToUInt32(tst.Groups[1].Value, 16);
-        var gs = System.Text.RegularExpressions.Regex.Match(name, @"_gs([0-9A-Fa-f]{2})(?:_|$)");
-        if (gs.Success) { ip.GsAlpha = Convert.ToByte(gs.Groups[1].Value, 16); return; }
+        var testMatch = System.Text.RegularExpressions.Regex.Match(name, @"_t([0-9A-Fa-f]{5})(?:_|$)");
+        if (testMatch.Success) primitive.GsTest = Convert.ToUInt32(testMatch.Groups[1].Value, 16);
+        var gsMatch = System.Text.RegularExpressions.Regex.Match(name, @"_gs([0-9A-Fa-f]{2})(?:_|$)");
+        if (gsMatch.Success) { primitive.GsAlpha = Convert.ToByte(gsMatch.Groups[1].Value, 16); return; }
         try
         {
-            if (mat.Extras is not System.Text.Json.Nodes.JsonObject ex
-                || ex["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend
+            if (material.Extras is not System.Text.Json.Nodes.JsonObject extras
+                || extras["DOTR_blend"] is not System.Text.Json.Nodes.JsonObject blend
                 || blend["gsAlpha"] != null
                 || blend["mode"]?.GetValue<string>() != "additive") return;
-            ip.IsAlt = true;
-            ip.GsAlpha = 0x48;
-            ip.RawColor1 ??= (178, 178, 178);
-            ip.BaseColor = ip.BaseColor with { W = 1f };
-            if (!untextured && ip.TexIdx >= 0) im.OpaqueAlphaSlots.Add(ip.TexIdx);
+            primitive.IsAlt = true;
+            primitive.GsAlpha = 0x48;
+            primitive.RawColor1 ??= (178, 178, 178);
+            primitive.BaseColor = primitive.BaseColor with { W = 1f };
+            if (!untextured && primitive.TextureIndex >= 0) importedModel.OpaqueAlphaSlots.Add(primitive.TextureIndex);
         }
         catch { }
     }
@@ -1195,147 +1137,193 @@ public static class GlbImporter
     /// primitive's triangles is sampled: no translucent texels -> a cutout (TEST 0x703FD, AREF 63)
     /// if it has holes, else opaque; otherwise the alpha chain (normal blend) with c1.w = the mean
     /// alpha of the covered texels and the texture alpha cut to coverage (CoverageAlphaSlots).
-    private static void ParsePlainAlpha(Material? mat, ImportedPrimitive ip, ImportedModel im)
+    private static void ParsePlainAlpha(Material? material, ImportedPrimitive primitive, ImportedModel importedModel)
     {
         try
         {
-            if (mat == null || ip.Untextured || ip.IsAlt || ip.GsTest != 0 || ip.GsAlpha != 0x44) return;
-            if (mat.Alpha == AlphaMode.OPAQUE) return;
-            if (mat.Extras is System.Text.Json.Nodes.JsonObject ex
-                && ex["DOTR_blend"] is System.Text.Json.Nodes.JsonObject blend
+            if (material == null || primitive.Untextured || primitive.IsAlt || primitive.GsTest != 0 || primitive.GsAlpha != 0x44) return;
+            if (material.Alpha == AlphaMode.OPAQUE) return;
+            if (material.Extras is System.Text.Json.Nodes.JsonObject extras
+                && extras["DOTR_blend"] is System.Text.Json.Nodes.JsonObject blend
                 && (blend["gsAlpha"] != null || blend["mode"]?.GetValue<string>() is "additive" or "multiply")) return;
-            float factor = Math.Clamp(ip.BaseColor.W, 0f, 1f);
-            var plane = AlphaPlane(mat, im);
-            long n = 0, holes = 0; double sum = 0;
-            if (plane is { } pl)
-                foreach (byte a in SampleAlpha(ip, pl.W, pl.H, pl.A))
+            float factor = Math.Clamp(primitive.BaseColor.W, 0f, 1f);
+            var plane = AlphaPlane(material, importedModel);
+            long sampleCount = 0, holes = 0; double sum = 0;
+            if (plane is { } alphaPlane)
+                foreach (byte alpha in SampleAlpha(primitive, alphaPlane.W, alphaPlane.H, alphaPlane.A))
                 {
-                    n++;
-                    if (a < 8) holes++; else sum += a / 255.0;
+                    sampleCount++;
+                    if (alpha < 8) holes++; else sum += alpha / 255.0;
                 }
-            float mean = n > holes ? (float)(sum / (n - holes)) : 1f;
-            if (mat.Alpha == AlphaMode.MASK) mean = 1f;   // a cutout: coverage only
-            float eff = mean * factor;
-            if (eff >= 0.97f)
+            float mean = sampleCount > holes ? (float)(sum / (sampleCount - holes)) : 1f;
+            if (material.Alpha == AlphaMode.MASK) mean = 1f;   // a cutout: coverage only
+            float effectiveAlpha = mean * factor;
+            if (effectiveAlpha >= 0.97f)
             {
-                ip.BaseColor = ip.BaseColor with { W = 1f };
+                primitive.BaseColor = primitive.BaseColor with { W = 1f };
                 if (holes == 0) return;
-                ip.GsTest = 0x703FD;
+                primitive.GsTest = 0x703FD;
             }
             else
             {
-                ip.IsAlt = true;
+                primitive.IsAlt = true;
                 // retail's alpha-chain pages keep the neutral c1 (178); MatKey gives alt pages full range
-                if (ip.BaseColor.X >= 0.9999f && ip.BaseColor.Y >= 0.9999f && ip.BaseColor.Z >= 0.9999f)
-                    ip.RawColor1 ??= (178, 178, 178);
-                ip.BaseColor = ip.BaseColor with { W = MathF.Max(eff, 1f / 128f) };
+                if (primitive.BaseColor.X >= 0.9999f && primitive.BaseColor.Y >= 0.9999f && primitive.BaseColor.Z >= 0.9999f)
+                    primitive.RawColor1 ??= (178, 178, 178);
+                primitive.BaseColor = primitive.BaseColor with { W = MathF.Max(effectiveAlpha, 1f / 128f) };
             }
-            if (ip.TexIdx >= 0) im.CoverageAlphaSlots.Add(ip.TexIdx);
+            if (primitive.TextureIndex >= 0) importedModel.CoverageAlphaSlots.Add(primitive.TextureIndex);
         }
         catch { /* leave the page opaque */ }
     }
 
     /// The alpha plane of the material's base-colour image (null: no image or undecodable).
-    private static (int W, int H, byte[] A)? AlphaPlane(Material mat, ImportedModel im)
+    private static (int W, int H, byte[] A)? AlphaPlane(Material material, ImportedModel importedModel)
     {
         // a DOTR_image replaces the base colour for the slot, and the faces' UVs already point into it
-        var gi = DotrImage(mat) ?? mat.FindChannel("BaseColor")?.Texture?.PrimaryImage;
-        if (gi == null) return null;
-        if (im.AlphaPlanes.TryGetValue(gi.LogicalIndex, out var cached)) return cached;
-        (int, int, byte[])? res = null;
-        var img = gi.Content;
-        if (img.IsValid)
+        var glbImage = DotrImage(material) ?? material.FindChannel("BaseColor")?.Texture?.PrimaryImage;
+        if (glbImage == null) return null;
+        if (importedModel.AlphaPlanes.TryGetValue(glbImage.LogicalIndex, out var cached)) return cached;
+        (int, int, byte[])? result = null;
+        var image = glbImage.Content;
+        if (image.IsValid)
         {
-            Image cpu = DecodeRgba(img);
-            if (cpu.Width > 0 && cpu.Height > 0)
+            Image decoded = DecodeRgba(image);
+            if (decoded.Width > 0 && decoded.Height > 0)
             {
-                var rgba = Pixels(cpu);
-                var a = new byte[cpu.Width * cpu.Height];
-                for (int i = 0; i < a.Length; i++) a[i] = rgba[i * 4 + 3];
-                res = (cpu.Width, cpu.Height, a);
+                var rgba = Pixels(decoded);
+                var alphas = new byte[decoded.Width * decoded.Height];
+                for (int i = 0; i < alphas.Length; i++) alphas[i] = rgba[i * 4 + 3];
+                result = (decoded.Width, decoded.Height, alphas);
             }
-            Raylib.UnloadImage(cpu);
+            Raylib.UnloadImage(decoded);
         }
-        im.AlphaPlanes[gi.LogicalIndex] = res;
-        return res;
+        importedModel.AlphaPlanes[glbImage.LogicalIndex] = result;
+        return result;
     }
 
     /// Texel alphas under the primitive's triangles (repeat-wrapped UVs, about 1k samples per
     /// triangle at most, its centroid when it covers no texel centre).
-    private static IEnumerable<byte> SampleAlpha(ImportedPrimitive ip, int w, int h, byte[] a)
+    private static IEnumerable<byte> SampleAlpha(ImportedPrimitive primitive, int width, int height, byte[] alphas)
     {
-        byte At(float x, float y)
+        byte AlphaAt(float x, float y)
         {
-            int ix = ((int)MathF.Floor(x) % w + w) % w, iy = ((int)MathF.Floor(y) % h + h) % h;
-            return a[iy * w + ix];
+            int texelX = ((int)MathF.Floor(x) % width + width) % width, texelY = ((int)MathF.Floor(y) % height + height) % height;
+            return alphas[texelY * width + texelX];
         }
-        foreach (var (i0, i1, i2) in ip.Triangles)
+        foreach (var (corner0, corner1, corner2) in primitive.Triangles)
         {
-            Vector2 p0 = ip.Vertices[i0].Uv * new Vector2(w, h), p1 = ip.Vertices[i1].Uv * new Vector2(w, h),
-                    p2 = ip.Vertices[i2].Uv * new Vector2(w, h);
-            float x0 = MathF.Min(p0.X, MathF.Min(p1.X, p2.X)), x1 = MathF.Max(p0.X, MathF.Max(p1.X, p2.X));
-            float y0 = MathF.Min(p0.Y, MathF.Min(p1.Y, p2.Y)), y1 = MathF.Max(p0.Y, MathF.Max(p1.Y, p2.Y));
-            float area = (p1.X - p0.X) * (p2.Y - p0.Y) - (p2.X - p0.X) * (p1.Y - p0.Y);
-            bool any = false;
-            if (MathF.Abs(area) > 1e-6f && (x1 - x0) * (y1 - y0) < 1e8f)
+            Vector2 uv0 = primitive.Vertices[corner0].Uv * new Vector2(width, height), uv1 = primitive.Vertices[corner1].Uv * new Vector2(width, height),
+                    uv2 = primitive.Vertices[corner2].Uv * new Vector2(width, height);
+            float minX = MathF.Min(uv0.X, MathF.Min(uv1.X, uv2.X)), maxX = MathF.Max(uv0.X, MathF.Max(uv1.X, uv2.X));
+            float minY = MathF.Min(uv0.Y, MathF.Min(uv1.Y, uv2.Y)), maxY = MathF.Max(uv0.Y, MathF.Max(uv1.Y, uv2.Y));
+            float area = (uv1.X - uv0.X) * (uv2.Y - uv0.Y) - (uv2.X - uv0.X) * (uv1.Y - uv0.Y);
+            bool sampledAny = false;
+            if (MathF.Abs(area) > 1e-6f && (maxX - minX) * (maxY - minY) < 1e8f)
             {
-                float step = MathF.Max(1f, MathF.Sqrt((x1 - x0) * (y1 - y0) / 1024f));
-                for (float y = MathF.Floor(y0) + 0.5f; y <= y1; y += step)
-                for (float x = MathF.Floor(x0) + 0.5f; x <= x1; x += step)
+                float step = MathF.Max(1f, MathF.Sqrt((maxX - minX) * (maxY - minY) / 1024f));
+                for (float y = MathF.Floor(minY) + 0.5f; y <= maxY; y += step)
+                for (float x = MathF.Floor(minX) + 0.5f; x <= maxX; x += step)
                 {
-                    float b1 = ((x - p0.X) * (p2.Y - p0.Y) - (p2.X - p0.X) * (y - p0.Y)) / area;
-                    float b2 = ((p1.X - p0.X) * (y - p0.Y) - (x - p0.X) * (p1.Y - p0.Y)) / area;
-                    if (b1 < 0 || b2 < 0 || b1 + b2 > 1) continue;
-                    any = true;
-                    yield return At(x, y);
+                    float barycentric1 = ((x - uv0.X) * (uv2.Y - uv0.Y) - (uv2.X - uv0.X) * (y - uv0.Y)) / area;
+                    float barycentric2 = ((uv1.X - uv0.X) * (y - uv0.Y) - (x - uv0.X) * (uv1.Y - uv0.Y)) / area;
+                    if (barycentric1 < 0 || barycentric2 < 0 || barycentric1 + barycentric2 > 1) continue;
+                    sampledAny = true;
+                    yield return AlphaAt(x, y);
                 }
             }
-            if (!any) { var c = (p0 + p1 + p2) / 3f; yield return At(c.X, c.Y); }
+            if (!sampledAny) { var centroid = (uv0 + uv1 + uv2) / 3f; yield return AlphaAt(centroid.X, centroid.Y); }
         }
     }
 
     /// 8x8 single-colour PNG wrapped as a glTF MemoryImage (for textureless materials).
-    private static SharpGLTF.Memory.MemoryImage SolidImage(byte r, byte g, byte b, byte a)
+    private static SharpGLTF.Memory.MemoryImage SolidImage(byte red, byte green, byte blue, byte alpha)
     {
         var rgba = new byte[8 * 8 * 4];
         for (int i = 0; i < rgba.Length; i += 4)
-        { rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = a; }
+        { rgba[i] = red; rgba[i + 1] = green; rgba[i + 2] = blue; rgba[i + 3] = alpha; }
         return new SharpGLTF.Memory.MemoryImage(PngEncoder.Encode(8, 8, rgba));
+    }
+
+    /// Leaves a model that the game loads and animates like any other but that draws nothing:
+    /// one triangle whose three corners are copies of one vertex (zero area, so the GS fills no
+    /// pixel), on one fully transparent 8x8 texture. The node tree and the motions are kept, so
+    /// every motion slot, node 1 (cameras, shadow) and the battle node refs stay as they were.
+    /// The corners are three vertices, not one used three times: RebuildPipeline skips a
+    /// triangle that repeats an index.
+    public static void RemoveModel(ImportedModel model)
+    {
+        ImportedPrimitive? keptPrimitive = model.Primitives.FirstOrDefault(primitive => primitive.Triangles.Count > 0);
+        if (keptPrimitive == null)
+        {
+            throw new InvalidOperationException("the model has no triangles to keep");
+        }
+        ImportedVertex source = keptPrimitive.Vertices[keptPrimitive.Triangles[0].First];
+        var corners = new List<ImportedVertex>();
+        for (int corner = 0; corner < 3; corner++)
+        {
+            corners.Add(new ImportedVertex
+            {
+                Position = source.Position,
+                FramePos = source.FramePos,
+                Normal = source.Normal,
+                Uv = source.Uv,
+                Influences = new List<ImportedInfluence>(source.Influences),
+                Game = source.Game,
+            });
+        }
+        keptPrimitive.Vertices = corners;
+        keptPrimitive.Triangles = new List<(int First, int Second, int Third)> { (0, 1, 2) };
+        keptPrimitive.TextureIndex = 0;
+        model.Primitives = new List<ImportedPrimitive> { keptPrimitive };
+
+        model.TextureImages = new Dictionary<int, SharpGLTF.Memory.MemoryImage> { [0] = SolidImage(0, 0, 0, 0) };
+        model.TextureAnimFrames.Clear();
+        model.TextureAnimTicks.Clear();
+        model.TextureAnimUvScale.Clear();
+        model.TextureAnimRecords.Clear();
+        model.TextureAnimEditFrames.Clear();
+        model.TextureAnimStamps.Clear();
+        model.MaterialTexAuto.Clear();
+        model.MatTexRemap.Clear();
+        model.OpaqueAlphaSlots.Clear();
+        model.CoverageAlphaSlots.Clear();
+        model.AppliedTexMerges = null;
     }
 
     /// Slot-sharing key for unnamed materials: same base-colour image => same slot;
     /// flat-colour materials key by their colour value.
-    private static string MaterialShareKey(Material m)
+    private static string MaterialShareKey(Material material)
     {
         try
         {
-            var ch = m.FindChannel("BaseColor");
-            if (ch.HasValue && ch.Value.Texture?.PrimaryImage != null)
-                return "img:" + ch.Value.Texture.PrimaryImage.LogicalIndex;
-            if (ch.HasValue)
+            var channel = material.FindChannel("BaseColor");
+            if (channel.HasValue && channel.Value.Texture?.PrimaryImage != null)
+                return "img:" + channel.Value.Texture.PrimaryImage.LogicalIndex;
+            if (channel.HasValue)
             {
-                var c = ch.Value.Color;
-                return $"rgba:{c.X:F4},{c.Y:F4},{c.Z:F4},{c.W:F4}";
+                var colour = channel.Value.Color;
+                return $"rgba:{colour.X:F4},{colour.Y:F4},{colour.Z:F4},{colour.W:F4}";
             }
         }
         catch { }
-        return "mat:" + m.LogicalIndex;
+        return "mat:" + material.LogicalIndex;
     }
 
-    /// Highest texture slot a "mat_texN" name may ask for. RH2 blocks per model; retail's
-    /// largest monster is far below this, so anything above is a typo, not a real slot.
+    /// Highest texture slot a "mat_texN" name may ask for (RH2 blocks per model); retail's
+    /// largest monster is far below it, so a higher number is a typo.
     private const int MaxTexSlot = 63;
 
     /// Parses the explicit "mat_texN" naming convention (suffix "_alt" allowed elsewhere).
-    private static bool TryParseMatTexIndex(string? name, out int tex)
+    private static bool TryParseMatTexIndex(string? name, out int textureIndex)
     {
-        tex = -1;
+        textureIndex = -1;
         if (string.IsNullOrEmpty(name)) return false;
-        int p = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
-        if (p < 0) return false;
-        int start = p + "mat_tex".Length, end = start;
+        int texPosition = name.IndexOf("mat_tex", StringComparison.OrdinalIgnoreCase);
+        if (texPosition < 0) return false;
+        int start = texPosition + "mat_tex".Length, end = start;
         while (end < name.Length && char.IsDigit(name[end])) end++;
-        return end > start && int.TryParse(name.AsSpan(start, end - start), out tex);
+        return end > start && int.TryParse(name.AsSpan(start, end - start), out textureIndex);
     }
 
     /// The GS CLAMP byte the extractor encodes in a material name as "_c<hex>" (see
@@ -1345,9 +1333,9 @@ public static class GlbImporter
     {
         clamp = 0;
         if (string.IsNullOrEmpty(name)) return false;
-        int p = name.IndexOf("_c", StringComparison.Ordinal);
-        if (p < 0) return false;
-        int start = p + 2, end = start;
+        int tagPosition = name.IndexOf("_c", StringComparison.Ordinal);
+        if (tagPosition < 0) return false;
+        int start = tagPosition + 2, end = start;
         while (end < name.Length && Uri.IsHexDigit(name[end])) end++;
         if (end == start || end - start > 2) return false;
         if (end < name.Length && name[end] != '_') return false;
@@ -1355,127 +1343,119 @@ public static class GlbImporter
         return true;
     }
 
-    private static Vector3 SafeNormalize(Vector3 v)
+    private static Vector3 SafeNormalize(Vector3 vector)
     {
-        float len = v.Length();
-        return len > 1e-6f ? v / len : Vector3.UnitY;
+        float length = vector.Length();
+        return length > 1e-6f ? vector / length : Vector3.UnitY;
     }
 
     /// Folds out-of-[0,1] UVs back into the unit tile (glTF/Blender REPEAT semantics) so the
-    /// PS2's CLAMP sampler reproduces the artist's tiled result instead of crushing the UV
-    /// onto a texture edge (Charizard's black face/wings). Done PER TRIANGLE using the floor
-    /// of the triangle's UV centroid, so all three corners shift by the same whole-tile
-    /// offset and the texture never swims across a face. Vertices shared between triangles
-    /// that land in different tiles are duplicated, because they need different shifts.
-    private static void WrapPrimitiveUvs(ImportedPrimitive ip, bool foldS = true, bool foldT = true)
+    /// PS2's CLAMP sampler reproduces the tiled result instead of crushing the UV onto a
+    /// texture edge (Charizard's black face/wings). Done per triangle with the floor of its UV
+    /// centroid, so all three corners shift by the same whole-tile offset. Vertices shared by
+    /// triangles in different tiles are duplicated, since they need different shifts.
+    private static void WrapPrimitiveUvs(ImportedPrimitive primitive, bool foldS = true, bool foldT = true)
     {
         if (!foldS && !foldT) return;
-        // quick out: nothing outside [0,1) on an axis that is being folded
-        bool any = false;
-        foreach (var v in ip.Vertices)
-            if ((foldS && (v.Uv.X < 0f || v.Uv.X >= 1f)) || (foldT && (v.Uv.Y < 0f || v.Uv.Y >= 1f))) { any = true; break; }
-        if (!any) return;
+        bool anyOutside = false;
+        foreach (var vertex in primitive.Vertices)
+            if ((foldS && (vertex.Uv.X < 0f || vertex.Uv.X >= 1f)) || (foldT && (vertex.Uv.Y < 0f || vertex.Uv.Y >= 1f))) { anyOutside = true; break; }
+        if (!anyOutside) return;
 
-        var newTris = new List<(int A, int B, int C)>(ip.Triangles.Count);
+        var newTriangles = new List<(int First, int Second, int Third)>(primitive.Triangles.Count);
         // (vertexIndex, tileX, tileY) -> resolved vertex index in the rewritten list
         var remap = new Dictionary<(int, int, int), int>();
 
-        int Resolve(int vi, int tx, int ty)
+        int Resolve(int vertexIndex, int tileX, int tileY)
         {
-            var key = (vi, tx, ty);
-            if (remap.TryGetValue(key, out int got)) return got;
-            var src = ip.Vertices[vi];
-            int outIdx;
-            if (tx == 0 && ty == 0)
+            var key = (vertexIndex, tileX, tileY);
+            if (remap.TryGetValue(key, out int resolved)) return resolved;
+            var source = primitive.Vertices[vertexIndex];
+            int outIndex;
+            if (tileX == 0 && tileY == 0)
             {
-                outIdx = vi;                 // tile (0,0): reuse the original vertex slot
+                outIndex = vertexIndex;
             }
             else
             {
-                var dup = new ImportedVertex
+                var duplicate = new ImportedVertex
                 {
-                    Pos = src.Pos, FramePos = src.FramePos, Normal = src.Normal,
-                    Uv = new Vector2(src.Uv.X - tx, src.Uv.Y - ty),
-                    Influences = src.Influences,   // share (read-only downstream)
-                    Game = src.Game,
+                    Position = source.Position, FramePos = source.FramePos, Normal = source.Normal,
+                    Uv = new Vector2(source.Uv.X - tileX, source.Uv.Y - tileY),
+                    Influences = source.Influences,   // share (read-only downstream)
+                    Game = source.Game,
                 };
-                outIdx = ip.Vertices.Count;
-                ip.Vertices.Add(dup);
+                outIndex = primitive.Vertices.Count;
+                primitive.Vertices.Add(duplicate);
             }
-            remap[key] = outIdx;
-            return outIdx;
+            remap[key] = outIndex;
+            return outIndex;
         }
 
-        foreach (var (a, b, c) in ip.Triangles)
+        foreach (var (corner0, corner1, corner2) in primitive.Triangles)
         {
-            var ua = ip.Vertices[a].Uv; var ub = ip.Vertices[b].Uv; var uc = ip.Vertices[c].Uv;
-            float cx = (ua.X + ub.X + uc.X) / 3f;
-            float cy = (ua.Y + ub.Y + uc.Y) / 3f;
-            int tx = foldS ? (int)MathF.Floor(cx) : 0, ty = foldT ? (int)MathF.Floor(cy) : 0;
-            newTris.Add((Resolve(a, tx, ty), Resolve(b, tx, ty), Resolve(c, tx, ty)));
+            var uv0 = primitive.Vertices[corner0].Uv; var uv1 = primitive.Vertices[corner1].Uv; var uv2 = primitive.Vertices[corner2].Uv;
+            float centroidU = (uv0.X + uv1.X + uv2.X) / 3f;
+            float centroidV = (uv0.Y + uv1.Y + uv2.Y) / 3f;
+            int tileX = foldS ? (int)MathF.Floor(centroidU) : 0, tileY = foldT ? (int)MathF.Floor(centroidV) : 0;
+            newTriangles.Add((Resolve(corner0, tileX, tileY), Resolve(corner1, tileX, tileY), Resolve(corner2, tileX, tileY)));
         }
-        ip.Triangles = newTris;
+        primitive.Triangles = newTriangles;
 
-        // finally fold any tile-(0,0) originals still sitting outside [0,1] (e.g. a vertex at
-        // exactly 1.0, or one only ever used by tile-(0,0) tris but authored at 1.x)
-        foreach (var v in ip.Vertices)
+        // fold tile-(0,0) originals still outside [0,1] (a vertex at exactly 1.0, or one authored at 1.x)
+        foreach (var vertex in primitive.Vertices)
         {
-            float wx = v.Uv.X, wy = v.Uv.Y;
+            float wrappedU = vertex.Uv.X, wrappedV = vertex.Uv.Y;
             if (foldS)
             {
-                wx = v.Uv.X - MathF.Floor(v.Uv.X);
-                if (wx == 0f && v.Uv.X != 0f) wx = 1f;
+                wrappedU = vertex.Uv.X - MathF.Floor(vertex.Uv.X);
+                if (wrappedU == 0f && vertex.Uv.X != 0f) wrappedU = 1f;
             }
             if (foldT)
             {
-                wy = v.Uv.Y - MathF.Floor(v.Uv.Y);
-                if (wy == 0f && v.Uv.Y != 0f) wy = 1f;
+                wrappedV = vertex.Uv.Y - MathF.Floor(vertex.Uv.Y);
+                if (wrappedV == 0f && vertex.Uv.Y != 0f) wrappedV = 1f;
             }
-            v.Uv = new Vector2(wx, wy);
+            vertex.Uv = new Vector2(wrappedU, wrappedV);
         }
     }
 
-    /// Decode the glb's embedded base-colour images (per "mat_texN" texture index) into raw
-    /// RGBA TextureInputs for the RH2 re-encoder. Decoded by LoadRgba, the same stb_image
-    /// decode as the model viewer. Best-effort: a
-    /// texture that fails to decode is skipped (its slot gets a flat white texture).
-    /// Each frame is capped at Rh0Assembler.MaxTextureDim, the cap every native texture is built
-    /// under (Rh2Encoder.ChooseTarget). THIS MATTERS MORE for animated slots than static
-    /// ones: a flipbook sheet's width grows with frame count, so an unclamped per-frame
-    /// cell size (e.g. a raw 1012px-wide source rounding up to 1024) multiplies directly
-    /// by frame count in the final sheet - a 4-frame flipbook from an uncapped 1024px
-    /// source becomes a 4096x1024 sheet (~4 MB encoded), which cannot fit in either a
-    /// fixed 1 MiB monster.mrg slot or a typical MODEL.MRG model's real budget. Clamping
-    /// each cell first keeps sheet size bounded and predictable the same way
-    /// static textures already are.
+    /// Decodes the glb's embedded base-colour images (per "mat_texN" texture index) into raw
+    /// RGBA TextureInputs for the RH2 re-encoder, with the same stb_image decode as the model
+    /// viewer (DecodeRgba). A texture that fails to decode is skipped (its slot gets a flat
+    /// white texture). Each frame is capped at Rh0Assembler.MaxTextureDim, the cap every native
+    /// texture is built under (Rh2Encoder.ChooseTarget). This matters most for animated slots:
+    /// a flipbook sheet's width grows with frame count, so an uncapped 1024px source makes a
+    /// 4-frame sheet of 4096x1024 (~4 MB encoded), which fits neither a fixed 1 MiB monster.mrg
+    /// slot nor a typical MODEL.MRG model's budget.
     public static List<Rh0Assembler.TextureInput> DecodeGlbTextures(ImportedModel model)
     {
-        const int maxDim = Rh0Assembler.MaxTextureDim;
+        const int maxDimension = Rh0Assembler.MaxTextureDim;
         var inputs = new List<Rh0Assembler.TextureInput>();
         var animSlots = model.TextureAnimFrames.Keys.ToHashSet();
 
-        foreach (var (texIdx, img) in model.TextureImages)
+        foreach (var (textureIndex, image) in model.TextureImages)
         {
-            if (animSlots.Contains(texIdx)) continue; // handled by the anim branch below instead
+            if (animSlots.Contains(textureIndex)) continue; // animated slots are packed below
             try
             {
-                Image cpu = DecodeRgba(img);
-                if (cpu.Width <= 0 || cpu.Height <= 0) continue;
-                byte[] rgba = Pixels(cpu);
-                ApplyEditedAnimFrames(model, texIdx, rgba, cpu.Width, cpu.Height);
-                if (model.OpaqueAlphaSlots.Contains(texIdx))
-                    for (int a = 3; a < rgba.Length; a += 4) rgba[a] = 255;
-                else if (model.CoverageAlphaSlots.Contains(texIdx))
-                    for (int a = 3; a < rgba.Length; a += 4) rgba[a] = rgba[a] >= 8 ? (byte)255 : (byte)0;
+                Image decoded = DecodeRgba(image);
+                if (decoded.Width <= 0 || decoded.Height <= 0) continue;
+                byte[] rgba = Pixels(decoded);
+                ApplyEditedAnimFrames(model, textureIndex, rgba, decoded.Width, decoded.Height);
+                if (model.OpaqueAlphaSlots.Contains(textureIndex))
+                    for (int alphaIndex = 3; alphaIndex < rgba.Length; alphaIndex += 4) rgba[alphaIndex] = 255;
+                else if (model.CoverageAlphaSlots.Contains(textureIndex))
+                    for (int alphaIndex = 3; alphaIndex < rgba.Length; alphaIndex += 4) rgba[alphaIndex] = rgba[alphaIndex] >= 8 ? (byte)255 : (byte)0;
                 inputs.Add(new Rh0Assembler.TextureInput {
-                    TexIdx = texIdx,
+                    TextureIndex = textureIndex,
                     Rgba = rgba,
-                    Width = cpu.Width,
-                    Height = cpu.Height,
-                    AnimRecords = model.TextureAnimRecords.TryGetValue(texIdx, out var ar) ? ar : null,
+                    Width = decoded.Width,
+                    Height = decoded.Height,
+                    AnimationRecords = model.TextureAnimRecords.TryGetValue(textureIndex, out var records) ? records : null,
                     AnimRecordsInImagePixels = !model.IsDotrExtractedGlb,
                 });
-                Raylib.UnloadImage(cpu);
+                Raylib.UnloadImage(decoded);
             }
             catch
             {
@@ -1483,100 +1463,99 @@ public static class GlbImporter
             }
         }
 
-        // --- animated slots: decode every frame, pack into one sprite sheet ---
-        // The game plays a flipbook by copying cell i of a cols x rows grid onto cell 0 every draw
-        // (Rh0Assembler.BuildCustomTexAnimEntry), so the sheet is that grid with frame 0 in cell 0,
-        // and the faces must sample cell 0 only: TextureAnimUvScale tells RebuildPipeline how far to
-        // squeeze their UVs. Every frame is resized to frame 0's size (clamped to maxDim), then
-        // halved until a grid of at most 15 x 15 cells fits MaxAnimSheetPixels (TryAnimSheetLayout).
-        foreach (var (texIdx, frames) in model.TextureAnimFrames)
+        /* Animated slots: every frame is decoded and packed into one sprite sheet. The game plays
+           a flipbook by copying cell i of a cols x rows grid onto cell 0 every draw
+           (Rh0Assembler.BuildCustomTexAnimEntry), so the sheet is that grid with frame 0 in
+           cell 0 and the faces sample cell 0 only: TextureAnimUvScale tells RebuildPipeline how
+           far to squeeze their UVs. Every frame is resized to frame 0's size (clamped to
+           maxDimension), then halved until a grid of at most 15 x 15 cells fits
+           MaxAnimSheetPixels (TryAnimSheetLayout). */
+        foreach (var (animatedTexture, frames) in model.TextureAnimFrames)
         {
             var images = new List<Image>();
             try
             {
-                foreach (var f in frames)
+                foreach (var frame in frames)
                 {
                     if (images.Count == Rh0Assembler.MaxAnimFrames)
                     {
-                        model.TexSlotWarnings.Add($"texture slot {texIdx}: {frames.Count} animation frames, " +
+                        model.TexSlotWarnings.Add($"texture slot {animatedTexture}: {frames.Count} animation frames, " +
                             $"only the first {Rh0Assembler.MaxAnimFrames} are used");
                         break;
                     }
-                    Image cpu = DecodeRgba(f);
-                    if (cpu.Width <= 0 || cpu.Height <= 0) continue;
-                    images.Add(cpu);
+                    Image decoded = DecodeRgba(frame);
+                    if (decoded.Width <= 0 || decoded.Height <= 0) continue;
+                    images.Add(decoded);
                 }
-                if (images.Count < 2) continue; // matches TextureAnimFrames' own >=2 rule
+                if (images.Count < 2) continue;
 
-                int n = images.Count;
-                int fw = images[0].Width, fh = images[0].Height;
-                if (fw > maxDim || fh > maxDim)
+                int frameCount = images.Count;
+                int frameWidth = images[0].Width, frameHeight = images[0].Height;
+                if (frameWidth > maxDimension || frameHeight > maxDimension)
                 {
-                    float scale = Math.Min((float)maxDim / fw, (float)maxDim / fh);
-                    fw = Math.Max(1, (int)Math.Round(fw * scale));
-                    fh = Math.Max(1, (int)Math.Round(fh * scale));
+                    float scale = Math.Min((float)maxDimension / frameWidth, (float)maxDimension / frameHeight);
+                    frameWidth = Math.Max(1, (int)Math.Round(frameWidth * scale));
+                    frameHeight = Math.Max(1, (int)Math.Round(frameHeight * scale));
                 }
                 AnimSheetLayout layout;
-                while (!TryAnimSheetLayout(n, fw, fh, out layout))
+                while (!TryAnimSheetLayout(frameCount, frameWidth, frameHeight, out layout))
                 {
-                    if (fw == 1 && fh == 1) break;
-                    fw = Math.Max(1, fw / 2);
-                    fh = Math.Max(1, fh / 2);
+                    if (frameWidth == 1 && frameHeight == 1) break;
+                    frameWidth = Math.Max(1, frameWidth / 2);
+                    frameHeight = Math.Max(1, frameHeight / 2);
                 }
                 if (layout.Cols == 0)
                 {
-                    model.TexSlotWarnings.Add($"texture slot {texIdx}: {n} animation frames do not fit one texture; not animated");
+                    model.TexSlotWarnings.Add($"texture slot {animatedTexture}: {frameCount} animation frames do not fit one texture; not animated");
                     continue;
                 }
-                if (images.Any(i => i.Width != images[0].Width || i.Height != images[0].Height))
-                    model.TexSlotWarnings.Add($"texture slot {texIdx}: animation frames differ in size; all resized to frame 0's");
+                if (images.Any(frameImage => frameImage.Width != images[0].Width || frameImage.Height != images[0].Height))
+                    model.TexSlotWarnings.Add($"texture slot {animatedTexture}: animation frames differ in size; all resized to frame 0's");
 
-                // Cells (POT, like retail's) hold the frame at their top-left; the loop runs over all
-                // cols * rows cells, so cells past the last frame repeat it.
-                int sheetW = layout.SheetW, sheetH = layout.SheetH, bw = layout.CellW, bh = layout.CellH;
-                byte[] sheet = new byte[sheetW * sheetH * 4];
-                byte[] cell = new byte[fw * fh * 4];
-                for (int c = 0; c < layout.Cols * layout.Rows; c++)
+                // POT cells (like retail's) hold the frame at their top-left; cells past the last frame repeat it.
+                int sheetWidth = layout.SheetW, sheetHeight = layout.SheetH, cellWidth = layout.CellW, cellHeight = layout.CellH;
+                byte[] sheet = new byte[sheetWidth * sheetHeight * 4];
+                byte[] cell = Array.Empty<byte>();
+                for (int cellIndex = 0; cellIndex < layout.Cols * layout.Rows; cellIndex++)
                 {
-                    if (c < n)
+                    if (cellIndex < frameCount)
                     {
-                        Image img = images[c];
-                        if (img.Width != fw || img.Height != fh)
+                        Image frameImage = images[cellIndex];
+                        if (frameImage.Width != frameWidth || frameImage.Height != frameHeight)
                         {
-                            Raylib.ImageResize(ref img, fw, fh);
-                            images[c] = img;
+                            Raylib.ImageResize(ref frameImage, frameWidth, frameHeight);
+                            images[cellIndex] = frameImage;
                         }
-                        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)img.Data, cell, 0, cell.Length); }
+                        cell = Pixels(frameImage);
                     }
-                    int cx = (c % layout.Cols) * bw, cy = (c / layout.Cols) * bh;
-                    for (int y = 0; y < fh; y++)
-                        Buffer.BlockCopy(cell, y * fw * 4, sheet, ((cy + y) * sheetW + cx) * 4, fw * 4);
+                    int cellX = (cellIndex % layout.Cols) * cellWidth, cellY = (cellIndex / layout.Cols) * cellHeight;
+                    for (int y = 0; y < frameHeight; y++)
+                        Buffer.BlockCopy(cell, y * frameWidth * 4, sheet, ((cellY + y) * sheetWidth + cellX) * 4, frameWidth * 4);
                 }
 
                 inputs.Add(new Rh0Assembler.TextureInput {
-                    TexIdx = texIdx,
+                    TextureIndex = animatedTexture,
                     Rgba = sheet,
-                    Width = sheetW,
-                    Height = sheetH,
-                    AnimFrameCount = layout.Cols * layout.Rows,
-                    AnimCols = layout.Cols,
-                    AnimRows = layout.Rows,
-                    AnimBlockW = bw,
-                    AnimBlockH = bh,
-                    AnimTicksPerFrame = model.TextureAnimTicks.TryGetValue(texIdx, out int customTicks)
+                    Width = sheetWidth,
+                    Height = sheetHeight,
+                    AnimationFrameCount = layout.Cols * layout.Rows,
+                    AnimationColumns = layout.Cols,
+                    AnimationRows = layout.Rows,
+                    AnimationBlockWidth = cellWidth,
+                    AnimationBlockHeight = cellHeight,
+                    AnimationTicksPerFrame = model.TextureAnimTicks.TryGetValue(animatedTexture, out int customTicks)
                         ? customTicks
-                        : 5, // default matches the one real retail sample (see TextureInput remarks)
+                        : 5, // the one retail sample's rate
                 });
-                model.TextureAnimUvScale[texIdx] = new Vector2((float)fw / sheetW, (float)fh / sheetH);
+                model.TextureAnimUvScale[animatedTexture] = new Vector2((float)frameWidth / sheetWidth, (float)frameHeight / sheetHeight);
             }
             catch
             {
-                /* skip this texture's animation; falls through with no TextureInput for
-                   this slot, so the template's existing texture/anim is kept untouched */
+                /* no TextureInput for this slot: the template's texture and animation stay */
             }
             finally
             {
-                foreach (var img in images) Raylib.UnloadImage(img);
+                foreach (var loadedImage in images) Raylib.UnloadImage(loadedImage);
             }
         }
 
@@ -1589,146 +1568,140 @@ public static class GlbImporter
     }
 
     /// A sprite sheet is encoded at exactly its packed size (Rh0Assembler never reduces it), so it
-    /// has to fit the 1 MiB block on its own terms: 512 x 512 texels, 256 KB at 8 bpp, the same
-    /// ceiling as Rh0Assembler.MaxTextureDim for a static texture. (A 512 x 1024 sheet overflowed a monster
-    /// slot by 13 KB.)
+    /// must fit the 1 MiB block on its own: 512 x 512 texels, 256 KB at 8 bpp, the same ceiling
+    /// as Rh0Assembler.MaxTextureDim for a static texture. (A 512 x 1024 sheet overflowed a
+    /// monster slot by 13 KB.)
     private const long MaxAnimSheetPixels = 512 * 512;
 
-    /// Smallest grid of POT cells for n frames of fw x fh: at most 15 x 15 cells (the entry's
+    /// Smallest grid of POT cells for frameCount frames of frameWidth x frameHeight: at most 15 x 15 cells (the entry's
     /// nibbles), the sheet POT with width >= 128 and height >= 64 (Rh2Encoder.BuildNative), at
     /// most 1024 on either side (the GS limit) and MaxAnimSheetPixels in all. Cols = 0 when
     /// nothing fits.
-    private static bool TryAnimSheetLayout(int n, int fw, int fh, out AnimSheetLayout best)
+    private static bool TryAnimSheetLayout(int frameCount, int frameWidth, int frameHeight, out AnimSheetLayout best)
     {
         best = default;
-        int bw = Rh2Encoder.NextPot(fw), bh = Rh2Encoder.NextPot(fh);
+        int cellWidth = Rh2Encoder.NextPot(frameWidth), cellHeight = Rh2Encoder.NextPot(frameHeight);
         long bestArea = long.MaxValue;
         for (int cols = 1; cols <= 15; cols++)
         {
-            int rows = (n + cols - 1) / cols;
+            int rows = (frameCount + cols - 1) / cols;
             if (rows > 15) continue;
-            int w = Rh2Encoder.NextPot(Math.Max(bw * cols, 128));
-            int h = Rh2Encoder.NextPot(Math.Max(bh * rows, 64));
-            if (w > 1024 || h > 1024 || (long)w * h > MaxAnimSheetPixels) continue;
+            int sheetWidth = Rh2Encoder.NextPot(Math.Max(cellWidth * cols, 128));
+            int sheetHeight = Rh2Encoder.NextPot(Math.Max(cellHeight * rows, 64));
+            if (sheetWidth > 1024 || sheetHeight > 1024 || (long)sheetWidth * sheetHeight > MaxAnimSheetPixels) continue;
             // fewer spare cells first (they repeat the last frame), then the smaller sheet
-            long area = (long)(cols * rows - n) << 32 | (long)w * h;
+            long area = (long)(cols * rows - frameCount) << 32 | (long)sheetWidth * sheetHeight;
             if (area < bestArea)
             {
                 bestArea = area;
-                best = new AnimSheetLayout { Cols = cols, Rows = rows, CellW = bw, CellH = bh, SheetW = w, SheetH = h };
+                best = new AnimSheetLayout { Cols = cols, Rows = rows, CellW = cellWidth, CellH = cellHeight, SheetW = sheetWidth, SheetH = sheetHeight };
             }
         }
         return best.Cols > 0;
     }
 
-    /// Fold an edited animation frame of an extracted glb back into the base image.
-    ///
-    /// An animated retail slot is ONE texture: each record makes the GS copy cell i of a
-    /// cols x rows sheet inside that texture onto a fixed destination rectangle of the same
-    /// texture (TexAnim), so a frame image is just the base image with those cells stamped
-    /// in. Repainting a cell in the base image therefore already works; repainting a FRAME
-    /// has to be mapped back to the cell the game copies it from, which is what this does.
-    /// The extractor's per-frame stamps say which record and cell made each destination
-    /// rectangle and what its pixels hashed to when extracted: an unchanged hash means the
-    /// frame was not touched and the base image's own (possibly edited) cell wins, a changed
-    /// hash means the frame was painted and its pixels replace the cell. The records
-    /// themselves are untouched, so the animation still plays exactly as retail's.
-    private static void ApplyEditedAnimFrames(ImportedModel model, int texIdx, byte[] rgba, int w, int h)
+    /// Folds an edited animation frame of an extracted glb back into the base image.
+    /// An animated retail slot is one texture: each record makes the GS copy cell i of a
+    /// cols x rows sheet inside it onto a fixed destination rectangle of the same texture
+    /// (TexAnim), so a frame image is the base image with those cells stamped in. Repainting a
+    /// cell in the base image already works; a repainted frame is mapped back to the cell the
+    /// game copies it from. The extractor's per-frame stamps give the record and cell that made
+    /// each destination rectangle and its pixel hash at extraction: an unchanged hash means the
+    /// frame was not touched and the base image's own (possibly edited) cell wins; a changed
+    /// hash means the frame was painted and its pixels replace the cell. The records stay
+    /// untouched.
+    private static void ApplyEditedAnimFrames(ImportedModel model, int textureIndex, byte[] rgba, int width, int height)
     {
-        if (!model.TextureAnimEditFrames.TryGetValue(texIdx, out var frames)) return;
-        if (!model.TextureAnimStamps.TryGetValue(texIdx, out var stampsByFrame)) return;
-        if (!model.TextureAnimRecords.TryGetValue(texIdx, out var recs)) return;
+        if (!model.TextureAnimEditFrames.TryGetValue(textureIndex, out var frames)) return;
+        if (!model.TextureAnimStamps.TryGetValue(textureIndex, out var stampsByFrame)) return;
+        if (!model.TextureAnimRecords.TryGetValue(textureIndex, out var records)) return;
 
-        foreach (var (frame, img) in frames)
+        foreach (var (frame, image) in frames)
         {
             if (!stampsByFrame.TryGetValue(frame, out var stamps)) continue;
             try
             {
-                Image cpu = DecodeRgba(img);
+                Image decoded = DecodeRgba(image);
                 try
                 {
-                    // The records' rectangles are in the retail texture's pixel space, so a
-                    // frame that is no longer the base image's size cannot be mapped back.
-                    if (cpu.Width != w || cpu.Height != h) continue;
-                    byte[] fr = Pixels(cpu);
+                    // record rectangles are in the retail texture's pixel space: a resized frame cannot be mapped back
+                    if (decoded.Width != width || decoded.Height != height) continue;
+                    byte[] framePixels = Pixels(decoded);
 
                     for (int k = 0; k < stamps.Count; k++)
                     {
-                        var (rec, cell, hash) = stamps[k];
-                        int o = rec * 0x18;
-                        if (o + 0x18 > recs.Length) continue;
-                        int cols = Math.Max(1, recs[o + 2] & 0xF);
-                        int bw = U16L(recs, o + 0x08), bh = U16L(recs, o + 0x0A);
-                        int sx = U16L(recs, o + 0x0C) + bw * (cell % cols);
-                        int sy = U16L(recs, o + 0x0E) + bh * (cell / cols);
-                        int dx = U16L(recs, o + 0x10), dy = U16L(recs, o + 0x12);
-                        if (bw <= 0 || bh <= 0) continue;
-                        if (ModelExtractor.RectHash(fr, w, h, dx, dy, bw, bh) == hash) continue;  // frame untouched
+                        var (record, cell, hash) = stamps[k];
+                        int recordOffset = record * 0x18;
+                        if (recordOffset + 0x18 > records.Length) continue;
+                        int cols = Math.Max(1, records[recordOffset + 2] & 0xF);
+                        int cellWidth = ReadU16(records, recordOffset + 0x08), cellHeight = ReadU16(records, recordOffset + 0x0A);
+                        int sourceX = ReadU16(records, recordOffset + 0x0C) + cellWidth * (cell % cols);
+                        int sourceY = ReadU16(records, recordOffset + 0x0E) + cellHeight * (cell / cols);
+                        int destinationX = ReadU16(records, recordOffset + 0x10), destinationY = ReadU16(records, recordOffset + 0x12);
+                        if (cellWidth <= 0 || cellHeight <= 0) continue;
+                        if (ModelExtractor.RectHash(framePixels, width, height, destinationX, destinationY, cellWidth, cellHeight) == hash) continue;
 
-                        for (int y = 0; y < bh; y++)
+                        for (int y = 0; y < cellHeight; y++)
                         {
-                            int syy = sy + y, dyy = dy + y;
-                            if ((uint)syy >= (uint)h || (uint)dyy >= (uint)h) continue;
-                            for (int x = 0; x < bw; x++)
+                            int sourceRow = sourceY + y, destinationRow = destinationY + y;
+                            if ((uint)sourceRow >= (uint)height || (uint)destinationRow >= (uint)height) continue;
+                            for (int x = 0; x < cellWidth; x++)
                             {
-                                int sxx = sx + x, dxx = dx + x;
-                                if ((uint)sxx >= (uint)w || (uint)dxx >= (uint)w) continue;
-                                // A later stamp of the same frame drew over this pixel, so
-                                // it is not this cell's (the bake stamps in record order).
-                                if (CoveredLater(recs, stamps, k, dxx, dyy)) continue;
-                                int d = (syy * w + sxx) * 4, sO = (dyy * w + dxx) * 4;
-                                rgba[d] = fr[sO]; rgba[d + 1] = fr[sO + 1];
-                                rgba[d + 2] = fr[sO + 2]; rgba[d + 3] = fr[sO + 3];
+                                int sourceColumn = sourceX + x, destinationColumn = destinationX + x;
+                                if ((uint)sourceColumn >= (uint)width || (uint)destinationColumn >= (uint)width) continue;
+                                // a later stamp of this frame drew over the pixel (the bake stamps in record order)
+                                if (CoveredLater(records, stamps, k, destinationColumn, destinationRow)) continue;
+                                int cellPixel = (sourceRow * width + sourceColumn) * 4, framePixel = (destinationRow * width + destinationColumn) * 4;
+                                rgba[cellPixel] = framePixels[framePixel]; rgba[cellPixel + 1] = framePixels[framePixel + 1];
+                                rgba[cellPixel + 2] = framePixels[framePixel + 2]; rgba[cellPixel + 3] = framePixels[framePixel + 3];
                             }
                         }
                     }
                 }
-                finally { Raylib.UnloadImage(cpu); }
+                finally { Raylib.UnloadImage(decoded); }
             }
             catch { /* a frame that will not decode just means no write-back for it */ }
         }
     }
 
 
-    /// Is (x,y) inside the destination rectangle of a stamp after index k of this frame?
-    private static bool CoveredLater(byte[] recs, List<(int Rec, int Cell, uint Hash)> stamps, int k, int x, int y)
+    /// Is (x,y) inside the destination rectangle of a stamp after stampIndex in this frame?
+    private static bool CoveredLater(byte[] records, List<(int Rec, int Cell, uint Hash)> stamps, int stampIndex, int x, int y)
     {
-        for (int j = k + 1; j < stamps.Count; j++)
+        for (int j = stampIndex + 1; j < stamps.Count; j++)
         {
-            int o = stamps[j].Rec * 0x18;
-            if (o + 0x18 > recs.Length) continue;
-            int bw = U16L(recs, o + 0x08), bh = U16L(recs, o + 0x0A);
-            int dx = U16L(recs, o + 0x10), dy = U16L(recs, o + 0x12);
-            if (x >= dx && x < dx + bw && y >= dy && y < dy + bh) return true;
+            int recordOffset = stamps[j].Rec * 0x18;
+            if (recordOffset + 0x18 > records.Length) continue;
+            int cellWidth = ReadU16(records, recordOffset + 0x08), cellHeight = ReadU16(records, recordOffset + 0x0A);
+            int destinationX = ReadU16(records, recordOffset + 0x10), destinationY = ReadU16(records, recordOffset + 0x12);
+            if (x >= destinationX && x < destinationX + cellWidth && y >= destinationY && y < destinationY + cellHeight) return true;
         }
         return false;
     }
 
-    private static int U16L(byte[] b, int o) => b[o] | (b[o + 1] << 8);
-
     /// A glTF image decoded by Raylib (stb_image), in its own pixel format; Width is 0 when it
     /// does not decode. The viewer uploads these and the importer encodes them, so both see the
     /// same pixels. The caller unloads it.
-    public static Image DecodeImage(SharpGLTF.Memory.MemoryImage img)
+    public static Image DecodeImage(SharpGLTF.Memory.MemoryImage image)
     {
-        string ext = string.IsNullOrEmpty(img.FileExtension) ? "png" : img.FileExtension;
-        return Raylib.LoadImageFromMemory("." + ext, img.Content.ToArray());
+        string extension = string.IsNullOrEmpty(image.FileExtension) ? "png" : image.FileExtension;
+        return Raylib.LoadImageFromMemory("." + extension, image.Content.ToArray());
     }
 
     /// DecodeImage converted to RGBA8.
-    private static Image DecodeRgba(SharpGLTF.Memory.MemoryImage img)
+    private static Image DecodeRgba(SharpGLTF.Memory.MemoryImage image)
     {
-        Image cpu = DecodeImage(img);
-        if (cpu.Width > 0 && cpu.Height > 0)
-            Raylib.ImageFormat(ref cpu, PixelFormat.UncompressedR8G8B8A8);
-        return cpu;
+        Image decoded = DecodeImage(image);
+        if (decoded.Width > 0 && decoded.Height > 0)
+            Raylib.ImageFormat(ref decoded, PixelFormat.UncompressedR8G8B8A8);
+        return decoded;
     }
 
     /// A copy of an RGBA8 image's pixels.
-    private static byte[] Pixels(Image cpu)
+    internal static byte[] Pixels(Image image)
     {
-        byte[] rgba = new byte[cpu.Width * cpu.Height * 4];
-        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)cpu.Data, rgba, 0, rgba.Length); }
+        byte[] rgba = new byte[image.Width * image.Height * 4];
+        unsafe { System.Runtime.InteropServices.Marshal.Copy((IntPtr)image.Data, rgba, 0, rgba.Length); }
         return rgba;
     }
 }

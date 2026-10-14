@@ -1,8 +1,9 @@
 namespace DotrAssetModder;
 
 using SkiaSharp;
+using static DotrAssetModder.Bin;
 
-public static class PS2Icon
+public static class Ps2Icon
 {
     const int TEX_WIDTH = 128;
     const int TEX_HEIGHT = 64;
@@ -18,7 +19,7 @@ public static class PS2Icon
 
     static bool[][] stpMasks = new bool[3][];
 
-    static byte Expand5To8(int v5) => (byte)((v5 << 3) | (v5 >> 2));
+    static byte Expand5To8(int value5Bit) => (byte)((value5Bit << 3) | (value5Bit >> 2));
 
     public static SKBitmap ExtractIconTexture(byte[] iconData)
     {
@@ -43,23 +44,23 @@ public static class PS2Icon
 
                 for (int i = 0; i < TEX_WIDTH * TEX_HEIGHT; i++)
                 {
-                    ushort p = BitConverter.ToUInt16(iconData, dataOffset + i * 2);
+                    ushort rawPixel = ReadU16(iconData, dataOffset + i * 2);
 
-                    int r5 = (p & 0x1F);
-                    int g5 = (p >> 5) & 0x1F;
-                    int b5 = (p >> 10) & 0x1F;
+                    int red5 = (rawPixel & 0x1F);
+                    int green5 = (rawPixel >> 5) & 0x1F;
+                    int blue5 = (rawPixel >> 10) & 0x1F;
 
-                    byte r = Expand5To8(r5);
-                    byte g = Expand5To8(g5);
-                    byte b = Expand5To8(b5);
+                    byte red8 = Expand5To8(red5);
+                    byte green8 = Expand5To8(green5);
+                    byte blue8 = Expand5To8(blue5);
 
-                    bool stp = (p & 0x8000) != 0;
+                    bool stp = (rawPixel & 0x8000) != 0;
                     stpMasks[CurrentTextureIndex][pixelBase + i] = stp;
 
-                    byte a = (r == 0 && g == 0 && b == 0) ? (byte)0 : (byte)255;
+                    byte alpha8 = (red8 == 0 && green8 == 0 && blue8 == 0) ? (byte)0 : (byte)255;
 
                     pixels[pixelBase + i] =
-                        (uint)(a << 24) | ((uint)r << 16) | ((uint)g << 8) | b;
+                        (uint)(alpha8 << 24) | ((uint)red8 << 16) | ((uint)green8 << 8) | blue8;
                 }
             }
         }
@@ -93,19 +94,19 @@ public static class PS2Icon
 
                 for (int i = 0; i < TEX_WIDTH * TEX_HEIGHT; i++)
                 {
-                    uint p = pixels[pixelBase + i];
+                    uint bgraPixel = pixels[pixelBase + i];
 
-                    byte r8 = (byte)((p >> 16) & 0xFF);
-                    byte g8 = (byte)((p >> 8) & 0xFF);
-                    byte b8 = (byte)(p & 0xFF);
+                    byte red8 = (byte)((bgraPixel >> 16) & 0xFF);
+                    byte green8 = (byte)((bgraPixel >> 8) & 0xFF);
+                    byte blue8 = (byte)(bgraPixel & 0xFF);
 
-                    ushort r5 = (ushort)((r8 * 31 + 127) / 255);
-                    ushort g5 = (ushort)((g8 * 31 + 127) / 255);
-                    ushort b5 = (ushort)((b8 * 31 + 127) / 255);
+                    ushort red5 = (ushort)((red8 * 31 + 127) / 255);
+                    ushort green5 = (ushort)((green8 * 31 + 127) / 255);
+                    ushort blue5 = (ushort)((blue8 * 31 + 127) / 255);
 
                     bool stp = stpMask[pixelBase + i];
 
-                    ushort packed = (ushort)(b5 | (g5 << 5) | (r5 << 10) | (stp ? 0x8000 : 0));
+                    ushort packed = (ushort)(blue5 | (green5 << 5) | (red5 << 10) | (stp ? 0x8000 : 0));
 
                     int byteIndex = dataOffset + i * 2;
                     output[byteIndex] = (byte)(packed & 0xFF);

@@ -32,11 +32,11 @@ public class TextureEditorWindow : IDisposable
     QuantMode quantMode = QuantMode.MedianCut;
 
     List<SKColor> palette = new();
-    int selectedPaletteIdx = -1;
+    int selectedPaletteIndex = -1;
     SKColor brushColor = SKColors.Black;
     bool wasPainting;
 
-    int sbColCount = 4;
+    int sidebarColumnCount = 4;
     int sidebarColumns = 1;
     bool scrollToSelected;
 
@@ -52,8 +52,8 @@ public class TextureEditorWindow : IDisposable
     PaintCanvas? picMiniFullCanvas = null;
     SKPointI cropOrigin = new(0, 0);
     float cropZoom = 1f;
-    int cropSrcW = 40;
-    int cropSrcH = 32;
+    int cropSourceWidth = 40;
+    int cropSourceHeight = 32;
     bool centerMouseOnZoom = false;
 
     PicMiniFilter picMiniFilter = PicMiniFilter.Point;
@@ -64,7 +64,7 @@ public class TextureEditorWindow : IDisposable
     }
     public void Render()
     {
-        DrawSidebar(glRD.GetScreenPixelsFromPercent(25, 10).X);
+        DrawSidebar(GuiContext.GetScreenPixelsFromPercent(25, 10).X);
         ImGui.SameLine();
         if (isEditMode && canvas != null)
         {
@@ -138,9 +138,9 @@ public class TextureEditorWindow : IDisposable
         ImGui.Separator();
         ImGui.BeginChild("Scrollable_bar");
         float spacing = ImGui.GetStyle().ItemSpacing.X;
-        float avail = ImGui.GetContentRegionAvail().X;
-        float thumb = MathF.Max(1f, (avail - (sbColCount - 1) * spacing) / sbColCount);
-        sidebarColumns = sbColCount;
+        float availableWidth = ImGui.GetContentRegionAvail().X;
+        float thumbnailSize = MathF.Max(1f, (availableWidth - (sidebarColumnCount - 1) * spacing) / sidebarColumnCount);
+        sidebarColumns = sidebarColumnCount;
 
         for (int i = 0; i < slots.Count; i++)
         {
@@ -149,7 +149,7 @@ public class TextureEditorWindow : IDisposable
                 ImGui.SameLine();
             }
             ImGui.PushID(i);
-            ImGui.Image((IntPtr)slots[i].Thumbnail.Id, new Vector2(thumb, thumb));
+            ImGui.Image((IntPtr)slots[i].Thumbnail.Id, new Vector2(thumbnailSize, thumbnailSize));
             if (ImGui.IsItemHovered())
             {
                 ImGui.SetTooltip($"Slot {i}  {slots[i].Width}x{slots[i].Height}");
@@ -161,18 +161,18 @@ public class TextureEditorWindow : IDisposable
 
             if (i == currentIndex)
             {
-                var min = ImGui.GetItemRectMin();
-                var max = ImGui.GetItemRectMax();
-                var winPos = ImGui.GetWindowPos();
-                ImGui.GetWindowDrawList().AddRect(min, max, ImGui.GetColorU32(new Vector4(0f, 1f, 1f, 1f)), 0f, ImDrawFlags.None, 3f);
+                var itemRectMin = ImGui.GetItemRectMin();
+                var itemRectMax = ImGui.GetItemRectMax();
+                var windowPosition = ImGui.GetWindowPos();
+                ImGui.GetWindowDrawList().AddRect(itemRectMin, itemRectMax, ImGui.GetColorU32(new Vector4(0f, 1f, 1f, 1f)), 0f, ImDrawFlags.None, 3f);
                 if (scrollToSelected)
                 {
-                    float winMaxY = winPos.Y + ImGui.GetWindowHeight();
-                    if (min.Y < winPos.Y)
+                    float windowBottomY = windowPosition.Y + ImGui.GetWindowHeight();
+                    if (itemRectMin.Y < windowPosition.Y)
                     {
                         ImGui.SetScrollHereY(0f);
                     }
-                    else if (max.Y > winMaxY)
+                    else if (itemRectMax.Y > windowBottomY)
                     {
                         ImGui.SetScrollHereY(1f);
                     }
@@ -201,10 +201,10 @@ public class TextureEditorWindow : IDisposable
         HandleMouseZoom(region);
         HandleMousePan();
         DrawCheckerboard(region);
-        Vector2 sz = new Vector2(viewTexture.Width, viewTexture.Height) * zoom;
-        Vector2 pos = region * 0.5f + pan - sz * 0.5f;
-        ImGui.SetCursorPos(pos);
-        ImGui.Image((IntPtr)viewTexture.Id, sz);
+        Vector2 textureSize = new Vector2(viewTexture.Width, viewTexture.Height) * zoom;
+        Vector2 texturePosition = region * 0.5f + pan - textureSize * 0.5f;
+        ImGui.SetCursorPos(texturePosition);
+        ImGui.Image((IntPtr)viewTexture.Id, textureSize);
         ImGui.EndChild();
     }
 
@@ -227,7 +227,7 @@ public class TextureEditorWindow : IDisposable
 
     void HandleMousePan()
     {
-        var io = ImGui.GetIO();
+        var imGuiIo = ImGui.GetIO();
         if (!ImGui.IsWindowHovered())
         {
             return;
@@ -235,7 +235,7 @@ public class TextureEditorWindow : IDisposable
         if (ImGui.IsMouseClicked(ImGuiMouseButton.Middle))
         {
             dragging = true;
-            dragStartMouse = io.MousePos;
+            dragStartMouse = imGuiIo.MousePos;
             dragStartPan = pan;
         }
         if (!ImGui.IsMouseDown(ImGuiMouseButton.Middle))
@@ -244,21 +244,21 @@ public class TextureEditorWindow : IDisposable
         }
         if (dragging)
         {
-            pan = dragStartPan + (io.MousePos - dragStartMouse);
+            pan = dragStartPan + (imGuiIo.MousePos - dragStartMouse);
         }
     }
 
     void DrawCheckerboard(Vector2 region)
     {
         const int cell = 16;
-        var draw = ImGui.GetWindowDrawList();
+        var drawList = ImGui.GetWindowDrawList();
         var origin = ImGui.GetWindowPos();
         for (int y = 0; y < region.Y; y += cell)
         {
             for (int x = 0; x < region.X; x += cell)
             {
-                uint col = ((x / cell + y / cell) % 2) == 0 ? 0xFF2A2A2A : 0xFF3A3A3A;
-                draw.AddRectFilled(origin + new Vector2(x, y), origin + new Vector2(x + cell, y + cell), col);
+                uint cellColour = ((x / cell + y / cell) % 2) == 0 ? 0xFF2A2A2A : 0xFF3A3A3A;
+                drawList.AddRectFilled(origin + new Vector2(x, y), origin + new Vector2(x + cell, y + cell), cellColour);
             }
         }
     }
@@ -268,37 +268,37 @@ public class TextureEditorWindow : IDisposable
         ImGui.BeginChild("editor_root", Vector2.Zero);
         canvas!.Update();
 
-        float totalW = ImGui.GetContentRegionAvail().X;
-        float halfW = totalW * 0.5f;
+        float totalWidth = ImGui.GetContentRegionAvail().X;
+        float halfWidth = totalWidth * 0.5f;
         float spacingX = ImGui.GetStyle().ItemSpacing.X;
         float startX = ImGui.GetCursorPosX();
 
-        bool isPicMini = selectedMrgName.Equals(TextureSlotManager.PicMiniMrg, StringComparison.OrdinalIgnoreCase);
+        bool isPicMini = selectedMrgName.Equals(TextureSlotManager.PictureMiniMrg, StringComparison.OrdinalIgnoreCase);
 
         int leftRow1Count = isPicMini ? (cropMode ? 8 : 7) : 6;
         float separationWidth = 7f;
-        float leftBtnW = MathF.Max(28f, (halfW - 2 * (separationWidth + spacingX) - spacingX * (leftRow1Count - 1)) / leftRow1Count);
+        float leftButtonWidth = MathF.Max(28f, (halfWidth - 2 * (separationWidth + spacingX) - spacingX * (leftRow1Count - 1)) / leftRow1Count);
 
-        float row1Y = ImGui.GetCursorPosY();
+        float firstRowY = ImGui.GetCursorPosY();
         float resetZoomX = 0f;
 
-        DrawToolButton("Pencil", PaintCanvas.Tool.Pencil, leftBtnW);
+        DrawToolButton("Pencil", PaintCanvas.Tool.Pencil, leftButtonWidth);
         ImGui.SameLine();
-        DrawToolButton("Eraser", PaintCanvas.Tool.Eraser, leftBtnW);
+        DrawToolButton("Eraser", PaintCanvas.Tool.Eraser, leftButtonWidth);
         ImGui.SameLine();
-        DrawToolButton("Fill", PaintCanvas.Tool.Fill, leftBtnW);
+        DrawToolButton("Fill", PaintCanvas.Tool.Fill, leftButtonWidth);
         ImGui.SameLine();
-        DrawToolButton("Eyedrop", PaintCanvas.Tool.Eyedropper, leftBtnW);
+        DrawToolButton("Eyedrop", PaintCanvas.Tool.Eyedropper, leftButtonWidth);
 
         ImGui.SameLine();
         VerticalSeparator();
 
-        if (ImGui.Button("Undo", new Vector2(leftBtnW, 0)) && canvas.CanUndo)
+        if (ImGui.Button("Undo", new Vector2(leftButtonWidth, 0)) && canvas.CanUndo)
         {
             canvas.Undo();
         }
         ImGui.SameLine();
-        if (ImGui.Button("Redo", new Vector2(leftBtnW, 0)) && canvas.CanRedo)
+        if (ImGui.Button("Redo", new Vector2(leftButtonWidth, 0)) && canvas.CanRedo)
         {
             canvas.Redo();
         }
@@ -310,7 +310,7 @@ public class TextureEditorWindow : IDisposable
             if (cropMode)
             {
                 resetZoomX = ImGui.GetCursorPosX();
-                if (ImGui.Button("Edit PicMini", new Vector2(leftBtnW * 1.5f, 0)))
+                if (ImGui.Button("Edit PicMini", new Vector2(leftButtonWidth * 1.5f, 0)))
                 {
                     ApplyCurrentCrop();
                     cropMode = false;
@@ -322,7 +322,7 @@ public class TextureEditorWindow : IDisposable
             }
             else
             {
-                if (ImGui.Button("Crop from Picture", new Vector2(leftBtnW * 2f, 0)))
+                if (ImGui.Button("Crop from Picture", new Vector2(leftButtonWidth * 2f, 0)))
                 {
                     OpenCropPicker();
                 }
@@ -330,22 +330,22 @@ public class TextureEditorWindow : IDisposable
         }
 
         ImGui.SameLine();
-        if (ImGui.GetCursorPosX() < startX + halfW)
+        if (ImGui.GetCursorPosX() < startX + halfWidth)
         {
-            ImGui.SetCursorPosX(startX + halfW);
+            ImGui.SetCursorPosX(startX + halfWidth);
         }
         VerticalSeparator();
 
-        float rightAvail = totalW - (ImGui.GetCursorPosX() - startX) - spacingX;
-        float importBtnW = MathF.Max(60f, rightAvail * 0.5f - spacingX * 0.5f);
+        float rightAvailableWidth = totalWidth - (ImGui.GetCursorPosX() - startX) - spacingX;
+        float importButtonWidth = MathF.Max(60f, rightAvailableWidth * 0.5f - spacingX * 0.5f);
         float importStartX = ImGui.GetCursorPosX();
 
-        if (ImGui.Button("Import PNG", new Vector2(importBtnW, 0)))
+        if (ImGui.Button("Import PNG", new Vector2(importButtonWidth, 0)))
         {
             ImportPng();
         }
         ImGui.SameLine();
-        if (ImGui.Button("Export PNG", new Vector2(importBtnW, 0)))
+        if (ImGui.Button("Export PNG", new Vector2(importButtonWidth, 0)))
         {
             canvas.SaveAs();
         }
@@ -364,14 +364,14 @@ public class TextureEditorWindow : IDisposable
         ImGui.SameLine();
         ImGui.Text("Colour");
         ImGui.SameLine();
-        Vector4 col = ColorToVec4(brushColor);
-        if (ImGui.ColorEdit4("##col", ref col, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaBar))
+        Vector4 brushColourVector = ColorToVec4(brushColor);
+        if (ImGui.ColorEdit4("##col", ref brushColourVector, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaBar))
         {
-            var newColor = Vec4ToColor(col);
-            if (selectedPaletteIdx >= 0 && selectedPaletteIdx < palette.Count)
+            var newColor = Vec4ToColor(brushColourVector);
+            if (selectedPaletteIndex >= 0 && selectedPaletteIndex < palette.Count)
             {
-                GameImageManager.RemapColourInBitmap(canvas.Bitmap, palette[selectedPaletteIdx], newColor);
-                palette[selectedPaletteIdx] = newColor;
+                GameImageManager.RemapColourInBitmap(canvas.Bitmap, palette[selectedPaletteIndex], newColor);
+                palette[selectedPaletteIndex] = newColor;
                 canvas.ForceRefresh();
             }
             brushColor = newColor;
@@ -392,7 +392,7 @@ public class TextureEditorWindow : IDisposable
         }
 
         ImGui.SetCursorPos(new Vector2(importStartX, ImGui.GetCursorPosY() - ImGui.GetFrameHeightWithSpacing()));
-        if (ImGui.Button("Import Options", new Vector2(importBtnW, 0)))
+        if (ImGui.Button("Import Options", new Vector2(importButtonWidth, 0)))
         {
             ImGui.OpenPopup("import_options");
         }
@@ -415,7 +415,7 @@ public class TextureEditorWindow : IDisposable
         if (isPicMini && isEditMode)
         {
             ImGui.SameLine();
-            if (ImGui.Button("Filtering Options", new Vector2(importBtnW, 0)))
+            if (ImGui.Button("Filtering Options", new Vector2(importButtonWidth, 0)))
             {
                 ImGui.OpenPopup("filtering_options");
             }
@@ -442,8 +442,8 @@ public class TextureEditorWindow : IDisposable
 
         if (cropMode && resetZoomX > 0)
         {
-            ImGui.SetCursorPos(new Vector2(resetZoomX, row1Y + ImGui.GetFrameHeightWithSpacing()));
-            if (ImGui.Button("Reset Zoom", new Vector2(leftBtnW * 1.5f, 0)))
+            ImGui.SetCursorPos(new Vector2(resetZoomX, firstRowY + ImGui.GetFrameHeightWithSpacing()));
+            if (ImGui.Button("Reset Zoom", new Vector2(leftButtonWidth * 1.5f, 0)))
             {
                 cropZoom = 1f;
                 ApplyCurrentCrop();
@@ -453,22 +453,22 @@ public class TextureEditorWindow : IDisposable
 
 
         Vector2 remaining = ImGui.GetContentRegionAvail();
-        float paletteColW = MathF.Floor(remaining.X * 0.2f);
-        float canvasColW = remaining.X - paletteColW - spacingX;
+        float paletteColumnWidth = MathF.Floor(remaining.X * 0.2f);
+        float canvasColumnWidth = remaining.X - paletteColumnWidth - spacingX;
         float canvasHeight = remaining.Y * 0.9f;
 
-        ImGui.BeginChild("palette_colour", new Vector2(paletteColW, 0), ImGuiChildFlags.None, ImGuiWindowFlags.NoScrollbar);
+        ImGui.BeginChild("palette_colour", new Vector2(paletteColumnWidth, 0), ImGuiChildFlags.None, ImGuiWindowFlags.NoScrollbar);
         DrawPaletteSwatches();
         ImGui.EndChild();
         ImGui.SameLine();
-        ImGui.BeginChild("canvas_colour", new Vector2(canvasColW, 0), ImGuiChildFlags.None, ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
+        ImGui.BeginChild("canvas_colour", new Vector2(canvasColumnWidth, 0), ImGuiChildFlags.None, ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse);
         if (cropMode)
         {
             DrawCropPicker();
         }
         else
         {
-            DrawCanvasImageCentred(canvasColW, canvasHeight);
+            DrawCanvasImageCentred(canvasColumnWidth, canvasHeight);
         }
         ImGui.EndChild();
 
@@ -495,89 +495,89 @@ public class TextureEditorWindow : IDisposable
 
     void DrawPaletteSwatches()
     {
-        float availX = ImGui.GetContentRegionAvail().X;
-        const int cols = 8;
+        float availableWidth = ImGui.GetContentRegionAvail().X;
+        const int columnCount = 8;
         float spacing = ImGui.GetStyle().ItemSpacing.X;
-        float sw = MathF.Max(6f, (availX - spacing * (cols - 1)) / cols);
+        float swatchSize = MathF.Max(6f, (availableWidth - spacing * (columnCount - 1)) / columnCount);
         var drawList = ImGui.GetWindowDrawList();
 
         for (int i = 0; i < palette.Count; i++)
         {
-            if (i % cols != 0)
+            if (i % columnCount != 0)
             {
                 ImGui.SameLine();
             }
-            var c = palette[i];
+            var swatchColour = palette[i];
             ImGui.PushID(i);
-            ImGui.ColorButton($"##p{i}", ColorToVec4(c),
+            ImGui.ColorButton($"##p{i}", ColorToVec4(swatchColour),
                 ImGuiColorEditFlags.NoTooltip | ImGuiColorEditFlags.NoBorder,
-                new Vector2(sw, sw));
+                new Vector2(swatchSize, swatchSize));
 
-            if (i == selectedPaletteIdx)
+            if (i == selectedPaletteIndex)
             {
-                var mn = ImGui.GetItemRectMin();
-                var mx = ImGui.GetItemRectMax();
-                drawList.AddRect(mn - new Vector2(1, 1), mx + new Vector2(1, 1), 0xFFFFFFFF, 0f, ImDrawFlags.None, 2f);
-                drawList.AddRect(mn - new Vector2(2, 2), mx + new Vector2(2, 2), 0xFF000000, 0f, ImDrawFlags.None, 1f);
+                var swatchRectMin = ImGui.GetItemRectMin();
+                var swatchRectMax = ImGui.GetItemRectMax();
+                drawList.AddRect(swatchRectMin - new Vector2(1, 1), swatchRectMax + new Vector2(1, 1), 0xFFFFFFFF, 0f, ImDrawFlags.None, 2f);
+                drawList.AddRect(swatchRectMin - new Vector2(2, 2), swatchRectMax + new Vector2(2, 2), 0xFF000000, 0f, ImDrawFlags.None, 1f);
             }
 
             if (ImGui.IsItemClicked())
             {
-                selectedPaletteIdx = i;
-                brushColor = c;
+                selectedPaletteIndex = i;
+                brushColor = swatchColour;
                 if (canvas != null)
                 {
-                    canvas.ActiveColor = c;
+                    canvas.ActiveColor = swatchColour;
                 }
             }
             if (ImGui.IsItemHovered())
             {
-                ImGui.SetTooltip($"[{i}] #{c.Red:X2}{c.Green:X2}{c.Blue:X2}{c.Alpha:X2}");
+                ImGui.SetTooltip($"[{i}] #{swatchColour.Red:X2}{swatchColour.Green:X2}{swatchColour.Blue:X2}{swatchColour.Alpha:X2}");
             }
             ImGui.PopID();
         }
     }
 
-    void DrawCanvasImageCentred(float colW, float maxH)
+    void DrawCanvasImageCentred(float columnWidth, float maxHeight)
     {
         if (canvas == null)
         {
             return;
         }
         float aspect = (float)canvas.Width / canvas.Height;
-        float fitByWidth = colW / aspect;
-        float w, h;
-        if (fitByWidth <= maxH)
+        float fitByWidth = columnWidth / aspect;
+        float displayWidth, displayHeight;
+        if (fitByWidth <= maxHeight)
         {
-            w = colW;
-            h = fitByWidth;
+            displayWidth = columnWidth;
+            displayHeight = fitByWidth;
         }
         else
         {
-            h = maxH;
-            w = maxH * aspect;
+            displayHeight = maxHeight;
+            displayWidth = maxHeight * aspect;
         }
 
-        float availH = ImGui.GetContentRegionAvail().Y;
-        float padY = MathF.Max(0f, (availH - h) * 0.5f);
+        float availableHeight = ImGui.GetContentRegionAvail().Y;
+        float padY = MathF.Max(0f, (availableHeight - displayHeight) * 0.5f);
         if (padY > 0)
         {
             ImGui.Dummy(new Vector2(1, padY));
         }
 
-        float padX = MathF.Max(0f, (colW - w) * 0.5f);
+        float padX = MathF.Max(0f, (columnWidth - displayWidth) * 0.5f);
         if (padX > 0)
         {
             ImGui.Dummy(new Vector2(padX, 1));
             ImGui.SameLine();
         }
 
-        Vector2 imagePos = ImGui.GetCursorScreenPos();
-        ImGui.Image(canvas.GetTexturePtr(), new Vector2(w, h));
-        HandleCanvasInput(imagePos, new Vector2(w, h));
+        Vector2 imagePosition = ImGui.GetCursorScreenPos();
+        ImGui.Image(canvas.GetTexturePtr(), new Vector2(displayWidth, displayHeight));
+        HandleCanvasInput(imagePosition, new Vector2(displayWidth, displayHeight));
     }
 
-    void HandleCanvasInput(Vector2 imagePos, Vector2 displaySize)
+    void HandleCanvasInput(Vector2 imagePosition, Vector2 displaySize)
     {
 
         if (canvas == null)
@@ -615,10 +615,10 @@ public class TextureEditorWindow : IDisposable
         }
 
 
-        float bx = (mouse.X - imagePos.X) / displaySize.X * canvas.Width;
-        float by = (mouse.Y - imagePos.Y) / displaySize.Y * canvas.Height;
-        int ibx = (int)Math.Clamp(bx, 0, canvas.Width - 1);
-        int iby = (int)Math.Clamp(by, 0, canvas.Height - 1);
+        float bitmapX = (mouse.X - imagePosition.X) / displaySize.X * canvas.Width;
+        float bitmapY = (mouse.Y - imagePosition.Y) / displaySize.Y * canvas.Height;
+        int bitmapPixelX = (int)Math.Clamp(bitmapX, 0, canvas.Width - 1);
+        int bitmapPixelY = (int)Math.Clamp(bitmapY, 0, canvas.Height - 1);
 
         if (down)
         {
@@ -627,26 +627,26 @@ public class TextureEditorWindow : IDisposable
                 switch (canvas.ActiveTool)
                 {
                     case PaintCanvas.Tool.Fill:
-                        canvas.FloodFill(ibx, iby);
+                        canvas.FloodFill(bitmapPixelX, bitmapPixelY);
                         wasPainting = true;
                         break;
                     case PaintCanvas.Tool.Eyedropper:
-                        var picked = canvas.Bitmap.GetPixel(ibx, iby);
+                        var picked = canvas.Bitmap.GetPixel(bitmapPixelX, bitmapPixelY);
                         brushColor = picked;
                         canvas.ActiveColor = picked;
-                        selectedPaletteIdx = palette.FindIndex(c => c == picked);
+                        selectedPaletteIndex = palette.FindIndex(paletteColour => paletteColour == picked);
                         canvas.ActiveTool = PaintCanvas.Tool.Pencil;
                         break;
                     default:
                         canvas.BeginStroke();
-                        canvas.PaintAt(bx, by);
+                        canvas.PaintAt(bitmapX, bitmapY);
                         wasPainting = true;
                         break;
                 }
             }
             else if (wasPainting && canvas.ActiveTool is PaintCanvas.Tool.Pencil or PaintCanvas.Tool.Eraser)
             {
-                canvas.PaintAt(bx, by);
+                canvas.PaintAt(bitmapX, bitmapY);
             }
         }
         else if (wasPainting)
@@ -663,31 +663,31 @@ public class TextureEditorWindow : IDisposable
             return;
         }
 
-        var dl = ImGui.GetWindowDrawList();
-        int fullW = picMiniFullCanvas.Width;
-        int fullH = picMiniFullCanvas.Height;
-        var canvasPos = ImGui.GetCursorScreenPos();
-        var availSize = ImGui.GetContentRegionAvail();
+        var drawList = ImGui.GetWindowDrawList();
+        int fullWidth = picMiniFullCanvas.Width;
+        int fullHeight = picMiniFullCanvas.Height;
+        var canvasPosition = ImGui.GetCursorScreenPos();
+        var availableSize = ImGui.GetContentRegionAvail();
 
-        cropSrcW = Math.Clamp((int)MathF.Round(40f / cropZoom), 1, fullW);
-        cropSrcH = Math.Clamp((int)MathF.Round(32f / cropZoom), 1, fullH);
-        cropOrigin.X = Math.Clamp(cropOrigin.X, 0, fullW - cropSrcW);
-        cropOrigin.Y = Math.Clamp(cropOrigin.Y, 0, fullH - cropSrcH);
+        cropSourceWidth = Math.Clamp((int)MathF.Round(40f / cropZoom), 1, fullWidth);
+        cropSourceHeight = Math.Clamp((int)MathF.Round(32f / cropZoom), 1, fullHeight);
+        cropOrigin.X = Math.Clamp(cropOrigin.X, 0, fullWidth - cropSourceWidth);
+        cropOrigin.Y = Math.Clamp(cropOrigin.Y, 0, fullHeight - cropSourceHeight);
 
-        float imgAspect = (float)fullW / fullH;
-        float canvasAspect = availSize.X / availSize.Y;
-        Vector2 imageSize = imgAspect > canvasAspect
-            ? new Vector2(availSize.X, availSize.X / imgAspect)
-            : new Vector2(availSize.Y * imgAspect, availSize.Y);
-        Vector2 imagePos = new(canvasPos.X + (availSize.X - imageSize.X) / 2f, canvasPos.Y);
+        float imageAspect = (float)fullWidth / fullHeight;
+        float canvasAspect = availableSize.X / availableSize.Y;
+        Vector2 imageSize = imageAspect > canvasAspect
+            ? new Vector2(availableSize.X, availableSize.X / imageAspect)
+            : new Vector2(availableSize.Y * imageAspect, availableSize.Y);
+        Vector2 imagePosition = new(canvasPosition.X + (availableSize.X - imageSize.X) / 2f, canvasPosition.Y);
 
-        float scaleX = imageSize.X / fullW;
-        float scaleY = imageSize.Y / fullH;
+        float scaleX = imageSize.X / fullWidth;
+        float scaleY = imageSize.Y / fullHeight;
 
-        ImGui.PushClipRect(canvasPos, canvasPos + availSize, true);
-        dl.AddImage(picMiniFullCanvas.GetTexturePtr(), imagePos, imagePos + imageSize);
-        ImGui.SetCursorScreenPos(canvasPos);
-        ImGui.InvisibleButton("##croparea", availSize);
+        ImGui.PushClipRect(canvasPosition, canvasPosition + availableSize, true);
+        drawList.AddImage(picMiniFullCanvas.GetTexturePtr(), imagePosition, imagePosition + imageSize);
+        ImGui.SetCursorScreenPos(canvasPosition);
+        ImGui.InvisibleButton("##croparea", availableSize);
 
         Vector2 mouse = ImGui.GetMousePos();
         bool mouseInView = ImGui.IsItemHovered();
@@ -700,14 +700,14 @@ public class TextureEditorWindow : IDisposable
                 cropZoom = Math.Clamp(cropZoom * MathF.Pow(1.1f, wheel), 0.2f, 16f);
                 if (centerMouseOnZoom)
                 {
-                    CenterCropOnMouse(mouse, imagePos, scaleX, scaleY, fullW, fullH);
+                    CenterCropOnMouse(mouse, imagePosition, scaleX, scaleY, fullWidth, fullHeight);
                 }
                 ApplyCurrentCrop();
             }
 
             if (ImGui.IsMouseDown(ImGuiMouseButton.Left))
             {
-                CenterCropOnMouse(mouse, imagePos, scaleX, scaleY, fullW, fullH);
+                CenterCropOnMouse(mouse, imagePosition, scaleX, scaleY, fullWidth, fullHeight);
             }
 
             if (ImGui.IsMouseReleased(ImGuiMouseButton.Left))
@@ -716,26 +716,26 @@ public class TextureEditorWindow : IDisposable
             }
         }
 
-        Vector2 cropMin = imagePos + new Vector2(cropOrigin.X * scaleX, cropOrigin.Y * scaleY);
-        Vector2 cropMax = cropMin + new Vector2(cropSrcW * scaleX, cropSrcH * scaleY);
-        dl.AddRectFilled(cropMin, cropMax, 0x33FFFFFF);
-        dl.AddRect(cropMin, cropMax, 0xFFFFFFFF, 0, ImDrawFlags.None, 2f);
-        dl.AddRect(cropMin - Vector2.One, cropMax + Vector2.One, 0xFF000000, 0, ImDrawFlags.None, 1f);
+        Vector2 cropMin = imagePosition + new Vector2(cropOrigin.X * scaleX, cropOrigin.Y * scaleY);
+        Vector2 cropMax = cropMin + new Vector2(cropSourceWidth * scaleX, cropSourceHeight * scaleY);
+        drawList.AddRectFilled(cropMin, cropMax, 0x33FFFFFF);
+        drawList.AddRect(cropMin, cropMax, 0xFFFFFFFF, 0, ImDrawFlags.None, 2f);
+        drawList.AddRect(cropMin - Vector2.One, cropMax + Vector2.One, 0xFF000000, 0, ImDrawFlags.None, 1f);
 
         ImGui.PopClipRect();
 
         if (mouseInView)
         {
-            ImGui.SetTooltip($"({cropOrigin.X}, {cropOrigin.Y})  zoom {cropZoom:0.00}x  src {cropSrcW}x{cropSrcH}");
+            ImGui.SetTooltip($"({cropOrigin.X}, {cropOrigin.Y})  zoom {cropZoom:0.00}x  src {cropSourceWidth}x{cropSourceHeight}");
         }
     }
 
-    void CenterCropOnMouse(Vector2 mouse, Vector2 imagePos, float scaleX, float scaleY, int fullW, int fullH)
+    void CenterCropOnMouse(Vector2 mouse, Vector2 imagePosition, float scaleX, float scaleY, int fullWidth, int fullHeight)
     {
-        int imgX = (int)((mouse.X - imagePos.X) / scaleX);
-        int imgY = (int)((mouse.Y - imagePos.Y) / scaleY);
-        cropOrigin.X = Math.Clamp(imgX - cropSrcW / 2, 0, fullW - cropSrcW);
-        cropOrigin.Y = Math.Clamp(imgY - cropSrcH / 2, 0, fullH - cropSrcH);
+        int imageX = (int)((mouse.X - imagePosition.X) / scaleX);
+        int imageY = (int)((mouse.Y - imagePosition.Y) / scaleY);
+        cropOrigin.X = Math.Clamp(imageX - cropSourceWidth / 2, 0, fullWidth - cropSourceWidth);
+        cropOrigin.Y = Math.Clamp(imageY - cropSourceHeight / 2, 0, fullHeight - cropSourceHeight);
     }
 
     void ApplyCurrentCrop()
@@ -744,26 +744,26 @@ public class TextureEditorWindow : IDisposable
         {
             return;
         }
-        int fullW = picMiniFullCanvas.Width;
-        int fullH = picMiniFullCanvas.Height;
+        int fullWidth = picMiniFullCanvas.Width;
+        int fullHeight = picMiniFullCanvas.Height;
 
-        cropSrcW = Math.Clamp((int)MathF.Round(40f / cropZoom), 1, fullW);
-        cropSrcH = Math.Clamp((int)MathF.Round(32f / cropZoom), 1, fullH);
-        cropOrigin.X = Math.Clamp(cropOrigin.X, 0, fullW - cropSrcW);
-        cropOrigin.Y = Math.Clamp(cropOrigin.Y, 0, fullH - cropSrcH);
+        cropSourceWidth = Math.Clamp((int)MathF.Round(40f / cropZoom), 1, fullWidth);
+        cropSourceHeight = Math.Clamp((int)MathF.Round(32f / cropZoom), 1, fullHeight);
+        cropOrigin.X = Math.Clamp(cropOrigin.X, 0, fullWidth - cropSourceWidth);
+        cropOrigin.Y = Math.Clamp(cropOrigin.Y, 0, fullHeight - cropSourceHeight);
 
         using var cropped = new SKBitmap(40, 32, SKColorType.Rgba8888, SKAlphaType.Unpremul);
-        using var sk = new SKCanvas(cropped);
-        var srcRect = new SKRect(cropOrigin.X, cropOrigin.Y, cropOrigin.X + cropSrcW, cropOrigin.Y + cropSrcH);
+        using var croppedCanvas = new SKCanvas(cropped);
+        var sourceRect = new SKRect(cropOrigin.X, cropOrigin.Y, cropOrigin.X + cropSourceWidth, cropOrigin.Y + cropSourceHeight);
         using var paint = new SKPaint { FilterQuality = SKFilterQuality.None };
-        sk.DrawBitmap(picMiniFullCanvas.Bitmap, srcRect, new SKRect(0, 0, 40, 32), paint);
-        sk.Flush();
+        croppedCanvas.DrawBitmap(picMiniFullCanvas.Bitmap, sourceRect, new SKRect(0, 0, 40, 32), paint);
+        croppedCanvas.Flush();
 
         canvas.LoadBitmap(cropped);
         palette = TextureSlotManager.BuildPalette(cropped);
     }
 
-    void LoadMrg(string name, TextureMrgKind kind)
+    void LoadMrg(string mrgName, TextureMrgKind kind)
     {
         TextureSlotManager.FreeSlots(slots);
         FreePicCanvas();
@@ -771,13 +771,13 @@ public class TextureEditorWindow : IDisposable
         isEditMode = false;
         cropMode = false;
         currentIndex = -1;
-        selectedMrgName = name;
+        selectedMrgName = mrgName;
         palette.Clear();
 
-        mrgBytes = FileLoader.Instance.GetFileBytesFromDisk(TextureSlotManager.IsoPath(name));
+        mrgBytes = FileLoader.Instance.GetFileBytesFromDisk(TextureSlotManager.IsoPath(mrgName));
         slots = kind == TextureMrgKind.Icon
             ? TextureSlotManager.LoadIconSlots(mrgBytes)
-            : TextureSlotManager.LoadRh2Slots(mrgBytes, name);
+            : TextureSlotManager.LoadRh2Slots(mrgBytes, mrgName);
 
         if (slots.Count > 0)
         {
@@ -803,56 +803,56 @@ public class TextureEditorWindow : IDisposable
 
         try
         {
-            var bmp = TextureSlotManager.DecodeSlot(slots[index]);
+            var slotBitmap = TextureSlotManager.DecodeSlot(slots[index]);
             palette = slots[index].Kind == TextureMrgKind.Icon
                 ? TextureSlotManager.BuildPaletteFromGameTexture()
-                : TextureSlotManager.BuildPalette(bmp);
+                : TextureSlotManager.BuildPalette(slotBitmap);
 
-            viewTexture = TextureSlotManager.BitmapToTexture(bmp);
+            viewTexture = TextureSlotManager.BitmapToTexture(slotBitmap);
             hasViewTexture = true;
             zoom = 2f;
             pan = Vector2.Zero;
 
             if (isEditMode)
             {
-                OpenCanvas(index, bmp);
+                OpenCanvas(index, slotBitmap);
             }
             else
             {
-                bmp.Dispose();
+                slotBitmap.Dispose();
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Console.Error.WriteLine($"SelectSlot {index}: {ex.Message}");
+            Console.Error.WriteLine($"SelectSlot {index}: {exception.Message}");
         }
 
-        selectedPaletteIdx = -1;
+        selectedPaletteIndex = -1;
     }
 
-    void OpenCanvas(int index, SKBitmap? bmp = null)
+    void OpenCanvas(int index, SKBitmap? bitmap = null)
     {
         if (index < 0 || index >= slots.Count)
         {
             return;
         }
-        bool ownBmp = bmp == null;
-        if (bmp == null)
+        bool ownsBitmap = bitmap == null;
+        if (bitmap == null)
         {
-            bmp = TextureSlotManager.DecodeSlot(slots[index]);
+            bitmap = TextureSlotManager.DecodeSlot(slots[index]);
         }
         if (canvas == null)
         {
-            canvas = new PaintCanvas(bmp);
+            canvas = new PaintCanvas(bitmap);
         }
         else
         {
-            canvas.LoadBitmap(bmp);
+            canvas.LoadBitmap(bitmap);
         }
         canvas.ClearStack();
-        if (ownBmp)
+        if (ownsBitmap)
         {
-            bmp.Dispose();
+            bitmap.Dispose();
         }
     }
 
@@ -864,8 +864,8 @@ public class TextureEditorWindow : IDisposable
         }
 
         int pictureIndex = currentIndex < 683 ? currentIndex : currentIndex + 171;
-        byte[] picBytes = FileLoader.Instance.GetFileBytesFromDisk(TextureSlotManager.IsoPath(TextureSlotManager.PictureMrg));
-        var offsets = AssetExtractor.FindAllRh2Offsets(picBytes);
+        byte[] pictureMrgBytes = FileLoader.Instance.GetFileBytesFromDisk(TextureSlotManager.IsoPath(TextureSlotManager.PictureMrg));
+        var offsets = AssetExtractor.FindAllRh2Offsets(pictureMrgBytes);
         if (pictureIndex >= offsets.Count)
         {
             pictureIndex = Math.Min(currentIndex, offsets.Count - 1);
@@ -875,16 +875,16 @@ public class TextureEditorWindow : IDisposable
             return;
         }
 
-        var decodedTex = Rh2Decoder.Decode(picBytes, (int)offsets[pictureIndex]);
-        if (decodedTex.IsEmpty)
+        var decodedTexture = Rh2Decoder.Decode(pictureMrgBytes, (int)offsets[pictureIndex]);
+        if (decodedTexture.IsEmpty)
         {
             return;
         }
 
         picMiniFullCanvas?.Free();
-        var bmp = TextureSlotManager.RgbaToBitmap(decodedTex.Width, decodedTex.Height, decodedTex.Rgba);
-        picMiniFullCanvas = new PaintCanvas(bmp);
-        bmp.Dispose();
+        var fullBitmap = TextureSlotManager.RgbaToBitmap(decodedTexture.Width, decodedTexture.Height, decodedTexture.Rgba);
+        picMiniFullCanvas = new PaintCanvas(fullBitmap);
+        fullBitmap.Dispose();
 
         cropOrigin = new SKPointI(0, 0);
         cropZoom = 1f;
@@ -912,13 +912,13 @@ public class TextureEditorWindow : IDisposable
             return;
         }
         var slot = slots[currentIndex];
-        var r = Dialog.FileOpen(FileDialogFilter.Of("png,jpg,jpeg,webp"));
-        if (!r.IsOk)
+        var openResult = Dialog.FileOpen(FileDialogFilter.Of("png,jpg,jpeg,webp"));
+        if (!openResult.IsOk)
         {
             return;
         }
 
-        var imported = GameImageManager.LoadAndPrepareImage(r.Path, slot.Width, slot.Height, cropOnImport);
+        var imported = GameImageManager.LoadAndPrepareImage(openResult.Path, slot.Width, slot.Height, cropOnImport);
         byte[] rgba = TextureSlotManager.BitmapToRgba(imported);
         imported.Dispose();
         if (quantMode == QuantMode.Octree)
@@ -930,7 +930,7 @@ public class TextureEditorWindow : IDisposable
         canvas.ClearStack();
         quantised.Dispose();
         palette = TextureSlotManager.BuildPalette(rgba, slot.Width * slot.Height);
-        selectedPaletteIdx = -1;
+        selectedPaletteIndex = -1;
     }
 
     void SaveCurrentSlot()
@@ -945,18 +945,18 @@ public class TextureEditorWindow : IDisposable
         {
             newSlotBytes = TextureSlotManager.EncodeSlot(slots[currentIndex], canvas.Bitmap);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Console.Error.WriteLine($"Encode failed: {ex.Message}");
+            Console.Error.WriteLine($"Encode failed: {exception.Message}");
             return;
         }
 
         TextureSlotManager.PatchMrg(mrgBytes, slots, currentIndex, newSlotBytes);
 
-        var newThumb = TextureSlotManager.BitmapToTexture(canvas.Bitmap);
+        var newThumbnail = TextureSlotManager.BitmapToTexture(canvas.Bitmap);
         Raylib.UnloadTexture(slots[currentIndex].Thumbnail);
         slots[currentIndex].Bytes = newSlotBytes;
-        slots[currentIndex].Thumbnail = newThumb;
+        slots[currentIndex].Thumbnail = newThumbnail;
 
         try
         {
@@ -965,12 +965,12 @@ public class TextureEditorWindow : IDisposable
             var plan = changes.Write(FileLoader.Instance);
             if (!plan.Ok)
             {
-                foreach (string err in plan.Errors) Console.Error.WriteLine($"Write to ISO refused: {err}");
+                foreach (string errorMessage in plan.Errors) Console.Error.WriteLine($"Write to ISO refused: {errorMessage}");
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Console.Error.WriteLine($"Write to ISO failed: {ex.Message}");
+            Console.Error.WriteLine($"Write to ISO failed: {exception.Message}");
         }
 
         RefreshAfterSave(currentIndex);
@@ -985,33 +985,33 @@ public class TextureEditorWindow : IDisposable
 
         try
         {
-            var bmp = TextureSlotManager.DecodeSlot(slots[index]);
+            var slotBitmap = TextureSlotManager.DecodeSlot(slots[index]);
             palette = slots[index].Kind == TextureMrgKind.Icon
                 ? TextureSlotManager.BuildPaletteFromGameTexture()
-                : TextureSlotManager.BuildPalette(bmp);
+                : TextureSlotManager.BuildPalette(slotBitmap);
 
             if (hasViewTexture)
             {
                 Raylib.UnloadTexture(viewTexture);
             }
-            viewTexture = TextureSlotManager.BitmapToTexture(bmp);
+            viewTexture = TextureSlotManager.BitmapToTexture(slotBitmap);
             hasViewTexture = true;
 
             if (isEditMode && canvas != null)
             {
-                canvas.LoadBitmap(bmp);
+                canvas.LoadBitmap(slotBitmap);
             }
             else
             {
-                bmp.Dispose();
+                slotBitmap.Dispose();
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Console.Error.WriteLine($"RefreshAfterSave {index}: {ex.Message}");
+            Console.Error.WriteLine($"RefreshAfterSave {index}: {exception.Message}");
         }
 
-        selectedPaletteIdx = -1;
+        selectedPaletteIndex = -1;
     }
 
     void HandleKeyboard()
@@ -1046,16 +1046,16 @@ public class TextureEditorWindow : IDisposable
 
         if (!ImGui.IsAnyItemActive())
         {
-            bool ctrl = ImGui.GetIO().KeyCtrl;
-            if (ctrl && ImGui.IsKeyPressed(ImGuiKey.Z) && canvas?.CanUndo == true)
+            bool isCtrlHeld = ImGui.GetIO().KeyCtrl;
+            if (isCtrlHeld && ImGui.IsKeyPressed(ImGuiKey.Z) && canvas?.CanUndo == true)
             {
                 canvas.Undo();
             }
-            if (ctrl && ImGui.IsKeyPressed(ImGuiKey.Y) && canvas?.CanRedo == true)
+            if (isCtrlHeld && ImGui.IsKeyPressed(ImGuiKey.Y) && canvas?.CanRedo == true)
             {
                 canvas.Redo();
             }
-            if (ctrl && ImGui.IsKeyPressed(ImGuiKey.S))
+            if (isCtrlHeld && ImGui.IsKeyPressed(ImGuiKey.S))
             {
                 SaveCurrentSlot();
             }
@@ -1072,21 +1072,21 @@ public class TextureEditorWindow : IDisposable
 
     static void VerticalSeparator()
     {
-        float h = ImGui.GetFrameHeight();
-        var pos = ImGui.GetCursorScreenPos();
-        ImGui.GetWindowDrawList().AddLine(pos, pos + new Vector2(0, h), ImGui.GetColorU32(ImGuiCol.Separator), 1f);
-        ImGui.Dummy(new Vector2(6f, h));
+        float frameHeight = ImGui.GetFrameHeight();
+        var cursorScreenPosition = ImGui.GetCursorScreenPos();
+        ImGui.GetWindowDrawList().AddLine(cursorScreenPosition, cursorScreenPosition + new Vector2(0, frameHeight), ImGui.GetColorU32(ImGuiCol.Separator), 1f);
+        ImGui.Dummy(new Vector2(6f, frameHeight));
         ImGui.SameLine();
     }
 
-    static Vector4 ColorToVec4(SKColor c)
+    static Vector4 ColorToVec4(SKColor color)
     {
-        return new(c.Red / 255f, c.Green / 255f, c.Blue / 255f, c.Alpha / 255f);
+        return new(color.Red / 255f, color.Green / 255f, color.Blue / 255f, color.Alpha / 255f);
     }
 
-    static SKColor Vec4ToColor(Vector4 v)
+    static SKColor Vec4ToColor(Vector4 colorVector)
     {
-        return new((byte)(v.X * 255), (byte)(v.Y * 255), (byte)(v.Z * 255), (byte)(v.W * 255));
+        return new((byte)(colorVector.X * 255), (byte)(colorVector.Y * 255), (byte)(colorVector.Z * 255), (byte)(colorVector.W * 255));
     }
 
     static TextureFilter ToTextureFilter(PicMiniFilter mode) => mode switch {

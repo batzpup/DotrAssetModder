@@ -4,43 +4,43 @@ namespace DotrAssetModder;
 
 public struct GuiColour
 {
-    public Vector4 value;
+    public Vector4 Value;
 
-    public GuiColour(int r, int g, int b, int a = 255)
+    public GuiColour(int red, int green, int blue, int alpha = 255)
     {
-        r = Math.Clamp(r, 0, 255);
-        g = Math.Clamp(g, 0, 255);
-        b = Math.Clamp(b, 0, 255);
-        a = Math.Clamp(a, 0, 255);
+        red = Math.Clamp(red, 0, 255);
+        green = Math.Clamp(green, 0, 255);
+        blue = Math.Clamp(blue, 0, 255);
+        alpha = Math.Clamp(alpha, 0, 255);
 
-        value = new Vector4(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+        Value = new Vector4(red / 255.0f, green / 255.0f, blue / 255.0f, alpha / 255.0f);
 
     }
 
-    public GuiColour(float r, float g, float b, float a = 1.0f)
+    public GuiColour(float red, float green, float blue, float alpha = 1.0f)
     {
-        r = Math.Clamp(r, 0.0f, 1.0f);
-        g = Math.Clamp(g, 0.0f, 1.0f);
-        b = Math.Clamp(b, 0.0f, 1.0f);
-        a = Math.Clamp(a, 0.0f, 1.0f);
-        value = new Vector4(r, g, b, a);
+        red = Math.Clamp(red, 0.0f, 1.0f);
+        green = Math.Clamp(green, 0.0f, 1.0f);
+        blue = Math.Clamp(blue, 0.0f, 1.0f);
+        alpha = Math.Clamp(alpha, 0.0f, 1.0f);
+        Value = new Vector4(red, green, blue, alpha);
     }
 
     public GuiColour(Color color)
     {
-      value = new Vector4(
+      Value = new Vector4(
         Math.Clamp(color.R / 255f, 0f, 1f), 
         Math.Clamp(color.G / 255f, 0f, 1f), 
         Math.Clamp(color.B / 255f, 0f, 1f), 
         Math.Clamp(color.A / 255f, 0f, 1f));
     }
 
-    public GuiColour(Vector4 vec)
+    public GuiColour(Vector4 colourVector)
     {
-        vec.X = Math.Clamp(vec.X, 0.0f, 1.0f);
-        vec.Y = Math.Clamp(vec.Y, 0.0f, 1.0f);
-        vec.Z = Math.Clamp(vec.Z, 0.0f, 1.0f);
-        vec.W = Math.Clamp(vec.W, 0.0f, 1.0f);
-        value = vec;
+        colourVector.X = Math.Clamp(colourVector.X, 0.0f, 1.0f);
+        colourVector.Y = Math.Clamp(colourVector.Y, 0.0f, 1.0f);
+        colourVector.Z = Math.Clamp(colourVector.Z, 0.0f, 1.0f);
+        colourVector.W = Math.Clamp(colourVector.W, 0.0f, 1.0f);
+        Value = colourVector;
     }
 }

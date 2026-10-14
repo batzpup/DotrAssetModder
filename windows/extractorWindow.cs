@@ -15,7 +15,7 @@ public class ExtractorWindow
     CurrentExtractor CurrentExtractor;
     int currentFolderIndex;
     ExtractionJob? activeJob;
-    ExtractResult result;
+    ExtractResult lastExtractResult;
     string? jobError;
 
     bool openResultsNext;
@@ -26,18 +26,18 @@ public class ExtractorWindow
 
     public void Render()
     {
-        ImGui.PushFont(glRD.MainFont);
+        ImGui.PushFont(GuiContext.MainFont);
         ImGui.Text(pathTemplate + FileLoader.Instance.CurrentIsoPath);
         ImGui.SameLine();
 
         if (ImGui.Button("Load ISO"))
         {
-            DialogResult result;
-            result = Dialog.FileOpen(FileDialogFilter.Of("iso"),Path.GetDirectoryName(Program.config.lastIsoPath));
-            if (result.IsOk)
+            DialogResult isoDialogResult;
+            isoDialogResult = Dialog.FileOpen(FileDialogFilter.Of("iso"),Path.GetDirectoryName(Program.config.lastIsoPath));
+            if (isoDialogResult.IsOk)
             {
-                FileLoader.Instance.OpenIso(result.Path);
-                Program.config.lastIsoPath = result.Path;
+                FileLoader.Instance.OpenIso(isoDialogResult.Path);
+                Program.config.lastIsoPath = isoDialogResult.Path;
             }
             else
             {
@@ -103,15 +103,15 @@ public class ExtractorWindow
                 }
                 else
                 {
-                    ImGui.Text($"Results: {result.Total} {result.Kind.ToString()} files found \nSucceed: {result.Written}\nFailed: {result.Failed}");
-                    if (result.Failures.Count > 0)
+                    ImGui.Text($"Results: {lastExtractResult.Total} {lastExtractResult.Kind.ToString()} files found \nSucceed: {lastExtractResult.Written}\nFailed: {lastExtractResult.Failed}");
+                    if (lastExtractResult.Failures.Count > 0)
                     {
                         ImGui.Separator();
                         ImGui.Text("Failures:");
                         if (ImGui.BeginChild("failures", new System.Numerics.Vector2(420, 160)))
                         {
-                            foreach (var f in result.Failures)
-                                ImGui.TextWrapped($"slot {f.Slot} ({f.Name}): {f.Reason}");
+                            foreach (var failure in lastExtractResult.Failures)
+                                ImGui.TextWrapped($"slot {failure.Slot} ({failure.Name}): {failure.Reason}");
                         }
                         ImGui.EndChild();
                     }
@@ -133,9 +133,9 @@ public class ExtractorWindow
         jobError = null;
         string currentFile = fileList[index];
         byte[] fileBytes = FileLoader.Instance.GetFileBytesFromDisk(currentFile);
-        string stem = IsoPaths.FileNameWithoutExtension(currentFile);
-        IList<string>? names = LoadWordlist();
-        activeJob = ExtractionJob.Start(fileBytes, dataDestinationPath, stem, names);
+        string fileNameStem = IsoPaths.FileNameWithoutExtension(currentFile);
+        IList<string>? wordlistNames = LoadWordlist();
+        activeJob = ExtractionJob.Start(fileBytes, dataDestinationPath, fileNameStem, wordlistNames);
     }
 
     IList<string>? LoadWordlist()
@@ -172,15 +172,15 @@ public class ExtractorWindow
         bool open = true;
         if (ImGui.BeginPopupModal("Extracting", ref open, ImGuiWindowFlags.AlwaysAutoResize))
         {
-            var prog = activeJob.Progress;
-            int total = prog.Total;
-            int done = prog.Done;
-            float frac = prog.Fraction;
+            var progress = activeJob.Progress;
+            int totalCount = progress.Total;
+            int doneCount = progress.Done;
+            float fraction = progress.Fraction;
 
-            ImGui.Text(total > 0 ? $"Extracting {done}/{total}" : "Preparing...");
-            ImGui.ProgressBar(frac, new System.Numerics.Vector2(300, 0));
+            ImGui.Text(totalCount > 0 ? $"Extracting {doneCount}/{totalCount}" : "Preparing...");
+            ImGui.ProgressBar(fraction, new System.Numerics.Vector2(300, 0));
 
-            if (prog.IsCancellationRequested)
+            if (progress.IsCancellationRequested)
             {
                 ImGui.TextDisabled("Cancelling...");
             }
@@ -199,8 +199,8 @@ public class ExtractorWindow
                 }
                 else
                 {
-                    result = activeJob.Result ?? new ExtractResult(AssetKind.Unknown, 0, 0, 0);
-                    if (result.Kind == AssetKind.Unknown)
+                    lastExtractResult = activeJob.Result ?? new ExtractResult(AssetKind.Unknown, 0, 0, 0);
+                    if (lastExtractResult.Kind == AssetKind.Unknown)
                         openUnsupportedNext = true;
                     else
                         openResultsNext = true;

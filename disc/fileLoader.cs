@@ -1,14 +1,14 @@
 ﻿using DiscUtils.Iso9660;
+using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-// The only disc class: it opens an ISO9660 image, lists its files and says where every file
-// physically sits. The LBA and byte size come from DiscUtils' own reader (CDReader.PathToExtents
-// gives the extent's byte offset in the image), so a file whose bytes happen to repeat elsewhere,
-// or whose first sector is all zeroes, is still located exactly.
-//
-// The retail disc uses no interleaving, no multi-extent files and no Joliet supplement that
-// matters here, so one extent per file is assumed; a file with more is reported as an anomaly
-// rather than silently truncated.
+/* The only disc class: it opens an ISO9660 image, lists its files and says where every file
+   physically sits. The LBA and byte size come from DiscUtils' own reader (CDReader.PathToExtents
+   gives the extent's byte offset in the image), so a file is located exactly even if its bytes
+   repeat elsewhere or its first sector is all zeroes.
+
+   The retail disc uses no interleaving, no multi-extent files and no Joliet supplement that
+   matters here, so one extent per file is assumed; a file with more is reported as an anomaly. */
 public class FileLoader : IDisposable
 {
     public const int SectorSize = 2048;
@@ -44,7 +44,7 @@ public class FileLoader : IDisposable
 
 
     public string[] folderNames = ["DATA", "MOVIE", "SOUND"];
-    public string[] iso_data_files_all;
+    public string[] IsoDataFilesAll;
     public string[] iso_data_files_supported;
     string[] unsupportedDataDefaults = ["BMODULE.MRG", "CMODULE.MRG", "MMODULE.MRG", "STAGECAM.MRG"];
 
@@ -69,9 +69,9 @@ public class FileLoader : IDisposable
     // A second loader on one image, for code that works on an ISO other than the open one.
     public static FileLoader Open(string isoPath)
     {
-        var fl = new FileLoader();
-        fl.OpenIso(isoPath);
-        return fl;
+        var loader = new FileLoader();
+        loader.OpenIso(isoPath);
+        return loader;
     }
 
     public void OpenIso(string filePath)
@@ -89,25 +89,25 @@ public class FileLoader : IDisposable
                 FileShare.ReadWrite
             );
 
-            CDReader iso = new CDReader(fileStream, true);
+            CDReader isoReader = new CDReader(fileStream, true);
 
 
             // An image built for a test (or a disc without these folders) has neither.
-            iso_data_files_all = iso.DirectoryExists("DATA") ? iso.GetFiles("DATA") : [];
+            IsoDataFilesAll = isoReader.DirectoryExists("DATA") ? isoReader.GetFiles("DATA") : [];
             List<string> supportedFiles = new List<string>();
-            foreach (var file in iso_data_files_all)
+            foreach (var isoFilePath in IsoDataFilesAll)
             {
-                if (!unsupportedDataDefaults.Contains(IsoPaths.FileName(file)))
+                if (!unsupportedDataDefaults.Contains(IsoPaths.FileName(isoFilePath)))
                 {
-                    supportedFiles.Add(file);
+                    supportedFiles.Add(isoFilePath);
                 }
             }
             iso_data_files_supported = supportedFiles.ToArray();
             supportedFiles.Clear();
 
-            MovieNames = iso.DirectoryExists("MOVIE") ? iso.GetFiles("MOVIE") : [];
+            MovieNames = isoReader.DirectoryExists("MOVIE") ? isoReader.GetFiles("MOVIE") : [];
 
-            BuildFileTable(iso);
+            BuildFileTable(isoReader);
         }
         IsIsoLoaded = true;
         OnIsoloaded?.Invoke();
@@ -116,7 +116,7 @@ public class FileLoader : IDisposable
     // ---- where every file sits ----------------------------------------------------------------
 
     // Caller holds FileStreamLock.
-    void BuildFileTable(CDReader iso)
+    void BuildFileTable(CDReader isoReader)
     {
         _files.Clear();
         _byKey.Clear();
@@ -125,49 +125,49 @@ public class FileLoader : IDisposable
 
         // Volume descriptors start at sector 16; the primary one carries the volume identifier
         // (32 chars at offset 40) and the volume size in sectors (offset 80).
-        var pvd = new byte[SectorSize];
-        ReadAt(16L * SectorSize, pvd, 0, pvd.Length);
-        VolumeIdentifier = System.Text.Encoding.ASCII.GetString(pvd, 40, 32).TrimEnd(' ', '\0');
-        VolumeSpaceSize = BitConverter.ToUInt32(pvd, 80);
+        var primaryVolumeDescriptor = new byte[SectorSize];
+        ReadAt(16L * SectorSize, primaryVolumeDescriptor, 0, primaryVolumeDescriptor.Length);
+        VolumeIdentifier = System.Text.Encoding.ASCII.GetString(primaryVolumeDescriptor, 40, 32).TrimEnd(' ', '\0');
+        VolumeSpaceSize = ReadU32(primaryVolumeDescriptor, 80);
 
-        Walk(iso.Root);
+        Walk(isoReader.Root);
 
-        // Capacity = the bytes between this file's first sector and the first sector of the next
-        // extent in LBA order; for the last file, up to the end of the image. It is never less
-        // than AllocatedSize. This is the room a file could grow into without moving anything
-        // else, which the writer reports but does not use (growing needs the directory record's
-        // size field rewritten too, which is the rebuilder's job).
-        var ordered = _files.OrderBy(f => f.Lba).ToList();
+        /* Capacity = the bytes between this file's first sector and the first sector of the next
+           extent in LBA order; for the last file, up to the end of the image. It is never less
+           than AllocatedSize. This is the room a file could grow into without moving anything
+           else; the writer reports it but does not use it (growing needs the directory record's
+           size field rewritten too, which is the rebuilder's job). */
+        var filesInLbaOrder = _files.OrderBy(entry => entry.Lba).ToList();
         long imageSectors = ImageLength / SectorSize;
-        for (int i = 0; i < ordered.Count; i++)
+        for (int i = 0; i < filesInLbaOrder.Count; i++)
         {
-            long nextLba = i + 1 < ordered.Count ? ordered[i + 1].Lba : imageSectors;
-            long cap = (nextLba - ordered[i].Lba) * SectorSize;
-            ordered[i].Capacity = Math.Max(cap, ordered[i].AllocatedSize);
+            long nextLba = i + 1 < filesInLbaOrder.Count ? filesInLbaOrder[i + 1].Lba : imageSectors;
+            long capacityBytes = (nextLba - filesInLbaOrder[i].Lba) * SectorSize;
+            filesInLbaOrder[i].Capacity = Math.Max(capacityBytes, filesInLbaOrder[i].AllocatedSize);
         }
 
-        void Walk(DiscUtils.DiscDirectoryInfo dir)
+        void Walk(DiscUtils.DiscDirectoryInfo directory)
         {
-            foreach (var fi in dir.GetFiles())
+            foreach (var discFileInfo in directory.GetFiles())
             {
-                var extents = iso.PathToExtents(fi.FullName);
+                var extents = isoReader.PathToExtents(discFileInfo.FullName);
                 if (extents.Length != 1)
-                    _anomalies.Add($"{fi.FullName}: {extents.Length} extents, only the first is seen");
+                    _anomalies.Add($"{discFileInfo.FullName}: {extents.Length} extents, only the first is seen");
 
-                var f = new FileEntry
+                var fileEntry = new FileEntry
                 {
-                    IsoPath = fi.FullName,
-                    Key = NormaliseKey(fi.FullName),
-                    Name = IsoPaths.FileName(fi.FullName),
+                    IsoPath = discFileInfo.FullName,
+                    Key = NormaliseKey(discFileInfo.FullName),
+                    Name = IsoPaths.FileName(discFileInfo.FullName),
                     Lba = (uint)(extents[0].Start / SectorSize),
-                    Size = fi.Length,
+                    Size = discFileInfo.Length,
                 };
-                f.AllocatedSize = (f.Size + SectorSize - 1) / SectorSize * SectorSize;
-                _files.Add(f);
-                if (!_byKey.TryAdd(f.Key, f)) _anomalies.Add($"{f.IsoPath}: duplicate path");
-                if (!_byName.TryAdd(f.Name, f)) _anomalies.Add($"{f.IsoPath}: duplicate file name");
+                fileEntry.AllocatedSize = (fileEntry.Size + SectorSize - 1) / SectorSize * SectorSize;
+                _files.Add(fileEntry);
+                if (!_byKey.TryAdd(fileEntry.Key, fileEntry)) _anomalies.Add($"{fileEntry.IsoPath}: duplicate path");
+                if (!_byName.TryAdd(fileEntry.Name, fileEntry)) _anomalies.Add($"{fileEntry.IsoPath}: duplicate file name");
             }
-            foreach (var sub in dir.GetDirectories()) Walk(sub);
+            foreach (var subDirectory in directory.GetDirectories()) Walk(subDirectory);
         }
     }
 
@@ -175,11 +175,11 @@ public class FileLoader : IDisposable
     public FileEntry? Find(string path)
     {
         string key = NormaliseKey(path);
-        if (_byKey.TryGetValue(key, out var hit)) return hit;
+        if (_byKey.TryGetValue(key, out var foundByKey)) return foundByKey;
         // bare name, the form the game itself resolves by
-        int slash = key.LastIndexOf('/');
-        string name = slash >= 0 ? key[(slash + 1)..] : key;
-        return _byName.TryGetValue(name, out var byName) ? byName : null;
+        int lastSlashIndex = key.LastIndexOf('/');
+        string bareName = lastSlashIndex >= 0 ? key[(lastSlashIndex + 1)..] : key;
+        return _byName.TryGetValue(bareName, out var foundByName) ? foundByName : null;
     }
 
     public FileEntry Get(string path) =>
@@ -187,21 +187,21 @@ public class FileLoader : IDisposable
 
     public static string NormaliseKey(string path)
     {
-        string s = path.Replace('\\', '/').TrimStart('/');
-        int semi = s.LastIndexOf(';');
-        if (semi > s.LastIndexOf('/')) s = s[..semi];
-        return s.ToUpperInvariant();
+        string normalisedPath = path.Replace('\\', '/').TrimStart('/');
+        int versionSeparatorIndex = normalisedPath.LastIndexOf(';');
+        if (versionSeparatorIndex > normalisedPath.LastIndexOf('/')) normalisedPath = normalisedPath[..versionSeparatorIndex];
+        return normalisedPath.ToUpperInvariant();
     }
 
     // ---- reading ------------------------------------------------------------------------------
 
     public byte[] ReadFile(string path) => ReadFile(Get(path));
 
-    public byte[] ReadFile(FileEntry f)
+    public byte[] ReadFile(FileEntry fileEntry)
     {
-        var buf = new byte[f.Size];
-        ReadAt(f.ImageOffset, buf, 0, buf.Length);
-        return buf;
+        var fileBytes = new byte[fileEntry.Size];
+        ReadAt(fileEntry.ImageOffset, fileBytes, 0, fileBytes.Length);
+        return fileBytes;
     }
 
     public void ReadAt(long imageOffset, byte[] buffer, int bufferOffset, int count)
@@ -223,10 +223,10 @@ public class FileLoader : IDisposable
                 throw new InvalidOperationException("No ISO loaded");
             }
 
-            var iso = new CDReader(fileStream, true);
-            using Stream file = iso.OpenFile(path, FileMode.Open);
-            var buffer = new byte[file.Length];
-            file.ReadExactly(buffer);
+            var isoReader = new CDReader(fileStream, true);
+            using Stream discStream = isoReader.OpenFile(path, FileMode.Open);
+            var buffer = new byte[discStream.Length];
+            discStream.ReadExactly(buffer);
             return buffer;
         }
     }
@@ -250,7 +250,7 @@ public class FileLoader : IDisposable
         {
             fileStream?.Dispose();
             fileStream = null;
-            iso_data_files_all = null;
+            IsoDataFilesAll = null;
             _files.Clear();
             _byKey.Clear();
             _byName.Clear();

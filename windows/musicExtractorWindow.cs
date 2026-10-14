@@ -13,7 +13,7 @@ public class MusicExtractorWindow
     bool isMusicPlaying = false;
     FileLoader fileloader = FileLoader.Instance;
 
-    string MusicDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Music");
+    string musicDirectory = Path.Combine(Directory.GetCurrentDirectory(), "Music");
     string playStopButton = "Play";
     int currentBGMIndex;
 
@@ -75,7 +75,7 @@ public class MusicExtractorWindow
         waveOut = new WaveOutEvent();
         waveOut.Volume = 0.1f;
 
-        bgmPath = Path.Combine(MusicDirectory, "BGM");
+        bgmPath = Path.Combine(musicDirectory, "BGM");
         pcmPath = Path.Combine(bgmPath, "Original_PCM");
 
     }
@@ -170,14 +170,13 @@ public class MusicExtractorWindow
     Task GetMusicFiles()
     {
 
-        if (!Directory.Exists(MusicDirectory))
+        if (!Directory.Exists(musicDirectory))
         {
-            Directory.CreateDirectory(MusicDirectory);
+            Directory.CreateDirectory(musicDirectory);
         }
 
         MediaFoundationApi.Startup();
         CDReader isoFile = new CDReader(fileloader.fileStream, true);
-        // Get the file from inside the ISO
         switch (currentMode)
         {
             case CurrentMusicMode.BGM:
@@ -248,8 +247,8 @@ public class MusicExtractorWindow
                 RawSourceWaveStream pcmReader;
                 using (FileStream fileStream = File.OpenWrite(extractedFilePath))
                 {
-                    var pcm = isoFile.OpenFile(file, FileMode.Open);
-                    pcm.CopyTo(fileStream);
+                    var pcmStream = isoFile.OpenFile(file, FileMode.Open);
+                    pcmStream.CopyTo(fileStream);
 
                 }
                 using (FileStream fileStream = File.OpenRead(extractedFilePath))
@@ -279,12 +278,12 @@ public class MusicExtractorWindow
     void PlaySelectedTrack(CurrentMusicMode currentMode, int trackNumber)
     {
         StopMusic();
-        string path = String.Empty;
+        string trackFolderPath = String.Empty;
         switch (currentMode)
         {
 
             case CurrentMusicMode.BGM:
-                path = bgmPath;
+                trackFolderPath = bgmPath;
                 break;
             case CurrentMusicMode.Card:
                 break;
@@ -295,14 +294,13 @@ public class MusicExtractorWindow
             default:
                 throw new ArgumentOutOfRangeException(nameof(currentMode), currentMode, null);
         }
-        string selectedMp3FilePath = Path.Combine(path, "00" + BgmTracks[trackNumber].Substring(0, 2) + ".mp3");
+        string selectedMp3FilePath = Path.Combine(trackFolderPath, "00" + BgmTracks[trackNumber].Substring(0, 2) + ".mp3");
         if (File.Exists(selectedMp3FilePath))
         {
             mp3Reader = new Mp3FileReader(selectedMp3FilePath);
             playStopButton = "Stop";
 
 
-            // Play or stop the MP3 based on the current state
             waveOut.Init(mp3Reader);
             waveOut.Play();
             isMusicPlaying = true;

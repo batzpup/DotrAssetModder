@@ -14,87 +14,87 @@ public sealed class Quantizer
         this.maxColors = maxColors;
     }
 
-    public void AddColor(byte r, byte g, byte b)
+    public void AddColor(byte red, byte green, byte blue)
     {
-        AddColor(root, r, g, b, 0);
+        AddColor(root, red, green, blue, 0);
         while (leafCount > maxColors)
         {
             Reduce();
         }
     }
 
-    public List<(byte R, byte G, byte B)> GetPalette()
+    public List<(byte Red, byte Green, byte Blue)> GetPalette()
     {
-        var result = new List<(byte, byte, byte)>(leafCount);
-        CollectLeaves(root, result);
-        return result;
+        var paletteColours = new List<(byte, byte, byte)>(leafCount);
+        CollectLeaves(root, paletteColours);
+        return paletteColours;
     }
 
     sealed class Node
     {
-        public long R, G, B, Count;
+        public long RedTotal, GreenTotal, BlueTotal, Count;
         public bool IsLeaf;
         public Node?[] Children = new Node?[8];
         public Node? NextReducible;
     }
 
-    void AddColor(Node node, byte r, byte g, byte b, int depth)
+    void AddColor(Node node, byte red, byte green, byte blue, int depth)
     {
         if (node.IsLeaf)
         {
-            node.R += r;
-            node.G += g;
-            node.B += b;
+            node.RedTotal += red;
+            node.GreenTotal += green;
+            node.BlueTotal += blue;
             node.Count++;
             return;
         }
         if (depth == MaxDepth)
         {
             node.IsLeaf = true;
-            node.R += r;
-            node.G += g;
-            node.B += b;
+            node.RedTotal += red;
+            node.GreenTotal += green;
+            node.BlueTotal += blue;
             node.Count++;
             leafCount++;
             return;
         }
 
-        int shift = 7 - depth;
-        int idx = ((r >> shift) & 1) << 2 | ((g >> shift) & 1) << 1 | ((b >> shift) & 1);
-        if (node.Children[idx] == null)
+        int bitShift = 7 - depth;
+        int childIndex = ((red >> bitShift) & 1) << 2 | ((green >> bitShift) & 1) << 1 | ((blue >> bitShift) & 1);
+        if (node.Children[childIndex] == null)
         {
             var child = new Node();
-            node.Children[idx] = child;
+            node.Children[childIndex] = child;
             if (depth < MaxDepth - 1)
             {
                 child.NextReducible = levels[depth + 1];
                 levels[depth + 1] = child;
             }
         }
-        AddColor(node.Children[idx]!, r, g, b, depth + 1);
+        AddColor(node.Children[childIndex]!, red, green, blue, depth + 1);
     }
 
     void Reduce()
     {
-        int lv = MaxDepth - 1;
-        while (lv > 0 && levels[lv] == null)
+        int level = MaxDepth - 1;
+        while (level > 0 && levels[level] == null)
         {
-            lv--;
+            level--;
         }
-        var node = levels[lv]!;
-        levels[lv] = node.NextReducible;
+        var node = levels[level]!;
+        levels[level] = node.NextReducible;
 
-        long r = 0, g = 0, b = 0, count = 0;
+        long redTotal = 0, greenTotal = 0, blueTotal = 0, colourCount = 0;
         foreach (var child in node.Children)
         {
             if (child == null)
             {
                 continue;
             }
-            r += child.R;
-            g += child.G;
-            b += child.B;
-            count += child.Count;
+            redTotal += child.RedTotal;
+            greenTotal += child.GreenTotal;
+            blueTotal += child.BlueTotal;
+            colourCount += child.Count;
             if (child.IsLeaf)
             {
                 leafCount--;
@@ -102,26 +102,26 @@ public sealed class Quantizer
         }
         node.Children = new Node?[8];
         node.IsLeaf = true;
-        node.R = r;
-        node.G = g;
-        node.B = b;
-        node.Count = count;
+        node.RedTotal = redTotal;
+        node.GreenTotal = greenTotal;
+        node.BlueTotal = blueTotal;
+        node.Count = colourCount;
         leafCount++;
     }
 
-    static void CollectLeaves(Node node, List<(byte, byte, byte)> result)
+    static void CollectLeaves(Node node, List<(byte, byte, byte)> paletteColours)
     {
         if (node.IsLeaf)
         {
-            long c = Math.Max(node.Count, 1);
-            result.Add(((byte)(node.R / c), (byte)(node.G / c), (byte)(node.B / c)));
+            long safeCount = Math.Max(node.Count, 1);
+            paletteColours.Add(((byte)(node.RedTotal / safeCount), (byte)(node.GreenTotal / safeCount), (byte)(node.BlueTotal / safeCount)));
             return;
         }
         foreach (var child in node.Children)
         {
             if (child != null)
             {
-                CollectLeaves(child, result);
+                CollectLeaves(child, paletteColours);
             }
         }
     }

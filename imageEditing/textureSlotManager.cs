@@ -20,10 +20,10 @@ public sealed class TextureSlot
     // Offset of this slot inside the MRG. Slots whose decode is empty or throws are skipped,
     // so the slot index is not the index of its RH2 match - PatchMrg must use this.
     public int Offset;
-    public Rh2Decoder.AlphaTreat Alpha;
+    public Rh2Decoder.AlphaTreatment Alpha;
 
     public TextureSlot(byte[] bytes, Texture2D thumbnail, int width, int height, TextureMrgKind kind, int iconIndex = -1,
-        Rh2Decoder.AlphaTreat alpha = Rh2Decoder.AlphaTreat.Keep, int offset = 0)
+        Rh2Decoder.AlphaTreatment alpha = Rh2Decoder.AlphaTreatment.Keep, int offset = 0)
     {
         Bytes = bytes;
         Thumbnail = thumbnail;
@@ -57,34 +57,34 @@ public static class TextureSlotManager
 
     public const string IconMrgName = "ICON.MRG";
     public const string PictureMrg = "PICTURE.MRG";
-    public const string PicMiniMrg = "PICMINI.MRG";
+    public const string PictureMiniMrg = "PICMINI.MRG";
 
     
 
     public static bool IsoHasFile(string name)
     {
-        return FileLoader.Instance.iso_data_files_all?.Any(f => IsoPaths.NameEquals(f, name)) == true;
+        return FileLoader.Instance.Find(name) != null;
     }
 
     public static string IsoPath(string name)
     {
-        return FileLoader.Instance.iso_data_files_all.First(f => IsoPaths.NameEquals(f, name));
+        return FileLoader.Instance.Get(name).IsoPath;
     }
 
-    // Card art and event pictures are drawn by the game with alpha test and blending off,
-    // so their palette alpha is never seen in-game. Their 5551 CLUTs still carry black
-    // entries with STP clear (0x0000), which decode as alpha 0 and punched holes through
-    // every black pixel of the art. Effect and model sheets do rely on that alpha
-    // (black STP-clear backgrounds are cut out), so they keep it.
-    internal static Rh2Decoder.AlphaTreat AlphaTreatFor(string mrgName)
+    /* Card art and event pictures are drawn by the game with alpha test and blending off,
+       so their palette alpha is never seen in-game. Their 5551 CLUTs still carry black
+       entries with STP clear (0x0000), which decode as alpha 0 and would punch holes
+       through every black pixel of the art. Effect and model sheets do rely on that
+       alpha (black STP-clear backgrounds are cut out), so they keep it. */
+    internal static Rh2Decoder.AlphaTreatment AlphaTreatFor(string mrgName)
     {
-        string n = IsoPaths.FileName(mrgName);
+        string fileName = IsoPaths.FileName(mrgName);
         bool drawnOpaque =
-            n.StartsWith("PICTURE", StringComparison.OrdinalIgnoreCase) ||
-            n.StartsWith("PICMINI", StringComparison.OrdinalIgnoreCase) ||
-            n.StartsWith("PICPACK", StringComparison.OrdinalIgnoreCase) ||
-            n.StartsWith("TEXEVE", StringComparison.OrdinalIgnoreCase);
-        return drawnOpaque ? Rh2Decoder.AlphaTreat.ForceOpaque : Rh2Decoder.AlphaTreat.Keep;
+            fileName.StartsWith("PICTURE", StringComparison.OrdinalIgnoreCase) ||
+            fileName.StartsWith("PICMINI", StringComparison.OrdinalIgnoreCase) ||
+            fileName.StartsWith("PICPACK", StringComparison.OrdinalIgnoreCase) ||
+            fileName.StartsWith("TEXEVE", StringComparison.OrdinalIgnoreCase);
+        return drawnOpaque ? Rh2Decoder.AlphaTreatment.ForceOpaque : Rh2Decoder.AlphaTreatment.Keep;
     }
 
     // withThumbnails = false skips the Raylib upload, for callers without a window (the harness).
@@ -95,28 +95,28 @@ public static class TextureSlotManager
         var offsets = AssetExtractor.FindAllRh2Offsets(mrgBytes);
         for (int i = 0; i < offsets.Count; i++)
         {
-            uint off = offsets[i];
+            uint mrgOffset = offsets[i];
             try
             {
-                var dec = Rh2Decoder.Decode(mrgBytes, (int)off, alpha);
-                if (dec.IsEmpty)
+                var decoded = Rh2Decoder.Decode(mrgBytes, (int)mrgOffset, alpha);
+                if (decoded.IsEmpty)
                     continue;
                 var thumbnail = default(Texture2D);
                 if (withThumbnails)
                 {
-                    var bmp = RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
-                    thumbnail = BitmapToTexture(bmp);
-                    bmp.Dispose();
+                    var decodedBitmap = RgbaToBitmap(decoded.Width, decoded.Height, decoded.Rgba);
+                    thumbnail = BitmapToTexture(decodedBitmap);
+                    decodedBitmap.Dispose();
                 }
                 // the gap to the next RH2 match, not to the next kept slot
-                int next = i + 1 < offsets.Count ? (int)offsets[i + 1] : mrgBytes.Length;
-                var slotBytes = mrgBytes.AsSpan((int)off, next - (int)off).ToArray();
-                slots.Add(new TextureSlot(slotBytes, thumbnail, dec.Width, dec.Height, TextureMrgKind.Rh2,
-                    alpha: alpha, offset: (int)off));
+                int nextOffset = i + 1 < offsets.Count ? (int)offsets[i + 1] : mrgBytes.Length;
+                var slotBytes = mrgBytes.AsSpan((int)mrgOffset, nextOffset - (int)mrgOffset).ToArray();
+                slots.Add(new TextureSlot(slotBytes, thumbnail, decoded.Width, decoded.Height, TextureMrgKind.Rh2,
+                    alpha: alpha, offset: (int)mrgOffset));
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                Console.Error.WriteLine($"Slot @ 0x{off:X}: {ex.Message}");
+                Console.Error.WriteLine($"Slot @ 0x{mrgOffset:X}: {exception.Message}");
             }
         }
         return slots;
@@ -125,30 +125,30 @@ public static class TextureSlotManager
     public static List<TextureSlot> LoadIconSlots(byte[] mrgBytes)
     {
         var slots = new List<TextureSlot>();
-        for (int i = 0; i < PS2Icon.TextureOffsets.Length; i++)
+        for (int i = 0; i < Ps2Icon.TextureOffsets.Length; i++)
         {
-            PS2Icon.CurrentTextureIndex = i;
-            int off = PS2Icon.TextureOffsets[i];
-            int len = i + 1 < PS2Icon.TextureOffsets.Length
-                ? PS2Icon.TextureOffsets[i + 1] - off
-                : mrgBytes.Length - off;
-            if (off + len > mrgBytes.Length)
+            Ps2Icon.CurrentTextureIndex = i;
+            int iconOffset = Ps2Icon.TextureOffsets[i];
+            int iconLength = i + 1 < Ps2Icon.TextureOffsets.Length
+                ? Ps2Icon.TextureOffsets[i + 1] - iconOffset
+                : mrgBytes.Length - iconOffset;
+            if (iconOffset + iconLength > mrgBytes.Length)
             {
                 break;   
             }
              
             try
             {
-                var slotBytes = mrgBytes.AsSpan(off, len).ToArray();
-                var bmp = PS2Icon.ExtractIconTexture(slotBytes);
-                var thumbnail = BitmapToTexture(bmp);
-                int w = bmp.Width, h = bmp.Height;
-                bmp.Dispose();
-                slots.Add(new TextureSlot(slotBytes, thumbnail, w, h, TextureMrgKind.Icon, i));
+                var slotBytes = mrgBytes.AsSpan(iconOffset, iconLength).ToArray();
+                var iconBitmap = Ps2Icon.ExtractIconTexture(slotBytes);
+                var thumbnail = BitmapToTexture(iconBitmap);
+                int iconWidth = iconBitmap.Width, iconHeight = iconBitmap.Height;
+                iconBitmap.Dispose();
+                slots.Add(new TextureSlot(slotBytes, thumbnail, iconWidth, iconHeight, TextureMrgKind.Icon, i));
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                Console.Error.WriteLine($"Icon slot {i}: {ex.Message}");
+                Console.Error.WriteLine($"Icon slot {i}: {exception.Message}");
             }
         }
         return slots;
@@ -158,24 +158,22 @@ public static class TextureSlotManager
     {
         if (slot.Kind == TextureMrgKind.Icon)
         {
-            PS2Icon.CurrentTextureIndex = slot.IconIndex;
-            return PS2Icon.ExtractIconTexture(slot.Bytes);
+            Ps2Icon.CurrentTextureIndex = slot.IconIndex;
+            return Ps2Icon.ExtractIconTexture(slot.Bytes);
         }
-        // Some textures (e.g. TEXEFF glow/particle sprites) carry their entire visible
-        // shape in the alpha channel, with a flat neutral-grey RGB underneath meant to be
-        // alpha-blended over the scene. Forcing alpha to 255 here discarded that alpha
-        // channel - the only channel with real content - leaving nothing but the flat grey
-        // RGB, which is why some textures rendered as plain grey boxes in the viewer.
-        // Only MRGs the game draws opaque drop alpha (see AlphaTreatFor).
-        var dec = Rh2Decoder.Decode(slot.Bytes, 0, slot.Alpha);
-        return RgbaToBitmap(dec.Width, dec.Height, dec.Rgba);
+        /* Some textures (e.g. TEXEFF glow/particle sprites) carry their whole visible shape
+           in the alpha channel over a flat neutral-grey RGB meant to be alpha-blended over
+           the scene. Forcing alpha to 255 would leave plain grey boxes, so only MRGs the
+           game draws opaque drop alpha (see AlphaTreatFor). */
+        var decoded = Rh2Decoder.Decode(slot.Bytes, 0, slot.Alpha);
+        return RgbaToBitmap(decoded.Width, decoded.Height, decoded.Rgba);
     }
 
     public static byte[] EncodeSlot(TextureSlot slot, SKBitmap bitmap)
     {
         if (slot.Kind == TextureMrgKind.Icon)
         {
-            return PS2Icon.SaveIconToByte(slot.Bytes, bitmap);
+            return Ps2Icon.SaveIconToByte(slot.Bytes, bitmap);
         }
         byte[] rgba = BitmapToRgba(bitmap);
         return Rh2Encoder.Encode(slot.Bytes.AsSpan(), rgba, bitmap.Width, bitmap.Height, slot.Alpha);
@@ -186,15 +184,15 @@ public static class TextureSlotManager
         var slot = slots[index];
         if (slot.Kind == TextureMrgKind.Rh2)
         {
-            int off = slot.Offset;
-            int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
-            Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
+            int slotOffset = slot.Offset;
+            int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - slotOffset);
+            Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, slotOffset, copyLen);
         }
         else if (slot.Kind == TextureMrgKind.Icon)
         {
-            int off = PS2Icon.TextureOffsets[slot.IconIndex];
-            int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - off);
-            Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, off, copyLen);
+            int slotOffset = Ps2Icon.TextureOffsets[slot.IconIndex];
+            int copyLen = Math.Min(newSlotBytes.Length, mrgBytes.Length - slotOffset);
+            Buffer.BlockCopy(newSlotBytes, 0, mrgBytes, slotOffset, copyLen);
         }
     }
 
@@ -213,128 +211,128 @@ public static class TextureSlotManager
             unique.Add(key);
         }
 
-        List<SKColor> list;
+        List<SKColor> paletteColours;
         if (unique.Count <= 256)
         {
-            list = unique.Select(k => new SKColor((byte)k, (byte)(k >> 8), (byte)(k >> 16), (byte)(k >> 24))).ToList();
+            paletteColours = unique.Select(packedRgba => new SKColor((byte)packedRgba, (byte)(packedRgba >> 8), (byte)(packedRgba >> 16), (byte)(packedRgba >> 24))).ToList();
         }
         else
         {
-            var q = new Quantizer(256);
+            var quantizer = new Quantizer(256);
             for (int i = 0; i < pixelCount; i++)
             {
-                q.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+                quantizer.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
             }
-            list = q.GetPalette().Select(t => new SKColor(t.R, t.G, t.B, 255)).ToList();
+            paletteColours = quantizer.GetPalette().Select(colourTuple => new SKColor(colourTuple.Red, colourTuple.Green, colourTuple.Blue, 255)).ToList();
         }
 
-        while (list.Count < 256)
+        while (paletteColours.Count < 256)
         {
-            list.Add(SKColors.Black);
+            paletteColours.Add(SKColors.Black);
         }
 
-        return list;
+        return paletteColours;
     }
 
     public static List<SKColor> BuildPaletteFromGameTexture()
     {
-        var pal = GameImageManager.CurrentTexture.Palette;
-        var list = new List<SKColor>(256);
+        var gamePalette = GameImageManager.CurrentTexture.Palette;
+        var paletteColours = new List<SKColor>(256);
         for (int i = 0; i < 256; i++)
         {
-            uint p = i < pal.Length ? pal[i] : 0xFF000000u;
-            list.Add(new SKColor((byte)(p >> 16), (byte)(p >> 8), (byte)p, (byte)(p >> 24)));
+            uint packedColour = i < gamePalette.Length ? gamePalette[i] : 0xFF000000u;
+            paletteColours.Add(new SKColor((byte)(packedColour >> 16), (byte)(packedColour >> 8), (byte)packedColour, (byte)(packedColour >> 24)));
         }
-        return list;
+        return paletteColours;
     }
 
     public static byte[] OctreePreQuantise(byte[] rgba, int pixelCount)
     {
-        var q = new Quantizer(256);
+        var quantizer = new Quantizer(256);
         for (int i = 0; i < pixelCount; i++)
         {
-            q.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
+            quantizer.AddColor(rgba[i * 4], rgba[i * 4 + 1], rgba[i * 4 + 2]);
         }
 
-        var pal = q.GetPalette();
-        var cache = new Dictionary<int, (byte R, byte G, byte B)>();
+        var palette = quantizer.GetPalette();
+        var nearestColourCache = new Dictionary<int, (byte Red, byte Green, byte Blue)>();
         var output = new byte[rgba.Length];
         for (int i = 0; i < pixelCount; i++)
         {
-            byte r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
-            int key = r | (g << 8) | (b << 16);
-            if (!cache.TryGetValue(key, out var nc))
+            byte red = rgba[i * 4], green = rgba[i * 4 + 1], blue = rgba[i * 4 + 2], alpha = rgba[i * 4 + 3];
+            int key = red | (green << 8) | (blue << 16);
+            if (!nearestColourCache.TryGetValue(key, out var nearestColour))
             {
-                nc = FindNearest(pal, r, g, b);
-                cache[key] = nc;
+                nearestColour = FindNearest(palette, red, green, blue);
+                nearestColourCache[key] = nearestColour;
             }
-            output[i * 4] = nc.R;
-            output[i * 4 + 1] = nc.G;
-            output[i * 4 + 2] = nc.B;
-            output[i * 4 + 3] = a;
+            output[i * 4] = nearestColour.Red;
+            output[i * 4 + 1] = nearestColour.Green;
+            output[i * 4 + 2] = nearestColour.Blue;
+            output[i * 4 + 3] = alpha;
         }
         return output;
     }
 
-    static (byte R, byte G, byte B) FindNearest(List<(byte R, byte G, byte B)> pal, byte r, byte g, byte b)
+    static (byte Red, byte Green, byte Blue) FindNearest(List<(byte Red, byte Green, byte Blue)> palette, byte red, byte green, byte blue)
     {
-        var best = pal[0];
-        long bestD = long.MaxValue;
-        foreach (var (pr, pg, pb) in pal)
+        var nearestColour = palette[0];
+        long bestDistance = long.MaxValue;
+        foreach (var (paletteRed, paletteGreen, paletteBlue) in palette)
         {
-            long dr = r - pr, dg = g - pg, db = b - pb;
-            long d = dr * dr + dg * dg + db * db;
-            if (d < bestD)
+            long deltaRed = red - paletteRed, deltaGreen = green - paletteGreen, deltaBlue = blue - paletteBlue;
+            long distance = deltaRed * deltaRed + deltaGreen * deltaGreen + deltaBlue * deltaBlue;
+            if (distance < bestDistance)
             {
-                bestD = d;
-                best = (pr, pg, pb);
+                bestDistance = distance;
+                nearestColour = (paletteRed, paletteGreen, paletteBlue);
             }
         }
-        return best;
+        return nearestColour;
     }
 
-    public static SKBitmap RgbaToBitmap(int w, int h, byte[] rgba)
+    public static SKBitmap RgbaToBitmap(int width, int height, byte[] rgba)
     {
-        var bmp = new SKBitmap(new SKImageInfo(w, h, SKColorType.Rgba8888, SKAlphaType.Unpremul));
+        var bitmap = new SKBitmap(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Unpremul));
         unsafe
         {
-            fixed (byte* src = rgba) Buffer.MemoryCopy(src, (void*)bmp.GetPixels(), bmp.ByteCount, Math.Min(rgba.Length, bmp.ByteCount));
+            fixed (byte* sourceBytes = rgba) Buffer.MemoryCopy(sourceBytes, (void*)bitmap.GetPixels(), bitmap.ByteCount, Math.Min(rgba.Length, bitmap.ByteCount));
         }
-        return bmp;
+        return bitmap;
     }
 
-    public static byte[] BitmapToRgba(SKBitmap bmp)
+    public static byte[] BitmapToRgba(SKBitmap bitmap)
     {
-        var src = bmp.ColorType == SKColorType.Rgba8888 ? bmp : bmp.Copy(SKColorType.Rgba8888);
-        var bytes = src.Bytes.ToArray();
-        if (!ReferenceEquals(src, bmp))
+        var rgbaBitmap = bitmap.ColorType == SKColorType.Rgba8888 ? bitmap : bitmap.Copy(SKColorType.Rgba8888);
+        var bytes = rgbaBitmap.Bytes.ToArray();
+        if (!ReferenceEquals(rgbaBitmap, bitmap))
         {
-            src.Dispose();
+            rgbaBitmap.Dispose();
         }
         return bytes;
     }
 
-    public static unsafe Texture2D BitmapToTexture(SKBitmap bmp)
+    public static unsafe Texture2D BitmapToTexture(SKBitmap bitmap)
     {
-        var src = bmp.ColorType == SKColorType.Rgba8888 ? bmp : bmp.Copy(SKColorType.Rgba8888);
-        var img = Raylib.GenImageColor(src.Width, src.Height, Color.Magenta);
-        var tex = Raylib.LoadTextureFromImage(img);
-        Raylib.UnloadImage(img);
-        Raylib.UpdateTexture(tex, (void*)src.GetPixels());
-        Raylib.SetTextureFilter(tex, TextureFilter.Point);
-        if (!ReferenceEquals(src, bmp))
+        var rgbaBitmap = bitmap.ColorType == SKColorType.Rgba8888 ? bitmap : bitmap.Copy(SKColorType.Rgba8888);
+        var colourImage = Raylib.GenImageColor(rgbaBitmap.Width, rgbaBitmap.Height, Color.Magenta);
+        var texture = Raylib.LoadTextureFromImage(colourImage);
+        Raylib.UnloadImage(colourImage);
+        Raylib.UpdateTexture(texture, (void*)rgbaBitmap.GetPixels());
+        Raylib.SetTextureFilter(texture, TextureFilter.Point);
+        if (!ReferenceEquals(rgbaBitmap, bitmap))
         {
-            src.Dispose();
+            rgbaBitmap.Dispose();
         }
 
-        return tex;
+        return texture;
     }
 
     public static void FreeSlots(List<TextureSlot> slots)
     {
-        foreach (var s in slots)
+        foreach (var slot in slots)
         {
-            Raylib.UnloadTexture(s.Thumbnail);
+            Raylib.UnloadTexture(slot.Thumbnail);
         }
 
         slots.Clear();

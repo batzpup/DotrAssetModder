@@ -1,27 +1,25 @@
-﻿using System;
-using System.IO;
-using System.Numerics;
+﻿using System.Numerics;
 using ImGuiNET;
 using NativeFileDialogSharp;
 using Raylib_cs;
 using rlImGui_cs;
-using static DotrAssetModder.glRD;
+using static DotrAssetModder.GuiContext;
+using static DotrAssetModder.Bin;
 
 namespace DotrAssetModder;
 
-// One importer for both model archives. MONSTER.MRG is 683 fixed 1 MiB card slots; a MODEL.MRG
-// block's slot is the gap to the next one. Pick a slot, load a glb, read the fit report, then
-// save everything staged to the ISO through ChangeSet.
+/* One importer for both model archives. MONSTER.MRG is 683 fixed 1 MiB card slots; a MODEL.MRG
+   block's slot is the gap to the next one. Pick a slot, load a glb, read the fit report, then
+   save everything staged to the ISO through ChangeSet. */
 public class ModelImporterWindow
 {
     const int ModelCount = 683;
-    const int BlockSize = 0x100000;
     const int SourceMonster = 0;
     const int SourceModel = 1;
 
     int source = SourceMonster;
     string status = string.Empty;
-    bool ok = true;
+    bool statusSucceeded = true;
     string openedIso = string.Empty;
 
     // MONSTER.MRG
@@ -30,12 +28,12 @@ public class ModelImporterWindow
     string[] cardNames = new string[ModelCount];
     Dictionary<int, byte[]> monsterStaged = new Dictionary<int, byte[]>();
     Dictionary<int, string> monsterStagedFrom = new Dictionary<int, string>();
-    HashSet<int> mapHeightEdits = new HashSet<int>();  // cards whose Map height was edited, written on Save to ISO
+    HashSet<int> mapHeightEdits = new HashSet<int>(); // cards whose Map height was edited, written on Save to ISO
     int selectedMonster = -1;
 
     // MODEL.MRG
-    ModelMrg imp;
-    int groupFilter;                   // 0 = all, else ModelMrg.Groups[groupFilter - 1]
+    ModelMrg modelMrg;
+    int groupFilter; // 0 = all, else ModelMrg.Groups[groupFilter - 1]
     string[] groupNames;
     int selectedModel = -1;
 
@@ -53,7 +51,7 @@ public class ModelImporterWindow
     string report = string.Empty;
     bool reportOk;
     List<string> reportWarnings = new List<string>();
-    List<string> reportConvert = new List<string>();   // the converter's own report lines
+    List<string> reportConvert = new List<string>(); // the converter's own report lines
 
     // The battle motion slots, in the order the importer fills them (RebuildPipeline's
     // SlotFillOrder), what the panel calls them, and the word written after "slot_N_".
@@ -61,36 +59,36 @@ public class ModelImporterWindow
     static readonly string[] SlotLabels = { "Idle", "Attack", "Death", "Win", "Hurt" };
     static readonly string[] SlotRoleName = { "idle", "attack", "death", "win", "hurt" };
 
-    bool keepStagedAfterSave;                          // off: a successful Save to ISO clears the staging
+    bool keepStagedAfterSave; // off: a successful Save to ISO clears the staging
 
-    bool convertOpen;                                  // the Convert panel's own window
-    bool convertShow;                                  // newly opened: expand it and bring it to the front
+    bool convertOpen; // the Convert panel's own window
+    bool convertShow; // newly opened: expand it and bring it to the front
     string convertPath = string.Empty;
     int convertIndex = -1;
     List<string> convertName = new List<string>();
     List<int> convertFrames = new List<int>();
-    string[] convertAnimLabels = new string[0];        // "name (N frames)", for the slot combos
-    int[] convertSlotAnim = new int[0];                // per slot (SlotIds order), the animation it plays
+    string[] convertAnimLabels = new string[0]; // "name (N frames)", for the slot combos
+    int[] convertSlotAnim = new int[0]; // per slot (SlotIds order), the animation it plays
     List<string> convertAnimsFrom = new List<string>();
-    List<string> convertWarnings = new List<string>();  // what reading the source said
+    List<string> convertWarnings = new List<string>(); // what reading the source said
 
     // The converter's options. Window fields, so they hold between imports.
     const float MinScale = 0.1f;
     float optScale = 1f;
-    bool optRotateOn;                                  // off: Rotate is not applied (and has no gizmo)
-    Vector3 optRotate;                                 // degrees about X, Y, Z
+    bool optRotateOn; // off: Rotate is not applied (and has no gizmo)
+    Vector3 optRotate; // degrees about X, Y, Z
     bool optMoveOn;
-    Vector3 optMove;                                   // Translate, in game units
-    bool optPivotOn;                                   // off: node 1 on node 0 (and no gizmo)
-    Vector3 optPivotAt;                                // Pivot: node 1, game units from node 0
+    Vector3 optMove; // Translate, in game units
+    bool optPivotOn; // off: node 1 on node 0 (and no gizmo)
+    Vector3 optPivotAt; // Pivot: node 1, game units from node 0
     bool optRestFromAnim;
     bool optFlipUv;
-    float optRadius;                                   // node 0's radius to write; 0 = measured (import, not convert)
+    float optRadius; // node 0's radius to write; 0 = measured (import, not convert)
 
-    // The Convert window on a card as it is on the ISO (opened by View): the same Transform and
-    // Radius options, applied to the card's extracted glb by ExtractedGlbEdit and staged like an
-    // import. Each kind keeps its own option values.
-    struct Opts
+    /* The Convert window on a card as it is on the ISO (opened by View): the same Transform and
+       Radius options, applied to the card's extracted glb by ExtractedGlbEdit and staged like an
+       import. Each kind keeps its own option values. */
+    struct ImportOptions
     {
         public float Scale;
         public bool RotateOn;
@@ -100,15 +98,16 @@ public class ModelImporterWindow
         public bool PivotOn;
         public Vector3 PivotAt;
         public float Radius;
-        public Vector3 PivotRest;                      // a card's: its node 1 rest offset from node 0
+        public Vector3 PivotRest; // a card's: its node 1 rest offset from node 0
     }
-    bool convertIsCard;                                // the Convert window edits convertIndex's card
-    Opts importOpts;                                   // the import options while it does
-    Dictionary<int, Opts> cardEdits = new Dictionary<int, Opts>();  // staged edits, by card
-    byte[] cardGlb;                                    // the card's glb as on the ISO; null: extract it again
-    Vector3 cardPivotRest;                             // its node 1 rest offset from node 0
-    float cardRadiusOwn;                               // its node 0 radius on the ISO
-    bool cardEditable;                                 // false: node 1 draws part of it, Radius only
+
+    bool convertIsCard; // the Convert window edits convertIndex's card
+    ImportOptions importOptions; // the import options while it does
+    Dictionary<int, ImportOptions> cardEdits = new Dictionary<int, ImportOptions>(); // staged edits, by card
+    byte[] cardGlb; // the card's glb as on the ISO; null: extract it again
+    Vector3 cardPivotRest; // its node 1 rest offset from node 0
+    float cardRadiusOwn; // its node 0 radius on the ISO
+    bool cardEditable; // false: node 1 draws part of it, Radius only
 
     // The last Check plan / Save, kept so the report stays on screen after the write.
     ChangeSet.Plan plan;
@@ -116,45 +115,45 @@ public class ModelImporterWindow
     bool planIsSaved;
 
     // View extracts on a worker thread; the preview is built from its glb on the main thread.
-    Task<(byte[] Glb, AnimatedGltfModel.Parsed Parsed, float Radius)> viewTask;   // read and parsed off the draw thread
+    Task<(byte[] Glb, AnimatedGltfModel.Parsed Parsed, float Radius)> viewTask; // read and parsed off the draw thread
     string viewName = string.Empty;
 
     // Extract .glb... writes one block on a worker thread too.
     Task extractTask;
     string extractPath = string.Empty;
 
-    // The viewed block's card and board scale, taken when View starts and kept with the preview.
-    // Compare is offered only for an import: View import from the Convert window, or View on a
-    // staged slot. A plain View of the ISO's model has nothing to compare with.
+    /* The viewed block's card and board scale, taken when View starts and kept with the preview.
+       Compare is offered only for an import: View import from the Convert window, or View on a
+       staged slot. A plain View of the ISO's model has nothing to compare with. */
     int viewIndex = -1;
     bool viewIsMonster;
     bool viewCanCompare;
-    bool viewCompareOn;                                // Compare's state when that preview opens
-    bool viewIsImport;                                 // View import: redone when an option changes
-    bool viewOpensCard;                                // a card's View: the Convert window opens for it
-    bool viewKeepCamera;                               // a redo keeps the camera and animation
-    string viewLabel = string.Empty;                   // the model's name beside its height
-    float viewRadius = -1f;                            // the block's node 0 radius; -1: the importer's measure (View import)
-    Vector3 viewMove;                                  // View import: the Move it was converted with
-    Vector3 viewRotate;                                // and the Rotate
-    float viewScale = 1f;                              // and the Scale
+    bool viewCompareOn; // Compare's state when that preview opens
+    bool viewIsImport; // View import: redone when an option changes
+    bool viewOpensCard; // a card's View: the Convert window opens for it
+    bool viewKeepCamera; // a redo keeps the camera and animation
+    string viewLabel = string.Empty; // the model's name beside its height
+    float viewRadius = -1f; // the block's node 0 radius; -1: the importer's measure (View import)
+    Vector3 viewMove; // View import: the Move it was converted with
+    Vector3 viewRotate; // and the Rotate
+    float viewScale = 1f; // and the Scale
     int previewIndex = -1;
     bool previewIsMonster;
     bool previewCanCompare;
     bool previewIsImport;
     string previewLabel = string.Empty;
-    float previewLowest;                               // lowest idle point, relative to node 0
-    float standLowest;                                 // Feet's stand height, from the first view (before Move)
-    float previewHeight;                               // tallest idle frame
-    float previewLeft;                                 // idle X extent, in glb coordinates
+    float previewLowest; // lowest idle point, relative to node 0
+    float standLowest; // Feet's stand height, from the first view (before Move)
+    float previewHeight; // tallest idle frame
+    float previewLeft; // idle X extent, in glb coordinates
     float previewRight;
-    float previewBack;                                 // idle Z extent, for the debug footprint
+    float previewBack; // idle Z extent, for the debug footprint
     float previewFront;
-    float previewRadius = 1f;                          // node 0's radius, read from the block or the importer's measure
-    Vector3 previewMove;                               // Move in previewLeft/Right etc. (View import), else 0
-    Vector3 previewRotate;                             // Rotate the preview was converted with, else 0
-    float previewScale = 1f;                           // Scale the preview was converted with, else 1
-    bool importDirty;                                  // an option changed under a View import
+    float previewRadius = 1f; // node 0's radius, read from the block or the importer's measure
+    Vector3 previewMove; // Move in previewLeft/Right etc. (View import), else 0
+    Vector3 previewRotate; // Rotate the preview was converted with, else 0
+    float previewScale = 1f; // Scale the preview was converted with, else 1
+    bool importDirty; // an option changed under a View import
 
     ViewScene viewScene = new ViewScene();
 
@@ -174,12 +173,12 @@ public class ModelImporterWindow
     float compareHeight;
     float compareLeft;
     float compareRight;
-    float compareBack;                                 // idle Z extent, for the debug footprint
+    float compareBack; // idle Z extent, for the debug footprint
     float compareFront;
-    float compareOffsetX;                              // its node 0 stands this far to the left of the preview's
-    float compareRadius = 1f;                          // its block's node 0 radius
+    float compareOffsetX; // its node 0 stands this far to the left of the preview's
+    float compareRadius = 1f; // its block's node 0 radius
     float compareTaskRadius = 1f;
-    int compareAnim = -1;                              // its idle animation
+    int compareAnim = -1; // its idle animation
     float compareTime;
 
     AnimatedGltfModel previewModel;
@@ -187,29 +186,29 @@ public class ModelImporterWindow
     bool previewOpen = false; // the preview's own window; closing it hides it until the next View
     bool previewShow = false; // a new View: expand the window if collapsed and bring it to the front
     string previewName = string.Empty;
-    RenderTexture2D previewTex;
-    bool previewTexReady = false;
-    int previewW = 1;
-    int previewH = 1;
+    RenderTexture2D previewTexture;
+    bool previewTextureReady = false;
+    int previewTextureWidth = 1;
+    int previewTextureHeight = 1;
 
-    OrbitCamera orbit = new OrbitCamera();
-    bool aimAtPivot;                                   // the camera follows node 1, as the game's focus camera does
+    OrbitCamera orbitCamera = new OrbitCamera();
+    bool aimAtPivot; // the camera follows node 1, as the game's focus camera does
 
     // The Move, Rotate and Pivot gizmos on a View import, each shown while its toggle is on. A
     // handle is 0-2 the X/Y/Z arrow or ring, 3 the centre (Move, Pivot).
     const int GizmoMove = 0;
     const int GizmoRotate = 1;
     const int GizmoPivot = 2;
-    int gizmoKind = -1;                                // the gizmo being dragged, -1 none
-    int gizmoDrag = -1;                                // its handle
+    int gizmoKind = -1; // the gizmo being dragged, -1 none
+    int gizmoDrag = -1; // its handle
     int gizmoHoverKind = -1;
     int gizmoHover = -1;
     Vector2 gizmoStartMouse;
-    Vector3 gizmoStartValue;                           // the dragged values (optMove/optRotate/optPivotAt) when it began
-    Vector3 gizmoStartCentre;                          // the gizmo's centre when it began, world units
-    float gizmoLength;                                 // the arrows' length when the drag began
-    float gizmoLastAngle;                              // Rotate: the mouse's angle round the centre last frame
-    float gizmoTurned;                                 // Rotate: degrees turned since the drag began
+    Vector3 gizmoStartValue; // the dragged values (optMove/optRotate/optPivotAt) when it began
+    Vector3 gizmoStartCentre; // the gizmo's centre when it began, world units
+    float gizmoLength; // the arrows' length when the drag began
+    float gizmoLastAngle; // Rotate: the mouse's angle round the centre last frame
+    float gizmoTurned; // Rotate: degrees turned since the drag began
 
     int currentAnim = 0;
     float animTime = 0f;
@@ -227,16 +226,16 @@ public class ModelImporterWindow
 
     public void Render()
     {
-        var fl = FileLoader.Instance;
+        var fileLoader = FileLoader.Instance;
 
-        if (!fl.IsIsoLoaded || fl.iso_data_files_all == null || string.IsNullOrEmpty(fl.CurrentIsoPath))
+        if (!fileLoader.IsIsoLoaded || fileLoader.IsoDataFilesAll == null || string.IsNullOrEmpty(fileLoader.CurrentIsoPath))
         {
             ImGui.TextDisabled("Load an ISO first (Extractor tab).");
             return;
         }
-        if (openedIso != fl.CurrentIsoPath)
+        if (openedIso != fileLoader.CurrentIsoPath)
         {
-            if (!Open(fl))
+            if (!Open(fileLoader))
             {
                 return;
             }
@@ -256,32 +255,29 @@ public class ModelImporterWindow
 
         if (source == SourceMonster)
         {
-            //Orange
-            ImGui.TextColored(new Vector4(1, 0.6f, 0, 1),
-                "MONSTER.MRG: the 683 card models. Each lives in a fixed 1 MiB block.");
+            ImGui.TextColored(new Vector4(1, 0.6f, 0, 1), "MONSTER.MRG: the 683 card models. Each lives in a fixed 1 MiB block.");
         }
         else
         {
             ImGui.TextColored(new Vector4(1, 0.6f, 0, 1),
-                "MODEL.MRG: duel table, terrain, arena stages, event scenes, stained-glass windows. " +
-                "A model must fit its existing slot.");
-            if (imp.Anomalies.Count > 0)
+                "MODEL.MRG: duel table, terrain, arena stages, event scenes, stained-glass windows. " + "A model must fit its existing slot.");
+            if (modelMrg.Anomalies.Count > 0)
             {
-                ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), $"{imp.Anomalies.Count} parse anomalies");
+                ImGui.TextColored(new Vector4(1, 0.4f, 0.4f, 1), $"{modelMrg.Anomalies.Count} parse anomalies");
             }
         }
 
-        DrawFilters(fl);
+        DrawFilters(fileLoader);
         ImGui.Separator();
         DrawList();
         ImGui.Separator();
         DrawSelected();
         ImGui.Separator();
-        DrawStagedAndSave(fl);
+        DrawStagedAndSave(fileLoader);
 
         if (status.Length > 0)
         {
-            if (ok)
+            if (statusSucceeded)
             {
                 ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), status);
             }
@@ -297,7 +293,7 @@ public class ModelImporterWindow
         viewScene.Update();
         if (viewScene.Error != null)
         {
-            ok = false;
+            statusSucceeded = false;
             status = viewScene.Error;
             viewScene.Error = null;
         }
@@ -341,17 +337,17 @@ public class ModelImporterWindow
     }
 
     // Reads both archives and the card names from a newly opened ISO.
-    bool Open(FileLoader fl)
+    bool Open(FileLoader fileLoader)
     {
         try
         {
-            monsterPath = fl.iso_data_files_all.FirstOrDefault(f => IsoPaths.NameEquals(f, "MONSTER.MRG"));
+            monsterPath = fileLoader.Find("MONSTER.MRG")?.IsoPath;
             if (monsterPath == null)
             {
                 throw new Exception("MONSTER.MRG not found in ISO.");
             }
-            monsterMrg = fl.GetFileBytesFromDisk(monsterPath);
-            compareCard = -1;                          // the compare model came from the old ISO
+            monsterMrg = fileLoader.GetFileBytesFromDisk(monsterPath);
+            compareCard = -1; // the compare model came from the old ISO
             viewScene.Unload();
             monsterStaged.Clear();
             monsterStagedFrom.Clear();
@@ -360,25 +356,25 @@ public class ModelImporterWindow
             cardGlb = null;
             PutImportOptionsBack();
 
-            if (imp != null)
+            if (modelMrg != null)
             {
-                imp.Dispose();
+                modelMrg.Dispose();
             }
-            imp = ModelMrg.Open(fl.CurrentIsoPath);
-            viewScene.SetSource(imp);
+            modelMrg = ModelMrg.Open(fileLoader.CurrentIsoPath);
+            viewScene.SetSource(modelMrg);
 
             for (int i = 0; i < ModelCount; i++)
             {
-                cardNames[i] = imp.Tables.CardName(i).Trim();
+                cardNames[i] = modelMrg.Tables.CardName(i).Trim();
             }
         }
-        catch (Exception e)
+        catch (Exception exception)
         {
-            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Could not read the ISO's models: " + e.Message);
+            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), "Could not read the ISO's models: " + exception.Message);
             return false;
         }
 
-        openedIso = fl.CurrentIsoPath;
+        openedIso = fileLoader.CurrentIsoPath;
         selectedMonster = -1;
         selectedModel = -1;
         plan = null;
@@ -392,7 +388,7 @@ public class ModelImporterWindow
 
     void SourceChanged()
     {
-        convertOpen = false;                           // its slot index belongs to the other archive
+        convertOpen = false; // its slot index belongs to the other archive
         ClearReport();
         plan = null;
         planReport = null;
@@ -434,7 +430,7 @@ public class ModelImporterWindow
         {
             return monsterStaged.ContainsKey(index);
         }
-        return imp.IsStaged(index);
+        return modelMrg.IsStaged(index);
     }
 
     int StagedCount()
@@ -443,10 +439,10 @@ public class ModelImporterWindow
         {
             return monsterStaged.Count;
         }
-        return imp.StagedCount;
+        return modelMrg.StagedCount;
     }
 
-    void DrawFilters(FileLoader fl)
+    void DrawFilters(FileLoader fileLoader)
     {
         if (source == SourceModel)
         {
@@ -468,26 +464,26 @@ public class ModelImporterWindow
         if (ImGui.Button("Reload from ISO"))
         {
             openedIso = string.Empty;
-            if (Open(fl))
+            if (Open(fileLoader))
             {
                 status = "Reloaded the models from the ISO.";
-                ok = true;
+                statusSucceeded = true;
             }
         }
         ImGui.SameLine();
         ImGui.Checkbox("Keep staged after save", ref keepStagedAfterSave);
-        HoveredTooltip("On: staged models stay staged after Save to ISO, so they can be saved again (e.g. to another ISO). " +
-            "\nOff: a successful save clears the staging, since those models are now on the disc.");
+        HoveredTooltip(@"On: staged models stay staged after Save to ISO, so they can be saved again (e.g. to another ISO). 
+Off: a successful save clears the staging, since those models are now on the disc.");
     }
 
-    bool Matches(string a, string b)
+    bool Matches(string listName, string displayName)
     {
         if (nameFilter.Length == 0)
         {
             return true;
         }
-        return a.Contains(nameFilter, StringComparison.OrdinalIgnoreCase) ||
-               b.Contains(nameFilter, StringComparison.OrdinalIgnoreCase);
+        return listName.Contains(nameFilter, StringComparison.OrdinalIgnoreCase) ||
+               displayName.Contains(nameFilter, StringComparison.OrdinalIgnoreCase);
     }
 
     void BuildRows()
@@ -513,25 +509,25 @@ public class ModelImporterWindow
         }
         else
         {
-            foreach (ModelMrg.Block b in imp.Blocks)
+            foreach (ModelMrg.Block block in modelMrg.Blocks)
             {
                 // DUEL01-21 are byte-identical to DUEL00 and saved with it, so only DUEL00 is listed
-                if (b.IsMirror)
+                if (block.IsMirror)
                 {
                     continue;
                 }
-                if (groupFilter > 0 && b.Group != ModelMrg.Groups[groupFilter - 1])
+                if (groupFilter > 0 && block.Group != ModelMrg.Groups[groupFilter - 1])
                 {
                     continue;
                 }
-                if (!Matches(b.Name, b.FriendlyName))
+                if (!Matches(block.Name, block.FriendlyName))
                 {
                     continue;
                 }
-                rowIndex.Add(b.Index);
-                rowName.Add(b.Name);
-                rowWhat.Add(b.FriendlyName);
-                rowGroup.Add(b.Group);
+                rowIndex.Add(block.Index);
+                rowName.Add(block.Name);
+                rowWhat.Add(block.FriendlyName);
+                rowGroup.Add(block.Group);
             }
         }
         rowsDirty = false;
@@ -559,9 +555,9 @@ public class ModelImporterWindow
             clipper.Begin(rowIndex.Count);
             while (clipper.Step())
             {
-                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++)
+                for (int visibleRow = clipper.DisplayStart; visibleRow < clipper.DisplayEnd; visibleRow++)
                 {
-                    int index = rowIndex[row];
+                    int index = rowIndex[visibleRow];
                     bool staged = IsStaged(index);
                     ImGui.TableNextRow();
                     ImGui.TableNextColumn();
@@ -570,7 +566,7 @@ public class ModelImporterWindow
                         ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.4f, 1f, 0.4f, 1f));
                     }
                     ImGui.PushID(index);
-                    if (ImGui.Selectable(rowName[row], Selected() == index, ImGuiSelectableFlags.SpanAllColumns))
+                    if (ImGui.Selectable(rowName[visibleRow], Selected() == index, ImGuiSelectableFlags.SpanAllColumns))
                     {
                         Select(index);
                         ClearReport();
@@ -581,16 +577,16 @@ public class ModelImporterWindow
                         ImGui.PopStyleColor();
                     }
                     ImGui.TableNextColumn();
-                    if (rowWhat[row].Length > 0)
+                    if (rowWhat[visibleRow].Length > 0)
                     {
-                        ImGui.Text(rowWhat[row]);
+                        ImGui.Text(rowWhat[visibleRow]);
                     }
                     else
                     {
                         ImGui.TextDisabled("not identified yet");
                     }
                     ImGui.TableNextColumn();
-                    ImGui.Text(rowGroup[row]);
+                    ImGui.Text(rowGroup[visibleRow]);
                 }
             }
             clipper.End();
@@ -606,12 +602,12 @@ public class ModelImporterWindow
         {
             return $"card {index:000}  -  {cardNames[index]}";
         }
-        ModelMrg.Block b = imp.Find(index);
-        if (b.FriendlyName.Length > 0)
+        ModelMrg.Block block = modelMrg.Find(index);
+        if (block.FriendlyName.Length > 0)
         {
-            return $"{b.Name}  -  {b.FriendlyName}";
+            return $"{block.Name}  -  {block.FriendlyName}";
         }
-        return b.Name;
+        return block.Name;
     }
 
     void DrawSelected()
@@ -626,17 +622,17 @@ public class ModelImporterWindow
         ImGui.Text(SlotName(index));
         if (source == SourceMonster)
         {
-            ImGui.TextDisabled($"slot {BlockSize:N0} B at MONSTER.MRG+0x{(long)index * BlockSize:X}");
+            ImGui.TextDisabled($"slot {GameTables.MonsterSlotSize:N0} B at MONSTER.MRG+0x{(long)index * GameTables.MonsterSlotSize:X}");
         }
         else
         {
-            ModelMrg.Block b = imp.Find(index);
+            ModelMrg.Block block = modelMrg.Find(index);
             string animated = "no";
-            if (b.HasEmbeddedMot)
+            if (block.HasEmbeddedMot)
             {
                 animated = "yes";
             }
-            ImGui.TextDisabled($"textures {b.TexCount}  animated {animated}  slot {b.Slot:N0} B");
+            ImGui.TextDisabled($"textures {block.TexCount}  animated {animated}  slot {block.Slot:N0} B");
         }
 
         ImGui.BeginDisabled(viewTask != null);
@@ -658,14 +654,22 @@ public class ModelImporterWindow
             ImGui.SameLine();
             ImGui.TextDisabled("Loading " + viewName + "...");
         }
-
+        ImGui.SameLine();
+        if (source == SourceMonster)
+        {
+            if (ImGui.Button("Remove model"))
+            {
+                RemoveModel(index);
+            }
+            HoveredTooltip("Stages this card as a model the game loads and animates but that draws nothing (one zero-area triangle, a transparent texture). Its nodes, motions and radius stay as they are on the ISO.");
+        }
         if (ImGui.Button("Load Model"))
         {
-            var r = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf,fbx,dae"),
+            var dialogResult = Dialog.FileOpen(FileDialogFilter.Of("glb,gltf,fbx,dae"),
                 Path.GetDirectoryName(Program.config.lastModelImportPath));
-            if (r.IsOk)
+            if (dialogResult.IsOk)
             {
-                BeginImport(r.Path);
+                BeginImport(dialogResult.Path);
             }
         }
         ImGui.SameLine();
@@ -684,11 +688,13 @@ public class ModelImporterWindow
                 }
                 else
                 {
-                    imp.Unstage(index);
+                    modelMrg.Unstage(index);
                 }
                 ClearReport();
             }
         }
+
+
 
         ImGui.BeginDisabled(extractTask != null);
         if (ImGui.Button("Extract .glb..."))
@@ -722,17 +728,17 @@ public class ModelImporterWindow
                 ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), report);
                 ImGui.TextWrapped("Nothing was staged. Simplify the mesh, or let the reduction checkbox shrink its textures.");
             }
-            foreach (string w in reportWarnings)
+            foreach (string warning in reportWarnings)
             {
-                ImGui.TextColored(new Vector4(1, 0.8f, 0.3f, 1), w);
+                ImGui.TextColored(new Vector4(1, 0.8f, 0.3f, 1), warning);
             }
         }
     }
 
-    // Shows the block (as it is on the ISO, or as staged) in the preview. Only a staged block
-    // offers Compare, against the ISO's model it replaces; it opens with Compare off. A card
-    // (as on the ISO, or staged as an edit) opens the Convert window for it, as an import does,
-    // without Compare.
+    /* Shows the block (as it is on the ISO, or as staged) in the preview. Only a staged block
+       offers Compare, against the ISO's model it replaces; it opens with Compare off. A card
+       (as on the ISO, or staged as an edit) opens the Convert window for it, as an import does,
+       without Compare. */
     void View(int index, bool staged)
     {
         byte[] bytes;
@@ -751,23 +757,23 @@ public class ModelImporterWindow
         }
         viewIndex = index;
         viewIsMonster = source == SourceMonster;
-        viewCanCompare = staged && !card;                  // no Compare for a card on the ISO (edited or not)
+        viewCanCompare = staged && !card; // no Compare for a card on the ISO (edited or not)
         viewCompareOn = false;
         viewIsImport = card;
         viewOpensCard = card;
         viewKeepCamera = false;
-        viewRadius = card ? -1f : BlockRadius(bytes);      // a card shows Radius as an import does
+        viewRadius = card ? -1f : BlockRadius(bytes); // a card shows Radius as an import does
         viewMove = Vector3.Zero;
         viewRotate = Vector3.Zero;
         viewScale = 1f;
         if (card && staged)
         {
             // the staged block itself; the preview was edited with the values it was staged with
-            Opts e = cardEdits[index];
+            ImportOptions cardEdit = cardEdits[index];
             viewLabel = cardNames[index];
-            viewMove = e.MoveOn ? e.Move : Vector3.Zero;
-            viewRotate = e.RotateOn ? e.Rotate : Vector3.Zero;
-            viewScale = e.Scale;
+            viewMove = cardEdit.MoveOn ? cardEdit.Move : Vector3.Zero;
+            viewRotate = cardEdit.RotateOn ? cardEdit.Rotate : Vector3.Zero;
+            viewScale = cardEdit.Scale;
         }
         byte[] donor = null;
         if (card)
@@ -818,27 +824,27 @@ public class ModelImporterWindow
     {
         if (!convertIsCard)
         {
-            importOpts = CurrentOpts();
+            importOptions = CurrentImportOptions();
         }
         convertIsCard = true;
         convertIndex = index;
         convertPath = cardNames[index];
-        Opts e;
-        if (cardEdits.TryGetValue(index, out e))
+        ImportOptions cardEdit;
+        if (cardEdits.TryGetValue(index, out cardEdit))
         {
-            cardGlb = null;                            // the shown glb is the staged block's
+            cardGlb = null; // the shown glb is the staged block's
         }
         else
         {
             cardGlb = glb;
-            e = new Opts();
-            e.Scale = 1f;
-            e.PivotRest = model.RestPivot - model.RestNodeZero;
-            e.PivotAt = e.PivotRest;
-            e.Radius = BlockRadius(BlockBytes(index));
+            cardEdit = new ImportOptions();
+            cardEdit.Scale = 1f;
+            cardEdit.PivotRest = model.RestPivot - model.RestNodeZero;
+            cardEdit.PivotAt = cardEdit.PivotRest;
+            cardEdit.Radius = BlockRadius(BlockBytes(index));
         }
-        SetOpts(e);
-        cardPivotRest = e.PivotRest;
+        SetImportOptions(cardEdit);
+        cardPivotRest = cardEdit.PivotRest;
         cardRadiusOwn = BlockRadius(BlockBytes(index));
         cardEditable = ExtractedGlbEdit.Editable(glb);
         // the card's own motions, in the slot rows, greyed: an edit keeps them as they are
@@ -861,7 +867,7 @@ public class ModelImporterWindow
         reportIndex = index;
         convertOpen = true;
         convertShow = true;
-        ok = true;
+        statusSucceeded = true;
         status = $"{cardNames[index]}: check the options, then Import.";
     }
 
@@ -870,41 +876,41 @@ public class ModelImporterWindow
     {
         if (convertIsCard)
         {
-            SetOpts(importOpts);
+            SetImportOptions(importOptions);
             convertIsCard = false;
         }
     }
 
-    Opts CurrentOpts()
+    ImportOptions CurrentImportOptions()
     {
-        Opts o = new Opts();
-        o.Scale = optScale;
-        o.RotateOn = optRotateOn;
-        o.Rotate = optRotate;
-        o.MoveOn = optMoveOn;
-        o.Move = optMove;
-        o.PivotOn = optPivotOn;
-        o.PivotAt = optPivotAt;
-        o.Radius = optRadius;
-        o.PivotRest = cardPivotRest;
-        return o;
+        ImportOptions windowOptions = new ImportOptions();
+        windowOptions.Scale = optScale;
+        windowOptions.RotateOn = optRotateOn;
+        windowOptions.Rotate = optRotate;
+        windowOptions.MoveOn = optMoveOn;
+        windowOptions.Move = optMove;
+        windowOptions.PivotOn = optPivotOn;
+        windowOptions.PivotAt = optPivotAt;
+        windowOptions.Radius = optRadius;
+        windowOptions.PivotRest = cardPivotRest;
+        return windowOptions;
     }
 
-    void SetOpts(Opts o)
+    void SetImportOptions(ImportOptions windowOptions)
     {
-        optScale = o.Scale;
-        optRotateOn = o.RotateOn;
-        optRotate = o.Rotate;
-        optMoveOn = o.MoveOn;
-        optMove = o.Move;
-        optPivotOn = o.PivotOn;
-        optPivotAt = o.PivotAt;
-        optRadius = o.Radius;
+        optScale = windowOptions.Scale;
+        optRotateOn = windowOptions.RotateOn;
+        optRotate = windowOptions.Rotate;
+        optMoveOn = windowOptions.MoveOn;
+        optMove = windowOptions.Move;
+        optPivotOn = windowOptions.PivotOn;
+        optPivotAt = windowOptions.PivotAt;
+        optRadius = windowOptions.Radius;
     }
 
-    // The Convert window's View import: the source converted with the options as they stand,
-    // beside the model on the ISO it would replace. Nothing is staged. A redo after an option
-    // changed keeps the camera, so Scale and Move show against the grid.
+    /* The Convert window's View import: the source converted with the options as they stand,
+       beside the model on the ISO it would replace. Nothing is staged. A redo after an option
+       changed keeps the camera, so Scale and Move show against the grid. */
     void ViewImport(bool redo)
     {
         if (convertIsCard)
@@ -913,7 +919,7 @@ public class ModelImporterWindow
             return;
         }
         string path = convertPath;
-        ConvertOptions o = Options();
+        ConvertOptions convertOptions = Options();
         viewName = Path.GetFileName(path) + " -> " + SlotName(convertIndex);
         viewLabel = Path.GetFileNameWithoutExtension(path);
         viewIndex = convertIndex;
@@ -931,13 +937,13 @@ public class ModelImporterWindow
         viewOpensCard = false;
         viewKeepCamera = redo;
         viewRadius = -1f;
-        viewMove = new Vector3((float)o.TranslateX, (float)o.TranslateY, (float)o.TranslateZ);
-        viewRotate = new Vector3((float)o.RotateX, (float)o.RotateY, (float)o.RotateZ);
-        viewScale = (float)o.Scale;
+        viewMove = new Vector3((float)convertOptions.TranslateX, (float)convertOptions.TranslateY, (float)convertOptions.TranslateZ);
+        viewRotate = new Vector3((float)convertOptions.RotateX, (float)convertOptions.RotateY, (float)convertOptions.RotateZ);
+        viewScale = (float)convertOptions.Scale;
         importDirty = false;
         // the converter's warnings are shown by Import; the preview ignores them
         byte[] donor = BlockBytes(convertIndex);
-        viewTask = Task.Run(() => WithParsed(ModelConverter.ConvertFile(path, o, w => { }).Glb, donor));
+        viewTask = Task.Run(() => WithParsed(ModelConverter.ConvertFile(path, convertOptions, message => { }).Glb, donor));
     }
 
     // Redoes a shown View import once an option has changed and the last convert is done.
@@ -962,15 +968,15 @@ public class ModelImporterWindow
         {
             return monsterStagedFrom[index];
         }
-        ModelMrg.Block b = imp.Find(index);
-        foreach (ModelMrg.StagedBlock s in imp.Staged)
+        ModelMrg.Block block = modelMrg.Find(index);
+        foreach (ModelMrg.StagedBlock stagedBlock in modelMrg.Staged)
         {
-            if (s.Block == b)
+            if (stagedBlock.Block == block)
             {
-                return s.SourcePath;
+                return stagedBlock.SourcePath;
             }
         }
-        return b.Name;
+        return block.Name;
     }
 
     // Starts loading the compare model if the one wanted is not already shown or loading.
@@ -998,17 +1004,17 @@ public class ModelImporterWindow
             {
                 return;
             }
-            bytes = new byte[BlockSize];
-            Array.Copy(monsterMrg, (long)card * BlockSize, bytes, 0, BlockSize);
+            bytes = new byte[GameTables.MonsterSlotSize];
+            Array.Copy(monsterMrg, (long)card * GameTables.MonsterSlotSize, bytes, 0, GameTables.MonsterSlotSize);
         }
         else
         {
             // a MODEL.MRG entry belongs to the archive it was viewed from
-            if (source != SourceModel || imp == null)
+            if (source != SourceModel || modelMrg == null)
             {
                 return;
             }
-            bytes = imp.BlockBytes(card);
+            bytes = modelMrg.BlockBytes(card);
         }
         compareTaskCard = card;
         compareTaskIsMonster = isMonster;
@@ -1024,7 +1030,7 @@ public class ModelImporterWindow
         }
         if (compareTask.IsFaulted)
         {
-            ok = false;
+            statusSucceeded = false;
             status = "Compare model failed: " + compareTask.Exception.InnerException.Message;
             compareTask = null;
             return;
@@ -1044,7 +1050,7 @@ public class ModelImporterWindow
         }
         else
         {
-            compareName = imp.Find(compareCard).Name;
+            compareName = modelMrg.Find(compareCard).Name;
         }
         compareAnim = IdleAnimIndex(compareModel);
         compareTime = 0f;
@@ -1080,12 +1086,12 @@ public class ModelImporterWindow
         {
             return 1f;
         }
-        int tree = BitConverter.ToInt32(block, 0x10);
+        int tree = ReadI32(block, 0x10);
         if (tree <= 0 || tree + 0x40 > block.Length)
         {
             return 1f;
         }
-        return BitConverter.ToSingle(block, tree + 0x3C);
+        return ReadF32(block, tree + 0x3C);
     }
 
     // Stands the compare model to the left of the preview, its idle extent clear of the
@@ -1096,12 +1102,12 @@ public class ModelImporterWindow
         {
             return;
         }
-        float sp = viewScene.ModelScale(PreviewRadius());
-        float sc = viewScene.ModelScale(compareRadius);
-        float gap = 0.1f * MathF.Max(sp * previewHeight, sc * compareHeight);
+        float previewModelScale = viewScene.ModelScale(PreviewRadius());
+        float compareModelScale = viewScene.ModelScale(compareRadius);
+        float gap = 0.1f * MathF.Max(previewModelScale * previewHeight, compareModelScale * compareHeight);
         // spaced from the body before Move X, so moving the import does not drag this one along
-        float x = viewScene.StandShift(previewModel, sp).X + sp * (previewLeft - previewMove.X)
-            - viewScene.StandShift(compareModel, sc).X - sc * compareRight - gap;
+        float x = viewScene.StandShift(previewModel, previewModelScale).X + previewModelScale * (previewLeft - previewMove.X)
+                  - viewScene.StandShift(compareModel, compareModelScale).X - compareModelScale * compareRight - gap;
         if (viewScene.Placement == ViewScene.PlaceBoard)
         {
             // the tile left of the centre one, as two units stand in a duel (big ones may overlap)
@@ -1114,23 +1120,23 @@ public class ModelImporterWindow
     // the compare model when shown.
     void FrameStanding()
     {
-        float s = viewScene.ModelScale(PreviewRadius());
-        Vector3 shift = viewScene.StandShift(previewModel, s);
-        float left = shift.X + s * previewLeft;
-        float right = shift.X + s * previewRight;
-        float bottom = viewScene.StandY(ShownLowest(), previewIndex) + shift.Y + s * previewLowest;
-        float top = bottom + s * previewHeight;
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        Vector3 shift = viewScene.StandShift(previewModel, modelScale);
+        float left = shift.X + modelScale * previewLeft;
+        float right = shift.X + modelScale * previewRight;
+        float bottom = viewScene.StandY(ShownLowest(), previewIndex) + shift.Y + modelScale * previewLowest;
+        float top = bottom + modelScale * previewHeight;
         if (CompareShown())
         {
-            float sc = viewScene.ModelScale(compareRadius);
-            Vector3 cs = viewScene.StandShift(compareModel, sc);
-            left = compareOffsetX + cs.X + sc * compareLeft;
-            float cb = viewScene.StandY(compareLowest, compareCard) + cs.Y + sc * compareLowest;
-            bottom = MathF.Min(bottom, cb);
-            top = MathF.Max(top, cb + sc * compareHeight);
+            float compareModelScale = viewScene.ModelScale(compareRadius);
+            Vector3 compareShift = viewScene.StandShift(compareModel, compareModelScale);
+            left = compareOffsetX + compareShift.X + compareModelScale * compareLeft;
+            float compareBottom = viewScene.StandY(compareLowest, compareCard) + compareShift.Y + compareModelScale * compareLowest;
+            bottom = MathF.Min(bottom, compareBottom);
+            top = MathF.Max(top, compareBottom + compareModelScale * compareHeight);
         }
-        bottom = MathF.Min(bottom, 0f);                // keep the grid in view
-        orbit.Frame(left, right, bottom, top, 0.15f);
+        bottom = MathF.Min(bottom, 0f); // keep the grid in view
+        orbitCamera.Frame(left, right, bottom, top, 0.15f);
     }
 
     // The idle motion: "slot_0" in an extracted block, "slot_0_idle" in a converted source;
@@ -1155,12 +1161,12 @@ public class ModelImporterWindow
     // One block through the Extractor tab's own conversion, written where the user picks.
     void ExtractOne(int index)
     {
-        var r = Dialog.FileSave("glb", DefaultGlbPath(index));
-        if (!r.IsOk)
+        var dialogResult = Dialog.FileSave("glb", DefaultGlbPath(index));
+        if (!dialogResult.IsOk)
         {
             return;
         }
-        string outPath = r.Path;
+        string outPath = dialogResult.Path;
         if (!outPath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
         {
             outPath += ".glb";
@@ -1184,18 +1190,18 @@ public class ModelImporterWindow
         }
         else
         {
-            name = imp.Find(index).Name;
+            name = modelMrg.Find(index).Name;
         }
-        foreach (char ch in Path.GetInvalidFileNameChars())
+        foreach (char invalidCharacter in Path.GetInvalidFileNameChars())
         {
-            name = name.Replace(ch, '_');
+            name = name.Replace(invalidCharacter, '_');
         }
-        string dir = string.Empty;
+        string directory = string.Empty;
         if (!string.IsNullOrEmpty(Program.config.lastModelImportPath))
         {
-            dir = Path.GetDirectoryName(Program.config.lastModelImportPath) ?? string.Empty;
+            directory = Path.GetDirectoryName(Program.config.lastModelImportPath) ?? string.Empty;
         }
-        return Path.Combine(dir, name + ".glb");
+        return Path.Combine(directory, name + ".glb");
     }
 
     void UpdateExtract()
@@ -1206,22 +1212,22 @@ public class ModelImporterWindow
         }
         if (extractTask.IsFaulted)
         {
-            ok = false;
+            statusSucceeded = false;
             status = "Extract failed: " + extractTask.Exception.InnerException.Message;
         }
         else
         {
-            ok = true;
+            statusSucceeded = true;
             status = "Wrote " + extractPath + ".";
         }
         extractTask = null;
     }
 
-    // A View's glb with its SharpGLTF read and scene (the slow part of a load), on the worker:
-    // only the GPU half is left for the draw thread, so a View import redo does not stall it.
-    // With a donor block, also the radius an import over it writes (Rebuilder.MeasureRadius,
-    // the importer's own measure), so the preview and Radius show what the game gets; else -1.
-    // The measure runs beside the parse.
+    /* A View's glb with its SharpGLTF read and scene (the slow part of a load), on the worker:
+       only the GPU half is left for the draw thread, so a View import redo does not stall it.
+       With a donor block, also the radius an import over it writes (Rebuilder.MeasureRadius,
+       the importer's own measure), so the preview and Radius show what the game gets; else -1.
+       The measure runs beside the parse. */
     static (byte[] Glb, AnimatedGltfModel.Parsed Parsed, float Radius) WithParsed(byte[] glb, byte[] donor)
     {
         Task<float> radius = Task.FromResult(-1f);
@@ -1241,7 +1247,7 @@ public class ModelImporterWindow
         }
         if (viewTask.IsFaulted)
         {
-            ok = false;
+            statusSucceeded = false;
             status = "View failed: " + viewTask.Exception.InnerException.Message;
         }
         else
@@ -1276,10 +1282,10 @@ public class ModelImporterWindow
     {
         if (source == SourceModel)
         {
-            return imp.BlockBytes(index);
+            return modelMrg.BlockBytes(index);
         }
-        byte[] block = new byte[BlockSize];
-        Array.Copy(monsterMrg, (long)index * BlockSize, block, 0, BlockSize);
+        byte[] block = new byte[GameTables.MonsterSlotSize];
+        Array.Copy(monsterMrg, (long)index * GameTables.MonsterSlotSize, block, 0, GameTables.MonsterSlotSize);
         return block;
     }
 
@@ -1287,7 +1293,7 @@ public class ModelImporterWindow
     {
         if (source == SourceModel)
         {
-            return imp.StagedBytes(index);
+            return modelMrg.StagedBytes(index);
         }
         return monsterStaged[index];
     }
@@ -1306,7 +1312,7 @@ public class ModelImporterWindow
         if (index < 0)
         {
             status = "Select a model in the list first.";
-            ok = false;
+            statusSucceeded = false;
             return;
         }
         Program.config.lastModelImportPath = path;
@@ -1322,29 +1328,29 @@ public class ModelImporterWindow
         convertWarnings = new List<string>();
         ClearReport();
         reportIndex = index;
-        Scene sc;
+        Scene scene;
         try
         {
             convertAnimsFrom = ModelConverter.FindMotionFiles(path);
-            sc = ModelConverter.ReadSource(path, Warn);
-            foreach (string f in convertAnimsFrom)
+            scene = ModelConverter.ReadSource(path, Warn);
+            foreach (string motionFile in convertAnimsFrom)
             {
-                Scene es = ModelConverter.ReadSource(f, Warn);
-                ModelConverter.AddAnimsFrom(sc, es, Path.GetFileName(f), Warn);
+                Scene motionScene = ModelConverter.ReadSource(motionFile, Warn);
+                ModelConverter.AddAnimsFrom(scene, motionScene, Path.GetFileName(motionFile), Warn);
             }
             // the converter sorts the animations by name, so the rows read in the same order
-            sc.Anims.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
-            convertAnimLabels = new string[sc.Anims.Count];
-            for (int i = 0; i < sc.Anims.Count; i++)
+            scene.Anims.Sort((firstAnimation, secondAnimation) => string.CompareOrdinal(firstAnimation.Name, secondAnimation.Name));
+            convertAnimLabels = new string[scene.Anims.Count];
+            for (int i = 0; i < scene.Anims.Count; i++)
             {
-                convertName.Add(sc.Anims[i].Name);
-                convertFrames.Add(sc.Anims[i].Frames);
-                convertAnimLabels[i] = $"{sc.Anims[i].Name} ({sc.Anims[i].Frames} frames)";
+                convertName.Add(scene.Anims[i].Name);
+                convertFrames.Add(scene.Anims[i].Frames);
+                convertAnimLabels[i] = $"{scene.Anims[i].Name} ({scene.Anims[i].Frames} frames)";
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Failed("Read failed: " + ex.Message);
+            Failed("Read failed: " + exception.Message);
             return;
         }
         if (convertName.Count > 1)
@@ -1354,7 +1360,7 @@ public class ModelImporterWindow
         convertOpen = true;
         convertShow = true;
         reportWarnings = convertWarnings;
-        ok = true;
+        statusSucceeded = true;
         status = $"{Path.GetFileName(path)}: check the options, then Import.";
     }
 
@@ -1370,42 +1376,42 @@ public class ModelImporterWindow
     {
         convertOpen = false;
         reportOk = false;
-        ok = false;
+        statusSucceeded = false;
         report = message;
         status = message;
         reportWarnings = convertWarnings;
     }
 
-    // Which animation each slot starts with. Each animation is placed by "slot_N" in its name,
-    // else its role words, else (a 3DS rip) its Motion letter, else the next free slot; a slot
-    // nothing landed on plays the idle animation (the importer would copy idle there too).
+    /* Which animation each slot starts with. Each animation is placed by "slot_N" in its name,
+       else its role words, else (a 3DS rip) its Motion letter, else the next free slot; a slot
+       nothing landed on plays the idle animation (the importer would copy idle there too). */
     void PrefillSlots()
     {
-        bool[] used = new bool[8];                    // MOT slots 0-7 (ParseSlotId)
+        bool[] used = new bool[8]; // MOT slots 0-7 (ParseSlotId)
         int[] slot = new int[convertName.Count];
         for (int i = 0; i < convertName.Count; i++)
         {
-            int s = RebuildPipeline.ParseSlotId(convertName[i]);
-            if (s < 0)
+            int slotId = RebuildPipeline.ParseSlotId(convertName[i]);
+            if (slotId < 0)
             {
-                s = RebuildPipeline.RoleSlotId(convertName[i]);
+                slotId = RebuildPipeline.RoleSlotId(convertName[i]);
             }
-            if (s < 0 && convertAnimsFrom.Count > 0)
+            if (slotId < 0 && convertAnimsFrom.Count > 0)
             {
-                s = MotionSlotId(convertName[i]);
+                slotId = MotionSlotId(convertName[i]);
             }
-            if (s < 0)
+            if (slotId < 0)
             {
-                slot[i] = -2;                 // nothing in the name: a free slot, below
+                slot[i] = -2; // nothing in the name: a free slot, below
                 continue;
             }
-            if (used[s])
+            if (used[slotId])
             {
-                slot[i] = -1;                 // that slot is taken already: leave it out
+                slot[i] = -1; // that slot is taken already: leave it out
                 continue;
             }
-            used[s] = true;
-            slot[i] = s;
+            used[slotId] = true;
+            slot[i] = slotId;
         }
         for (int i = 0; i < convertName.Count; i++)
         {
@@ -1428,10 +1434,10 @@ public class ModelImporterWindow
         Array.Fill(convertSlotAnim, -1);
         for (int i = 0; i < convertName.Count; i++)
         {
-            int k = SlotIndex(slot[i]);
-            if (k >= 0 && convertSlotAnim[k] < 0)
+            int slotRow = SlotIndex(slot[i]);
+            if (slotRow >= 0 && convertSlotAnim[slotRow] < 0)
             {
-                convertSlotAnim[k] = i;
+                convertSlotAnim[slotRow] = i;
             }
         }
         if (convertSlotAnim[0] < 0)
@@ -1460,23 +1466,23 @@ public class ModelImporterWindow
         return -1;
     }
 
-   
+
     static int MotionSlotId(string name)
     {
-        string n = name.ToLowerInvariant();
-        if (n.Contains("motionb"))
+        string lowerName = name.ToLowerInvariant();
+        if (lowerName.Contains("motionb"))
         {
             return 0;
         }
-        if (n.Contains("motiond"))
+        if (lowerName.Contains("motiond"))
         {
             return 2;
         }
-        if (n.Contains("motiona"))
+        if (lowerName.Contains("motiona"))
         {
             return 5;
         }
-        if (n.Contains("motionc"))
+        if (lowerName.Contains("motionc"))
         {
             return 6;
         }
@@ -1526,8 +1532,8 @@ public class ModelImporterWindow
             ViewImport(false);
         }
         ImGui.EndDisabled();
-        HoveredTooltip("Preview the model converted with these options, beside the model it would replace." +
-            "\nNothing is staged; press it again after changing an option.");
+        HoveredTooltip(@"Preview the model converted with these options, beside the model it would replace.
+Nothing is staged; press it again after changing an option.");
         ImGui.SameLine();
         if (ImGui.Button("Save .glb..."))
         {
@@ -1547,9 +1553,9 @@ public class ModelImporterWindow
     void DrawSlotTable()
     {
         float labelWidth = 0;
-        foreach (string s in SlotLabels)
+        foreach (string slotLabel in SlotLabels)
         {
-            labelWidth = Math.Max(labelWidth, ImGui.CalcTextSize(s).X);
+            labelWidth = Math.Max(labelWidth, ImGui.CalcTextSize(slotLabel).X);
         }
         if (ImGui.BeginTable("convert_slots", 2,
                 ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable | ImGuiTableFlags.BordersV | ImGuiTableFlags.BordersOuterH))
@@ -1574,9 +1580,9 @@ public class ModelImporterWindow
         }
     }
 
-    // The converter's options, the same ones tools/toglb.py takes. They hold between imports.
-    // Fields are dragged (or double-clicked to type); the View import preview follows a drag at
-    // once and is converted again when it is let go.
+    /* The converter's options, the same ones tools/toglb.py takes. They hold between imports.
+       Fields are dragged (or double-clicked to type); the View import preview follows a drag at
+       once and is converted again when it is let go. */
     void DrawAdvanced()
     {
         bool changed = false;
@@ -1601,11 +1607,10 @@ public class ModelImporterWindow
         changed |= ImGui.IsItemDeactivatedAfterEdit();
         if (!(optScale >= MinScale))
         {
-            optScale = MinScale;                       // 0 collapses the model (and NaN fails the !(>=) too)
+            optScale = MinScale; // 0 collapses the model (and NaN fails the !(>=) too)
         }
-        HoveredTooltip("Multiplies the source's size (in metres; 1 game unit = 1 metre). 1 keeps the model as exported." +
-            "\nThe size it comes out at is in the convert report. At least " + MinScale + "." +
-            "\nDrag to change it, double-click to type.");
+        HoveredTooltip(@"Multiplies the model's size in all directions
+Drag to change it, double-click to type.");
         if (optScale != 1f)
         {
             ImGui.SameLine();
@@ -1614,31 +1619,23 @@ public class ModelImporterWindow
                 optScale = 1f;
                 changed = true;
             }
-            HoveredTooltip("Back to 1.");
+            HoveredTooltip("Reset scale back to 1x.");
         }
         if (ScaleHiddenByShrink())
         {
             ImGui.SameLine();
-            ImGui.TextDisabled("(the board/map shrinks it to radius 40: Feet on grid shows Scale)");
-            HoveredTooltip("lSzModel_LoadCB: x clamp(40 / radius, 0.3, 1) on the board, half that on the map." +
-                "\nA bigger Scale grows the radius with it, so the game draws it the same size" +
-                "\nuntil the radius passes 133 (x0.3). Set Radius to keep the shrink fixed.");
+            ImGui.TextDisabled("(the board/map shrinks it to radius 40: Grid shows Scale)");
+            HoveredTooltip(@"A bigger Scale grows the radius with it, so the game draws it the same size
+until the radius passes 133 (x0.3). Set Radius to keep the shrink fixed.");
         }
 
         changed |= AxisRow("Rotate", "rotate", ref optRotateOn, ref optRotate, 0.5f, "Reset", nameAt, valuesAt,
-            "Extra turn in degrees, X applied first, for a model that does not stand upright facing forward " +
-            "(up is +Y, facing +Z), about node 1 (Pivot).\nY 180 turns it round. In the View import preview, drag a ring to turn about its axis.",
-            new string[] { "Turn about the side axis, in degrees.", "Turn about the up axis, in degrees.",
-                "Turn about the forward axis, in degrees." });
+            "Rotatation is in degree's (eular angles) and Y is up",
+            new string[] { });
 
         changed |= AxisRow("Position", "move", ref optMoveOn, ref optMove, 0.1f, "Reset", nameAt, valuesAt,
-            "Moves the whole model off node 0, in game units (after Scale and the turn)." +
-            "\nNode 0, where the game stands the unit, stays put, so this is where the body sits around it." +
-            "\nNode 1 (Pivot) stays put too." +
-            "\nIn the View import preview, drag an arrow to move it along that axis, or the centre ball across the view.",
-            new string[] { "Right (+) or left (-), in game units.",
-                "Up (+) or down (-), in game units. The battle floor is 50 below node 0.",
-                "Forward (+) or back (-), in game units." });
+            "",
+            new string[] { "" });
 
         // the board and map stand node 1 over a fixed point, so the Pivot is edited in Feet on grid only
         ImGui.BeginDisabled(!PivotEditable());
@@ -1651,26 +1648,21 @@ public class ModelImporterWindow
             pivotStart = cardPivotRest;
         }
         changed |= AxisRow("Pivot", "pivot", ref optPivotOn, ref optPivotAt, 0.1f, pivotReset, nameAt, valuesAt,
-            "Where node 1 sits: the point the game scales and turns the model about and the battle camera" +
-            "\naims at, in game units from node 0 (the model's own origin). Scale and Rotate turn the body about it;" +
-            "\nwith neither set the body stays where it is. Position does not change it. Off: node 1 on node 0, as the model is imported (a card on the ISO: its own node 1)." +
-            "\nIn the View import preview, drag an arrow to move it along that axis, or the centre square across the view." +
-            "\nEdited in View: Feet on grid only; the duel board and map stand node 1 over the tile or arena point.",
-            new string[] { "Right (+) or left (-), in game units.", "Up (+) or down (-), in game units.",
-                "Forward (+) or back (-), in game units." }, pivotStart);
+            "Where node 1 sits: the point the game scales and turns the model about and where the camera focus on",
+            new string[] { }, pivotStart);
         ImGui.EndDisabled();
         ImGui.EndDisabled();
 
         ImGui.SeparatorText("Source fixes");
-        ImGui.BeginDisabled(convertIsCard);            // a card has no source to fix
+        ImGui.BeginDisabled(convertIsCard); // a card has no source to fix
         changed |= ImGui.Checkbox("Bind at first frame", ref optRestFromAnim);
-        HoveredTooltip("Bind the skin at the first animation's first frame instead of the file's bind pose." +
-            "\nOnly for rips whose bind pose lies flat or is never shown;" +
-            "\nvertices pulled by several bones then move slightly differently.");
+        HoveredTooltip(@"Bind the skin at the first animation's first frame instead of the file's bind pose.
+Only for rips whose bind pose lies flat or is never shown;
+vertices pulled by several bones then move slightly differently.");
 
         changed |= ImGui.Checkbox("Flip UV", ref optFlipUv);
-        HoveredTooltip("Turn this on if the textures land upside down: the source's UVs are already top-left." +
-            "\nDone by itself for FBX files exported by Unity Studio.");
+        HoveredTooltip(@"Turn this on if the textures land upside down: the source's UVs are already top-left.
+Done by itself for FBX files exported by Unity Studio.");
         ImGui.EndDisabled();
         if (changed)
         {
@@ -1683,32 +1675,32 @@ public class ModelImporterWindow
         }
     }
 
-    // One Advanced row: the toggle, `name`, then X/Y/Z fields dragged by `speed` (greyed while
-    // off), and a `resetLabel` button that puts them back at `resetTo` (where the row started).
-    // True when a change is done (a drag let go, a value typed, the toggle or the button).
-    bool AxisRow(string name, string id, ref bool on, ref Vector3 value, float speed, string resetLabel,
-        float nameAt, float valuesAt, string tip, string[] axisTips, Vector3 resetTo = default)
+    /* One Advanced row: the toggle, `name`, then X/Y/Z fields dragged by `speed` (greyed while
+       off), and a `resetLabel` button that puts them back at `resetTo` (where the row started).
+       True when a change is done (a drag let go, a value typed, the toggle or the button). */
+    bool AxisRow(string name, string imguiId, ref bool enabled, ref Vector3 value, float speed, string resetLabel,
+        float nameAt, float valuesAt, string tooltip, string[] axisTips, Vector3 resetTo = default)
     {
-        bool changed = ImGui.Checkbox("##on" + id, ref on);
-        HoveredTooltip("On: " + name + " is applied, and its gizmo shows in the View import preview." +
-            "\nOff: it is not applied (the values are kept).");
+        bool changed = ImGui.Checkbox("##on" + imguiId, ref enabled);
+        HoveredTooltip($@"On: {name} is applied, and its gizmo shows in the View import preview.
+Off: it is not applied and hides gizmos.");
         ImGui.SameLine(nameAt);
-        changed |= AxisFields(name, id, on, ref value, speed, resetLabel, valuesAt, tip, axisTips, resetTo);
+        changed |= AxisFields(name, imguiId, enabled, ref value, speed, resetLabel, valuesAt, tooltip, axisTips, resetTo);
         return changed;
     }
 
-    // `name`, then X/Y/Z fields dragged by `speed` (greyed unless `on`), and a `resetLabel`
-    // button that puts them back at `resetTo`. True when a change is done (a drag let go, a
-    // value typed, the button).
-    bool AxisFields(string name, string id, bool on, ref Vector3 value, float speed, string resetLabel,
-        float valuesAt, string tip, string[] axisTips, Vector3 resetTo)
+    /* `name`, then X/Y/Z fields dragged by `speed` (greyed unless `enabled`), and a `resetLabel`
+       button that puts them back at `resetTo`. True when a change is done (a drag let go, a
+       value typed, the button). */
+    bool AxisFields(string name, string imguiId, bool enabled, ref Vector3 value, float speed, string resetLabel,
+        float valuesAt, string tooltip, string[] axisTips, Vector3 resetTo)
     {
         bool changed = false;
         ImGui.AlignTextToFramePadding();
         ImGui.Text(name);
-        HoveredTooltip(tip);
+        HoveredTooltip(tooltip);
         ImGui.SameLine(valuesAt);
-        ImGui.BeginDisabled(!on);
+        ImGui.BeginDisabled(!enabled);
         string[] axes = { "X", "Y", "Z" };
         for (int k = 0; k < 3; k++)
         {
@@ -1718,11 +1710,11 @@ public class ModelImporterWindow
             }
             ImGui.Text(axes[k]);
             ImGui.SameLine();
-            float v = Axis(value, k);
+            float axisValue = Axis(value, k);
             ImGui.SetNextItemWidth(FieldWidth(0.15f, 4f));
-            if (ImGui.DragFloat("##" + id + axes[k], ref v, speed, 0f, 0f, "%.3f"))
+            if (ImGui.DragFloat("##" + imguiId + axes[k], ref axisValue, speed, 0f, 0f, "%.3f"))
             {
-                value = WithAxis(value, k, v);
+                value = WithAxis(value, k, axisValue);
             }
             changed |= ImGui.IsItemDeactivatedAfterEdit();
             HoveredTooltip(axisTips[k] + "\nDrag to change it, double-click to type.");
@@ -1730,7 +1722,7 @@ public class ModelImporterWindow
         if (value != resetTo)
         {
             ImGui.SameLine();
-            if (ImGui.SmallButton(resetLabel + "##" + id))
+            if (ImGui.SmallButton(resetLabel + "##" + imguiId))
             {
                 value = resetTo;
                 changed = true;
@@ -1741,34 +1733,34 @@ public class ModelImporterWindow
         return changed;
     }
 
-    static float Axis(Vector3 v, int k)
+    static float Axis(Vector3 vector, int axisIndex)
     {
-        if (k == 0)
+        if (axisIndex == 0)
         {
-            return v.X;
+            return vector.X;
         }
-        if (k == 1)
+        if (axisIndex == 1)
         {
-            return v.Y;
+            return vector.Y;
         }
-        return v.Z;
+        return vector.Z;
     }
 
-    static Vector3 WithAxis(Vector3 v, int k, float value)
+    static Vector3 WithAxis(Vector3 vector, int axisIndex, float value)
     {
-        if (k == 0)
+        if (axisIndex == 0)
         {
-            v.X = value;
+            vector.X = value;
         }
-        else if (k == 1)
+        else if (axisIndex == 1)
         {
-            v.Y = value;
+            vector.Y = value;
         }
         else
         {
-            v.Z = value;
+            vector.Z = value;
         }
-        return v;
+        return vector;
     }
 
     // Move as the converter gets it: zero while its toggle is off.
@@ -1821,13 +1813,13 @@ public class ModelImporterWindow
                 optRadius = 0f;
             }
         }
-        HoveredTooltip("The model's bounding radius the import writes (node 0). Measured from the model until changed" +
-            "\n(a card on the ISO: its own radius)." +
-            "\nOn the duel board the game shrinks a monster to fit radius 40: x clamp(40 / radius, 0.3, 1);" +
-            "\nthe map draws it at half that. Battle ignores it (real size)." +
-            "\nA radius much smaller than the model may let the game cull it before it leaves the screen." +
-            "\nView import shows the result in View: Duel board / Map leader." +
-            "\nDrag to change it, double-click to type.");
+        HoveredTooltip(@"The model's bounding radius the import writes (node 0). Measured from the model until changed
+(a card on the ISO: its own radius).
+On the duel board the game shrinks a monster to fit radius 40:
+the map draws it at half that. Battles use real size.
+A radius much smaller than the model may let the game cull it before it leaves the screen.
+View import shows the result in View: Duel board / Map leader.
+Drag to change it, double-click to type.");
         // one starting point: an import's radius starts measured, a card's at its own
         if (convertIsCard && optRadius != cardRadiusOwn)
         {
@@ -1859,33 +1851,33 @@ public class ModelImporterWindow
 
     ConvertOptions Options()
     {
-        ConvertOptions o = new ConvertOptions();
-        o.Scale = optScale;
+        ConvertOptions convertOptions = new ConvertOptions();
+        convertOptions.Scale = optScale;
         if (optRotateOn)
         {
-            o.RotateX = optRotate.X;
-            o.RotateY = optRotate.Y;
-            o.RotateZ = optRotate.Z;
+            convertOptions.RotateX = optRotate.X;
+            convertOptions.RotateY = optRotate.Y;
+            convertOptions.RotateZ = optRotate.Z;
         }
         Vector3 move = MoveApplied();
-        o.TranslateX = move.X;
-        o.TranslateY = move.Y;
-        o.TranslateZ = move.Z;
+        convertOptions.TranslateX = move.X;
+        convertOptions.TranslateY = move.Y;
+        convertOptions.TranslateZ = move.Z;
         Vector3 pivot = LivePivot();
-        o.PivotPoint = new double[] { pivot.X, pivot.Y, pivot.Z };
-        o.RestFromAnim = optRestFromAnim;
-        o.FlipUv = optFlipUv;
-        foreach (string f in convertAnimsFrom)
+        convertOptions.PivotPoint = new double[] { pivot.X, pivot.Y, pivot.Z };
+        convertOptions.RestFromAnim = optRestFromAnim;
+        convertOptions.FlipUv = optFlipUv;
+        foreach (string motionFile in convertAnimsFrom)
         {
-            o.AnimsFrom.Add(f);
+            convertOptions.AnimsFrom.Add(motionFile);
         }
-        o.Anims = AnimsOption();
-        return o;
+        convertOptions.Animations = AnimsOption();
+        return convertOptions;
     }
 
-    // "name=slot_N_role,..." for every slot, in the order the slots are filled; an animation in
-    // two slots is named twice and the converter copies it. Null with one animation or
-    // none (no slot rows): one animation goes to idle on its own.
+    /* "name=slot_N_role,..." for every slot, in the order the slots are filled; an animation in
+       two slots is named twice and the converter copies it. Null with one animation or
+       none (no slot rows): one animation goes to idle on its own. */
     string? AnimsOption()
     {
         List<string> parts = new List<string>();
@@ -1908,23 +1900,23 @@ public class ModelImporterWindow
             StageCardEdit();
             return;
         }
-        ConvertResult res;
+        ConvertResult convertResult;
         convertWarnings = new List<string>();
         try
         {
-            res = ModelConverter.ConvertFile(convertPath, Options(), Warn);
+            convertResult = ModelConverter.ConvertFile(convertPath, Options(), Warn);
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Failed("Convert failed: " + ex.Message);
+            Failed("Convert failed: " + exception.Message);
             return;
         }
         convertOpen = false;
-        StageConverted(convertIndex, res.Glb, convertPath);
-        reportConvert = res.Report;
-        foreach (string w in convertWarnings)
+        StageConverted(convertIndex, convertResult.Glb, convertPath);
+        reportConvert = convertResult.Report;
+        foreach (string warning in convertWarnings)
         {
-            reportWarnings.Add(w);
+            reportWarnings.Add(warning);
         }
     }
 
@@ -1937,58 +1929,80 @@ public class ModelImporterWindow
         {
             glb = CardEditGlb();
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Failed("Edit failed: " + ex.Message);
+            Failed("Edit failed: " + exception.Message);
             return;
         }
         convertOpen = false;
         StageConverted(index, glb, cardNames[index] + " (edited)");
         if (reportOk)
         {
-            cardEdits[index] = CurrentOpts();
+            cardEdits[index] = CurrentImportOptions();
         }
+    }
+
+    // The card as on the ISO with its geometry removed (GlbImporter.RemoveModel), staged in place of
+    // anything staged for it. The ISO's radius is kept so the board and map treat it as before.
+    void RemoveModel(int index)
+    {
+        reportIndex = index;
+        reportWarnings = new List<string>();
+        try
+        {
+            byte[] block = BlockBytes(index);
+            ImportedModel model = GlbImporter.LoadFromBytes(ModelExtractor.ExtractGlb(block));
+            GlbImporter.RemoveModel(model);
+            StageMonster(index, model, cardNames[index] + " (removed)", BlockRadius(block));
+        }
+        catch (Exception exception)
+        {
+            reportOk = false;
+            report = "Remove failed: " + exception.Message;
+        }
+        statusSucceeded = reportOk;
+        status = report;
     }
 
     // The same conversion (or card edit), written out instead of staged, to check it in another tool.
     void SaveConverted()
     {
-        ConvertResult res = new ConvertResult();
+        ConvertResult convertResult = new ConvertResult();
         convertWarnings = new List<string>();
         string defaultPath = Path.ChangeExtension(convertPath, ".glb");
         try
         {
             if (convertIsCard)
             {
-                res.Glb = CardEditGlb();
+                convertResult.Glb = CardEditGlb();
                 defaultPath = DefaultGlbPath(convertIndex);
             }
             else
             {
-                res = ModelConverter.ConvertFile(convertPath, Options(), Warn);
+                convertResult = ModelConverter.ConvertFile(convertPath, Options(), Warn);
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            Failed("Convert failed: " + ex.Message);
+            Failed("Convert failed: " + exception.Message);
             return;
         }
-        var r = Dialog.FileSave("glb", defaultPath);
-        if (!r.IsOk)
+        var dialogResult = Dialog.FileSave("glb", defaultPath);
+        if (!dialogResult.IsOk)
         {
             return;
         }
-        string outPath = r.Path;
+        string outPath = dialogResult.Path;
         if (!outPath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase))
         {
             outPath += ".glb";
         }
-        File.WriteAllBytes(outPath, res.Glb);
-        reportConvert = res.Report;
+        File.WriteAllBytes(outPath, convertResult.Glb);
+        reportConvert = convertResult.Report;
         reportWarnings = convertWarnings;
         reportIndex = convertIndex;
         reportOk = true;
-        ok = true;
+        statusSucceeded = true;
         report = "Wrote " + outPath + ".";
         status = report;
     }
@@ -2001,38 +2015,37 @@ public class ModelImporterWindow
         {
             if (source == SourceMonster)
             {
-                StageMonster(index, glb, label);
+                StageMonster(index, GlbImporter.LoadFromBytes(glb), label, optRadius);
             }
             else
             {
-                ModelMrg.StageResult s = imp.Stage(index, glb, label, allowReduction);
-                reportOk = s.Staged;
-                if (s.Staged)
+                ModelMrg.StageResult stageResult = modelMrg.Stage(index, glb, label, allowReduction);
+                reportOk = stageResult.Staged;
+                if (stageResult.Staged)
                 {
-                    report = s.Summary + " - staged.";
+                    report = stageResult.Summary + " - staged.";
                 }
                 else
                 {
-                    report = s.Summary + " - not staged.";
+                    report = stageResult.Summary + " - not staged.";
                 }
-                reportWarnings = s.Warnings;
+                reportWarnings = stageResult.Warnings;
             }
-            ok = reportOk;
+            statusSucceeded = reportOk;
             status = report;
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
             reportOk = false;
-            ok = false;
-            report = "Import failed: " + ex.Message;
+            statusSucceeded = false;
+            report = "Import failed: " + exception.Message;
             status = report;
         }
     }
 
-    void StageMonster(int index, byte[] glb, string label)
+    void StageMonster(int index, ImportedModel model, string label, float boundsRadius)
     {
         byte[] donor = LoadTemplate(index);
-        ImportedModel model = GlbImporter.LoadFromBytes(glb);
         List<Rh0Assembler.TextureInput> textures = GlbImporter.DecodeGlbTextures(model);
 
         // What the rebuild asked to reduce, for the fit report when it does not fit.
@@ -2045,7 +2058,7 @@ public class ModelImporterWindow
         Rebuilder.ImportResult import;
         try
         {
-            import = Rebuilder.Import(model, donor, BlockSize, false,
+            import = Rebuilder.Import(model, donor, GameTables.MonsterSlotSize, false,
                 (category, categoryBytes, totalBytes, budget) =>
                 {
                     asked = true;
@@ -2055,14 +2068,14 @@ public class ModelImporterWindow
                     askedBudget = budget;
                     return allowReduction;
                 },
-                textures, optRadius);
+                textures, boundsRadius);
         }
         catch (Exception) when (asked)
         {
-            double pct = 0;
+            double percentOfBudget = 0;
             if (askedBudget > 0)
             {
-                pct = 100.0 * askedBytes / askedBudget;
+                percentOfBudget = 100.0 * askedBytes / askedBudget;
             }
             string what = "the texture(s) is";
             if (askedCategory == Rh0Assembler.OverflowCategory.Animation)
@@ -2071,7 +2084,7 @@ public class ModelImporterWindow
             }
             reportOk = false;
             report = $"card {index:000} is {askedTotal:N0} B, over the {askedBudget:N0} B slot: " +
-                     $"{what} {pct:0.#}% of it ({askedBytes:N0} B) - not staged.";
+                     $"{what} {percentOfBudget:0.#}% of it ({askedBytes:N0} B) - not staged.";
             return;
         }
 
@@ -2079,19 +2092,19 @@ public class ModelImporterWindow
         reportWarnings.AddRange(import.Warnings);
         monsterStaged[index] = bytes;
         monsterStagedFrom[index] = label;
-        cardEdits.Remove(index);                       // StageCardEdit records an edit again
+        cardEdits.Remove(index); // StageCardEdit records an edit again
         reportOk = true;
         float radius = BlockRadius(bytes);
         float shrink = ViewScene.BoardShrink(radius);
-        report = $"card {index:000}: {bytes.Length:N0} of {BlockSize:N0} B - staged. " +
+        report = $"card {index:000}: {bytes.Length:N0} of {GameTables.MonsterSlotSize:N0} B - staged. " +
                  $"Radius {radius:0.#}: board x{shrink:0.##}, map x{ViewScene.MapScale * shrink:0.##}.";
         // battle slots the glb lacked, filled with a copy of another motion (MotWriter)
         if (import.CopiedMotions.Count > 0)
         {
             var copied = new List<string>();
-            foreach (var c in import.CopiedMotions)
+            foreach (var copiedMotion in import.CopiedMotions)
             {
-                copied.Add($"slot {c.Slot} from slot {c.From}");
+                copied.Add($"slot {copiedMotion.Slot} from slot {copiedMotion.From}");
             }
             reportWarnings.Add("Missing motions copied: " + string.Join(", ", copied) +
                                " (4 death, 5 win, 6 damage; a copied idle never shows a fall).");
@@ -2112,7 +2125,7 @@ public class ModelImporterWindow
         var changes = new ChangeSet();
         foreach (int index in monsterStaged.Keys.OrderBy(k => k))
         {
-            changes.Add(monsterPath, (long)index * BlockSize, monsterStaged[index], $"model block {index}");
+            changes.Add(monsterPath, (long)index * GameTables.MonsterSlotSize, monsterStaged[index], $"model block {index}");
         }
         AddMapHeights(changes);
         return changes;
@@ -2123,12 +2136,12 @@ public class ModelImporterWindow
     {
         foreach (int card in mapHeightEdits.OrderBy(k => k))
         {
-            byte[] value = { (byte)(sbyte)imp.Tables.MapLeaderY(card) };
-            changes.Add(imp.Tables.BootElfIsoPath, imp.Tables.MapLeaderYOffset(card), value, $"map height card {card}");
+            byte[] value = { (byte)(sbyte)modelMrg.Tables.MapLeaderY(card) };
+            changes.Add(modelMrg.Tables.BootElfIsoPath, modelMrg.Tables.MapLeaderYOffset(card), value, $"map height card {card}");
         }
     }
 
-    void DrawStagedAndSave(FileLoader fl)
+    void DrawStagedAndSave(FileLoader fileLoader)
     {
         ImGui.Text($"Staged: {StagedCount()}");
         if (source == SourceMonster)
@@ -2137,23 +2150,23 @@ public class ModelImporterWindow
             {
                 if (cardEdits.ContainsKey(index))
                 {
-                    ImGui.BulletText($"card {index:000} {cardNames[index]} (edited)  {monsterStaged[index].Length:N0} of {BlockSize:N0} B");
+                    ImGui.BulletText($"card {index:000} {cardNames[index]} (edited)  {monsterStaged[index].Length:N0} of {GameTables.MonsterSlotSize:N0} B");
                     continue;
                 }
-                ImGui.BulletText($"card {index:000} {cardNames[index]}  {monsterStaged[index].Length:N0} of {BlockSize:N0} B  " +
+                ImGui.BulletText($"card {index:000} {cardNames[index]}  {monsterStaged[index].Length:N0} of {GameTables.MonsterSlotSize:N0} B  " +
                                  Path.GetFileName(monsterStagedFrom[index]));
             }
         }
         else
         {
-            foreach (ModelMrg.StagedBlock s in imp.Staged)
+            foreach (ModelMrg.StagedBlock stagedBlock in modelMrg.Staged)
             {
-                ImGui.BulletText($"{s.Block.Name}  {s.Bytes.Length:N0} of {s.Block.Slot:N0} B  {Path.GetFileName(s.SourcePath)}");
+                ImGui.BulletText($"{stagedBlock.Block.Name}  {stagedBlock.Bytes.Length:N0} of {stagedBlock.Block.Slot:N0} B  {Path.GetFileName(stagedBlock.SourcePath)}");
             }
         }
         foreach (int card in mapHeightEdits)
         {
-            ImGui.BulletText($"card {card:000} {cardNames[card]}  map height {imp.Tables.MapLeaderY(card)}");
+            ImGui.BulletText($"card {card:000} {cardNames[card]}  map height {modelMrg.Tables.MapLeaderY(card)}");
         }
 
         if (StagedCount() > 0)
@@ -2168,7 +2181,7 @@ public class ModelImporterWindow
                 }
                 else
                 {
-                    imp.ClearStaged();
+                    modelMrg.ClearStaged();
                 }
                 plan = null;
                 planReport = null;
@@ -2180,15 +2193,15 @@ public class ModelImporterWindow
         {
             if (source == SourceMonster)
             {
-                plan = MonsterChanges().Validate(fl);
+                plan = MonsterChanges().Validate(fileLoader);
                 planReport = null;
             }
             else
             {
-                plan = imp.Validate(out planReport);
+                plan = modelMrg.Validate(out planReport);
             }
             planIsSaved = false;
-            ok = plan.Ok;
+            statusSucceeded = plan.Ok;
             status = $"Plan: {plan.Writes.Count} writes ({plan.BytesToWrite:N0} B), {plan.NoOps.Count} no-ops, {plan.Errors.Count} errors.";
         }
         ImGui.SameLine();
@@ -2214,12 +2227,12 @@ public class ModelImporterWindow
             }
             if (mapHeightEdits.Count > 0)
             {
-                ImGui.Text($"Write {mapHeightEdits.Count} map height(s) into {imp.Tables.Addresses.BootElf}?");
+                ImGui.Text($"Write {mapHeightEdits.Count} map height(s) into {modelMrg.Tables.Addresses.BootElf}?");
             }
             if (ImGui.Button("Yes"))
             {
                 ImGui.CloseCurrentPopup();
-                Save(fl);
+                Save(fileLoader);
             }
             ImGui.SameLine();
             if (ImGui.Button("Cancel"))
@@ -2252,13 +2265,13 @@ public class ModelImporterWindow
         }
     }
 
-    void Save(FileLoader fl)
+    void Save(FileLoader fileLoader)
     {
         try
         {
             if (source == SourceMonster)
             {
-                plan = MonsterChanges().Write(fl);
+                plan = MonsterChanges().Write(fileLoader);
                 planReport = null;
                 if (plan.Ok)
                 {
@@ -2266,7 +2279,7 @@ public class ModelImporterWindow
                     // an edit's values no longer describe it (the next edit starts from it).
                     foreach (int index in monsterStaged.Keys)
                     {
-                        Array.Copy(monsterStaged[index], 0, monsterMrg, (long)index * BlockSize, BlockSize);
+                        Array.Copy(monsterStaged[index], 0, monsterMrg, (long)index * GameTables.MonsterSlotSize, GameTables.MonsterSlotSize);
                     }
                     cardEdits.Clear();
                     cardGlb = null;
@@ -2281,18 +2294,18 @@ public class ModelImporterWindow
                 // The heights first: a MODEL.MRG save re-reads the tables from the disc.
                 var heights = new ChangeSet();
                 AddMapHeights(heights);
-                plan = heights.Write(fl);
+                plan = heights.Write(fileLoader);
                 planReport = null;
                 if (plan.Ok)
                 {
-                    plan = imp.Save(out planReport);
+                    plan = modelMrg.Save(out planReport);
                 }
             }
             planIsSaved = plan.Ok;
-            ok = plan.Ok;
+            statusSucceeded = plan.Ok;
             if (plan.Ok)
             {
-                mapHeightEdits.Clear();                // on the disc now
+                mapHeightEdits.Clear(); // on the disc now
 
                 status = $"Saved: {plan.Writes.Count} writes ({plan.BytesToWrite:N0} B), {plan.NoOps.Count} unchanged.";
                 if (!keepStagedAfterSave)
@@ -2305,7 +2318,7 @@ public class ModelImporterWindow
                     }
                     else
                     {
-                        imp.ClearStaged();
+                        modelMrg.ClearStaged();
                     }
                 }
             }
@@ -2314,10 +2327,10 @@ public class ModelImporterWindow
                 status = $"Nothing written: {plan.Errors.Count} error(s).";
             }
         }
-        catch (Exception ex)
+        catch (Exception exception)
         {
-            ok = false;
-            status = "Save failed: " + ex.Message;
+            statusSucceeded = false;
+            status = "Save failed: " + exception.Message;
         }
     }
 
@@ -2382,7 +2395,7 @@ public class ModelImporterWindow
             {
                 animPlaying = !animPlaying;
             }
-            
+
             ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.5f);
             if (ImGui.Combo("Animation", ref currentAnim, previewModel.AnimationNames, previewModel.AnimationNames.Length))
             {
@@ -2395,38 +2408,38 @@ public class ModelImporterWindow
         // NoMove: a drag on the canvas orbits the model; only the title bar moves the window
         ImGui.BeginChild("preview_vp", Vector2.Zero, ImGuiChildFlags.None, ImGuiWindowFlags.NoMove);
         Vector2 imageMin = ImGui.GetCursorScreenPos();
-        Vector2 avail = ImGui.GetContentRegionAvail();
-        int width = Math.Max((int)avail.X, 1);
-        int height = Math.Max((int)avail.Y, 1);
+        Vector2 available = ImGui.GetContentRegionAvail();
+        int width = Math.Max((int)available.X, 1);
+        int height = Math.Max((int)available.Y, 1);
 
-        if (!previewTexReady || width != previewW || height != previewH)
+        if (!previewTextureReady || width != previewTextureWidth || height != previewTextureHeight)
         {
-            if (previewTexReady)
+            if (previewTextureReady)
             {
-                Raylib.UnloadRenderTexture(previewTex);
+                Raylib.UnloadRenderTexture(previewTexture);
             }
-            previewTex = Raylib.LoadRenderTexture(width, height);
-            previewW = width;
-            previewH = height;
-            previewTexReady = true;
+            previewTexture = Raylib.LoadRenderTexture(width, height);
+            previewTextureWidth = width;
+            previewTextureHeight = height;
+            previewTextureReady = true;
         }
 
         bool hovered = ImGui.IsWindowHovered();
         bool gizmoBusy = UpdateGizmos(ImGui.GetMousePos() - imageMin, hovered);
         if (hovered && !gizmoBusy)
         {
-            orbit.UpdateMouse();
+            orbitCamera.UpdateMouse();
         }
         AdvanceAnimation();
         AdvanceCompare();
         if (aimAtPivot)
         {
-            orbit.Target = PivotWorld();
+            orbitCamera.Target = PivotWorld();
         }
-        orbit.Apply();
+        orbitCamera.Apply();
         RenderScene();
 
-        rlImGui.ImageRenderTexture(previewTex);
+        rlImGui.ImageRenderTexture(previewTexture);
         ImGui.EndChild();
     }
 
@@ -2434,9 +2447,9 @@ public class ModelImporterWindow
     void DrawCompareControls()
     {
         ImGui.Checkbox("Aim at pivot", ref aimAtPivot);
-        HoveredTooltip("The camera looks at node 1 (the Pivot) as it moves with the animation, as the game's duel board" +
-            "\nfocus camera and the camera that follows a monster after a hit do. Drag to turn, wheel to zoom." +
-            "\nThe battle attack and win cameras are the card's own camera paths, set from node 0 instead.");
+        HoveredTooltip(@"The camera looks at node 1 (the Pivot) as it moves with the animation, as the game's duel board
+focus camera and the camera that follows a monster after a hit do. Drag to turn, wheel to zoom.
+The battle attack and win cameras are the card's own camera paths, set from node 0 instead.");
         ImGui.SameLine();
         if (previewCanCompare)
         {
@@ -2446,8 +2459,8 @@ public class ModelImporterWindow
                 PlaceCompare();
                 FrameStanding();
             }
-            HoveredTooltip("Stand a second model beside this one to compare sizes." +
-                "\nIt is this card's model as it is on the ISO: the model the import replaces.");
+            HoveredTooltip(@"Stand a second model beside this one to compare sizes.
+It is this card's model as it is on the ISO: the model the import replaces.");
             if (compareOn)
             {
                 ImGui.SameLine();
@@ -2459,23 +2472,24 @@ public class ModelImporterWindow
             }
             if (previewIsMonster)
             {
-                ImGui.SameLine();                      // the View combo follows (monsters only)
+                ImGui.SameLine(); // the View combo follows (monsters only)
             }
         }
         int card = previewIndex;
-        string tip = "";
+        string extraTooltip = "";
         if (previewIsImport)
         {
-            tip = "\nPivot and Position show here; an import keeps the replaced card's map height." +
-                "\nThe radius of an import can be set in the Convert window's Advanced options.";
+            extraTooltip = @"
+Pivot and Position show here; an import keeps the replaced card's map height.
+The radius of an import can be set in the Convert window's Advanced options.";
         }
-        int heightBefore = imp.Tables.MapLeaderY(card);
-        if (viewScene.DrawControls(previewIsMonster, ref card, false, tip))
+        int heightBefore = modelMrg.Tables.MapLeaderY(card);
+        if (viewScene.DrawControls(previewIsMonster, ref card, false, extraTooltip))
         {
             PlaceCompare();
             FrameStanding();
         }
-        if (imp.Tables.MapLeaderY(card) != heightBefore)
+        if (modelMrg.Tables.MapLeaderY(card) != heightBefore)
         {
             mapHeightEdits.Add(card);
         }
@@ -2508,11 +2522,11 @@ public class ModelImporterWindow
 
         if (animPlaying)
         {
-            float dur = previewModel.Duration(currentAnim);
-            if (dur > 0f)
+            float duration = previewModel.Duration(currentAnim);
+            if (duration > 0f)
             {
                 animTime += Raylib.GetFrameTime();
-                animTime %= dur;
+                animTime %= duration;
             }
         }
 
@@ -2529,11 +2543,11 @@ public class ModelImporterWindow
         compareModel.AdvanceTextureAnim(Raylib.GetFrameTime());
         if (animPlaying)
         {
-            float dur = compareModel.Duration(compareAnim);
-            if (dur > 0f)
+            float duration = compareModel.Duration(compareAnim);
+            if (duration > 0f)
             {
                 compareTime += Raylib.GetFrameTime();
-                compareTime %= dur;
+                compareTime %= duration;
             }
         }
         compareModel.SetAnimationFrame(compareAnim, compareTime);
@@ -2544,7 +2558,7 @@ public class ModelImporterWindow
         bool compare = CompareShown();
         if (previewCanCompare)
         {
-            PlaceCompare();                            // the Radius option may have changed the shrink
+            PlaceCompare(); // the Radius option may have changed the shrink
         }
         float drawn = viewScene.ModelScale(PreviewRadius()) * PreviewRadius();
         if (compare)
@@ -2552,10 +2566,10 @@ public class ModelImporterWindow
             drawn = MathF.Max(drawn, viewScene.ModelScale(compareRadius) * compareRadius) + MathF.Abs(compareOffsetX);
         }
 
-        Raylib.BeginTextureMode(previewTex);
+        Raylib.BeginTextureMode(previewTexture);
         Raylib.ClearBackground(Color.DarkGray);
-        viewScene.SetClipPlanes(orbit.Camera, drawn);
-        Raylib.BeginMode3D(orbit.Camera);
+        viewScene.SetClipPlanes(orbitCamera.Camera, drawn);
+        Raylib.BeginMode3D(orbitCamera.Camera);
         bool scenery = viewScene.SceneryShown;
         if (!scenery)
         {
@@ -2635,29 +2649,29 @@ public class ModelImporterWindow
         return Vector3.Zero;
     }
 
-    // Live preview. The shown glb was converted (or a card edited) with previewScale/Rotate/Move;
-    // the options as they stand map its point g to k * T * (g - c0 - previewMove) + LiveShift()
-    // (both scale and turn about TurnCentre, then move), k the Scale ratio, T the turn from the old
-    // Rotate to the new. Not exact where the converter does more (a new rest pose), so the
-    // model is converted again once a change is done.
+    /* Live preview. The shown glb was converted (or a card edited) with previewScale/Rotate/Move;
+       the options as they stand map its point g to k * T * (g - c0 - previewMove) + LiveShift()
+       (both scale and turn about TurnCentre, then move), k the Scale ratio, T the turn from the old
+       Rotate to the new. Not exact where the converter does more (a new rest pose), so the
+       model is converted again once a change is done. */
     float LiveScale()
     {
         return optScale / previewScale;
     }
 
-    Mat4 LiveTurn()
+    Matrix4 LiveTurn()
     {
-        Vector3 now = RotateApplied();
-        Mat4 turn = Mat4.Euler(now.X, now.Y, now.Z);
-        return turn * Mat4.Euler(previewRotate.X, previewRotate.Y, previewRotate.Z).Inverse();
+        Vector3 rotateNow = RotateApplied();
+        Matrix4 turn = Matrix4.EulerAngles(rotateNow.X, rotateNow.Y, rotateNow.Z);
+        return turn * Matrix4.EulerAngles(previewRotate.X, previewRotate.Y, previewRotate.Z).Inverse();
     }
 
-    static Vector3 Turn(Mat4 m, Vector3 v)
+    static Vector3 Turn(Matrix4 matrix, Vector3 vector)
     {
         return new Vector3(
-            (float)(m[0, 0] * v.X + m[0, 1] * v.Y + m[0, 2] * v.Z),
-            (float)(m[1, 0] * v.X + m[1, 1] * v.Y + m[1, 2] * v.Z),
-            (float)(m[2, 0] * v.X + m[2, 1] * v.Y + m[2, 2] * v.Z));
+            (float)(matrix[0, 0] * vector.X + matrix[0, 1] * vector.Y + matrix[0, 2] * vector.Z),
+            (float)(matrix[1, 0] * vector.X + matrix[1, 1] * vector.Y + matrix[1, 2] * vector.Z),
+            (float)(matrix[2, 0] * vector.X + matrix[2, 1] * vector.Y + matrix[2, 2] * vector.Z));
     }
 
     // Node 0 in the shown glb: the origin for a converted one, where the extractor's MrgRoot
@@ -2678,9 +2692,9 @@ public class ModelImporterWindow
     // c + Move + S R (c0 - c), c the centre as the options stand.
     Vector3 LiveShift()
     {
-        Vector3 c = TurnCentre();
-        Vector3 now = RotateApplied();
-        return c + MoveApplied() + optScale * Turn(Mat4.Euler(now.X, now.Y, now.Z), previewModel.RestPivot - c);
+        Vector3 centre = TurnCentre();
+        Vector3 rotateNow = RotateApplied();
+        return centre + MoveApplied() + optScale * Turn(Matrix4.EulerAngles(rotateNow.X, rotateNow.Y, rotateNow.Z), previewModel.RestPivot - centre);
     }
 
     // Node 1 from node 0 with the options as they stand: on the Pivot while its toggle is on, else
@@ -2715,15 +2729,15 @@ public class ModelImporterWindow
     // whose lowest idle point is `lowest`.
     Vector3 StandAt(Vector3 pivot, float lowest)
     {
-        float s = viewScene.ModelScale(PreviewRadius());
-        Vector3 shift = viewScene.StandShift(pivot, previewModel.RestNodeZero, s);
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        Vector3 shift = viewScene.StandShift(pivot, previewModel.RestNodeZero, modelScale);
         return new Vector3(shift.X, viewScene.StandY(lowest, previewIndex) + shift.Y, shift.Z);
     }
 
-    // Where the preview draws point `g` of a glb converted with the options as they stand.
-    Vector3 LiveWorld(Vector3 g)
+    // Where the preview draws point `glbPoint` of a glb converted with the options as they stand.
+    Vector3 LiveWorld(Vector3 glbPoint)
     {
-        return StandAt(NodeZero() + LivePivot(), LiveLowest()) + viewScene.ModelScale(PreviewRadius()) * g;
+        return StandAt(NodeZero() + LivePivot(), LiveLowest()) + viewScene.ModelScale(PreviewRadius()) * glbPoint;
     }
 
     // Node 1 where the preview draws it: on the Pivot as the options stand for a View import
@@ -2734,21 +2748,21 @@ public class ModelImporterWindow
         {
             return LiveWorld(NodeZero() + LivePivot());
         }
-        float s = viewScene.ModelScale(PreviewRadius());
-        return StandAt(previewModel.RestPivot, ShownLowest()) + s * previewModel.PivotNow();
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        return StandAt(previewModel.RestPivot, ShownLowest()) + modelScale * previewModel.PivotNow();
     }
 
-    // Before DrawStanding: takes the shown glb's drawn point W(g) to LiveWorld of where the options
-    // as they stand put g,
-    // W(g) = A + s g: translate(A' + s LiveShift) * scale(k) * turn * translate(-(A + s (c0 + previewMove))).
+    /* Before DrawStanding: takes the shown glb's drawn point W(g) to LiveWorld of where the options
+       as they stand put g,
+       W(g) = A + s g: translate(A' + s LiveShift) * scale(k) * turn * translate(-(A + s (c0 + previewMove))). */
     void ApplyLiveTransform()
     {
-        float s = viewScene.ModelScale(PreviewRadius());
-        Vector3 from = StandAt(previewModel.RestPivot, ShownLowest()) + s * (previewModel.RestPivot + previewMove);
-        Vector3 to = StandAt(NodeZero() + LivePivot(), LiveLowest()) + s * LiveShift();
-        Rlgl.Translatef(to.X, to.Y, to.Z);
-        float k = LiveScale();
-        Rlgl.Scalef(k, k, k);
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        Vector3 fromPoint = StandAt(previewModel.RestPivot, ShownLowest()) + modelScale * (previewModel.RestPivot + previewMove);
+        Vector3 toPoint = StandAt(NodeZero() + LivePivot(), LiveLowest()) + modelScale * LiveShift();
+        Rlgl.Translatef(toPoint.X, toPoint.Y, toPoint.Z);
+        float scaleRatio = LiveScale();
+        Rlgl.Scalef(scaleRatio, scaleRatio, scaleRatio);
         Vector3 axis;
         float degrees;
         AxisAngle(LiveTurn(), out axis, out degrees);
@@ -2756,70 +2770,70 @@ public class ModelImporterWindow
         {
             Rlgl.Rotatef(degrees, axis.X, axis.Y, axis.Z);
         }
-        Rlgl.Translatef(-from.X, -from.Y, -from.Z);
+        Rlgl.Translatef(-fromPoint.X, -fromPoint.Y, -fromPoint.Z);
     }
 
     // A turn matrix as an axis and an angle in degrees (0 for none).
-    static void AxisAngle(Mat4 m, out Vector3 axis, out float degrees)
+    static void AxisAngle(Matrix4 matrix, out Vector3 axis, out float degrees)
     {
-        double cos = Math.Clamp((m[0, 0] + m[1, 1] + m[2, 2] - 1.0) * 0.5, -1.0, 1.0);
-        double angle = Math.Acos(cos);
+        double cosine = Math.Clamp((matrix[0, 0] + matrix[1, 1] + matrix[2, 2] - 1.0) * 0.5, -1.0, 1.0);
+        double angle = Math.Acos(cosine);
         axis = Vector3.UnitY;
         degrees = 0f;
         if (angle < 1e-5)
         {
             return;
         }
-        Vector3 a = new Vector3((float)(m[2, 1] - m[1, 2]), (float)(m[0, 2] - m[2, 0]), (float)(m[1, 0] - m[0, 1]));
+        Vector3 axisVector = new Vector3((float)(matrix[2, 1] - matrix[1, 2]), (float)(matrix[0, 2] - matrix[2, 0]), (float)(matrix[1, 0] - matrix[0, 1]));
         if (Math.Sin(angle) < 1e-3)
         {
             // a half turn: the axis from the diagonal, signs from the largest part
-            float x = (float)Math.Sqrt(Math.Max(0.0, (m[0, 0] + 1.0) * 0.5));
-            float y = (float)Math.Sqrt(Math.Max(0.0, (m[1, 1] + 1.0) * 0.5));
-            float z = (float)Math.Sqrt(Math.Max(0.0, (m[2, 2] + 1.0) * 0.5));
+            float x = (float)Math.Sqrt(Math.Max(0.0, (matrix[0, 0] + 1.0) * 0.5));
+            float y = (float)Math.Sqrt(Math.Max(0.0, (matrix[1, 1] + 1.0) * 0.5));
+            float z = (float)Math.Sqrt(Math.Max(0.0, (matrix[2, 2] + 1.0) * 0.5));
             if (x >= y && x >= z)
             {
-                y = MathF.CopySign(y, (float)m[0, 1]);
-                z = MathF.CopySign(z, (float)m[0, 2]);
+                y = MathF.CopySign(y, (float)matrix[0, 1]);
+                z = MathF.CopySign(z, (float)matrix[0, 2]);
             }
             else if (y >= z)
             {
-                x = MathF.CopySign(x, (float)m[0, 1]);
-                z = MathF.CopySign(z, (float)m[1, 2]);
+                x = MathF.CopySign(x, (float)matrix[0, 1]);
+                z = MathF.CopySign(z, (float)matrix[1, 2]);
             }
             else
             {
-                x = MathF.CopySign(x, (float)m[0, 2]);
-                y = MathF.CopySign(y, (float)m[1, 2]);
+                x = MathF.CopySign(x, (float)matrix[0, 2]);
+                y = MathF.CopySign(y, (float)matrix[1, 2]);
             }
-            a = new Vector3(x, y, z);
+            axisVector = new Vector3(x, y, z);
         }
-        if (a.LengthSquared() < 1e-12f)
+        if (axisVector.LengthSquared() < 1e-12f)
         {
             return;
         }
-        axis = Vector3.Normalize(a);
+        axis = Vector3.Normalize(axisVector);
         degrees = (float)(angle * 180.0 / Math.PI);
     }
 
-    // Rotate's X, Y, Z (degrees, X turned first) for turn matrix `m` = Rz * Ry * Rx.
-    static Vector3 EulerOf(Mat4 m)
+    // Rotate's X, Y, Z (degrees, X turned first) for turn matrix `matrix` = Rz * Ry * Rx.
+    static Vector3 EulerOf(Matrix4 matrix)
     {
-        double y = Math.Asin(Math.Clamp(-m[2, 0], -1.0, 1.0));
+        double y = Math.Asin(Math.Clamp(-matrix[2, 0], -1.0, 1.0));
         double x;
         double z;
         if (Math.Cos(y) > 1e-6)
         {
-            x = Math.Atan2(m[2, 1], m[2, 2]);
-            z = Math.Atan2(m[1, 0], m[0, 0]);
+            x = Math.Atan2(matrix[2, 1], matrix[2, 2]);
+            z = Math.Atan2(matrix[1, 0], matrix[0, 0]);
         }
         else
         {
-            x = Math.Atan2(-m[1, 2], m[1, 1]);     // straight up or down: all the turn in X
+            x = Math.Atan2(-matrix[1, 2], matrix[1, 1]); // straight up or down: all the turn in X
             z = 0.0;
         }
-        double d = 180.0 / Math.PI;
-        return new Vector3((float)(x * d), (float)(y * d), (float)(z * d));
+        double degreesPerRadian = 180.0 / Math.PI;
+        return new Vector3((float)(x * degreesPerRadian), (float)(y * degreesPerRadian), (float)(z * degreesPerRadian));
     }
 
     // Each gizmo's centre with the values as they stand: Move on node 0 moved by Move, Rotate on
@@ -2881,9 +2895,9 @@ public class ModelImporterWindow
     {
         if (gizmoKind >= 0)
         {
-            return gizmoLength;                        // steady while dragging
+            return gizmoLength; // steady while dragging
         }
-        return orbit.Distance * 0.15f;
+        return orbitCamera.Distance * 0.15f;
     }
 
     // Rotate's rings are a little wider than the arrows, so they do not meet the arrow tips.
@@ -2892,30 +2906,30 @@ public class ModelImporterWindow
         return GizmoLength() * 1.25f;
     }
 
-    // A point on the ring about axis `k`, at angle `t` (radians).
-    static Vector3 RingPoint(Vector3 centre, int k, float radius, float t)
+    // A point on the ring about axis `axisIndex`, at angle `angle` (radians).
+    static Vector3 RingPoint(Vector3 centre, int axisIndex, float radius, float angle)
     {
-        Vector3 u = Vector3.UnitY;
-        Vector3 v = Vector3.UnitZ;
-        if (k == 1)
+        Vector3 firstDirection = Vector3.UnitY;
+        Vector3 secondDirection = Vector3.UnitZ;
+        if (axisIndex == 1)
         {
-            u = Vector3.UnitZ;
-            v = Vector3.UnitX;
+            firstDirection = Vector3.UnitZ;
+            secondDirection = Vector3.UnitX;
         }
-        else if (k == 2)
+        else if (axisIndex == 2)
         {
-            u = Vector3.UnitX;
-            v = Vector3.UnitY;
+            firstDirection = Vector3.UnitX;
+            secondDirection = Vector3.UnitY;
         }
-        return centre + radius * (MathF.Cos(t) * u + MathF.Sin(t) * v);
+        return centre + radius * (MathF.Cos(angle) * firstDirection + MathF.Sin(angle) * secondDirection);
     }
 
     const int RingSegments = 48;
 
     // A ring piece on the far side of its centre from the camera: drawn faint, not grabbed.
-    bool RingBack(Vector3 centre, Vector3 a, Vector3 b)
+    bool RingBack(Vector3 centre, Vector3 pieceStart, Vector3 pieceEnd)
     {
-        return Vector3.Dot((a + b) * 0.5f - centre, orbit.Camera.Position - centre) < 0f;
+        return Vector3.Dot((pieceStart + pieceEnd) * 0.5f - centre, orbitCamera.Camera.Position - centre) < 0f;
     }
 
     static Vector3 GizmoAxis(int k)
@@ -2931,9 +2945,9 @@ public class ModelImporterWindow
         return Vector3.UnitZ;
     }
 
-    Vector2 PreviewToScreen(Vector3 p)
+    Vector2 PreviewToScreen(Vector3 worldPoint)
     {
-        return Raylib.GetWorldToScreenEx(p, orbit.Camera, previewW, previewH);
+        return Raylib.GetWorldToScreenEx(worldPoint, orbitCamera.Camera, previewTextureWidth, previewTextureHeight);
     }
 
     // The gizmo and handle under `mouse` (pixels in the preview image): a centre first, then the
@@ -2943,73 +2957,73 @@ public class ModelImporterWindow
         kind = -1;
         handle = -1;
         int[] arrowKinds = { GizmoPivot, GizmoMove };
-        foreach (int g in arrowKinds)
+        foreach (int arrowKind in arrowKinds)
         {
             // Pivot's centre is the smaller one, inside Position's when they share a spot
-            float reach = g == GizmoPivot ? 5f : 9f;
-            if (GizmoShown(g) && Vector2.Distance(mouse, PreviewToScreen(GizmoCentre(g))) < reach)
+            float reach = arrowKind == GizmoPivot ? 5f : 9f;
+            if (GizmoShown(arrowKind) && Vector2.Distance(mouse, PreviewToScreen(GizmoCentre(arrowKind))) < reach)
             {
-                kind = g;
+                kind = arrowKind;
                 handle = 3;
                 return true;
             }
         }
-        float bestDist = 7f;
-        foreach (int g in arrowKinds)
+        float bestDistance = 7f;
+        foreach (int arrowKind in arrowKinds)
         {
-            if (!GizmoShown(g))
+            if (!GizmoShown(arrowKind))
             {
                 continue;
             }
-            Vector3 o = GizmoCentre(g);
-            Vector2 p0 = PreviewToScreen(o);
+            Vector3 centre = GizmoCentre(arrowKind);
+            Vector2 centreOnScreen = PreviewToScreen(centre);
             for (int k = 0; k < 3; k++)
             {
-                float dist = DistanceToSegment(mouse, p0, PreviewToScreen(o + GizmoAxis(k) * ArrowLength(g)));
-                if (dist < bestDist)
+                float distance = DistanceToSegment(mouse, centreOnScreen, PreviewToScreen(centre + GizmoAxis(k) * ArrowLength(arrowKind)));
+                if (distance < bestDistance)
                 {
-                    bestDist = dist;
-                    kind = g;
+                    bestDistance = distance;
+                    kind = arrowKind;
                     handle = k;
                 }
             }
         }
         if (GizmoShown(GizmoRotate))
         {
-            Vector3 c = GizmoCentre(GizmoRotate);
-            float r = RingRadius();
+            Vector3 ringCentre = GizmoCentre(GizmoRotate);
+            float ringRadius = RingRadius();
             for (int k = 0; k < 3; k++)
             {
-                Vector3 prev = RingPoint(c, k, r, 0f);
+                Vector3 previousPoint = RingPoint(ringCentre, k, ringRadius, 0f);
                 for (int i = 1; i <= RingSegments; i++)
                 {
-                    Vector3 next = RingPoint(c, k, r, i * 2f * MathF.PI / RingSegments);
-                    if (!RingBack(c, prev, next))
+                    Vector3 nextPoint = RingPoint(ringCentre, k, ringRadius, i * 2f * MathF.PI / RingSegments);
+                    if (!RingBack(ringCentre, previousPoint, nextPoint))
                     {
-                        float dist = DistanceToSegment(mouse, PreviewToScreen(prev), PreviewToScreen(next));
-                        if (dist < bestDist)
+                        float distance = DistanceToSegment(mouse, PreviewToScreen(previousPoint), PreviewToScreen(nextPoint));
+                        if (distance < bestDistance)
                         {
-                            bestDist = dist;
+                            bestDistance = distance;
                             kind = GizmoRotate;
                             handle = k;
                         }
                     }
-                    prev = next;
+                    previousPoint = nextPoint;
                 }
             }
         }
         return kind >= 0;
     }
 
-    static float DistanceToSegment(Vector2 p, Vector2 a, Vector2 b)
+    static float DistanceToSegment(Vector2 point, Vector2 segmentStart, Vector2 segmentEnd)
     {
-        Vector2 d = b - a;
-        float t = 0f;
-        if (d.LengthSquared() > 0f)
+        Vector2 segment = segmentEnd - segmentStart;
+        float along = 0f;
+        if (segment.LengthSquared() > 0f)
         {
-            t = Math.Clamp(Vector2.Dot(p - a, d) / d.LengthSquared(), 0f, 1f);
+            along = Math.Clamp(Vector2.Dot(point - segmentStart, segment) / segment.LengthSquared(), 0f, 1f);
         }
-        return Vector2.Distance(p, a + d * t);
+        return Vector2.Distance(point, segmentStart + segment * along);
     }
 
     // Hover, start and drag the gizmos. True while one has the mouse, so the view does not orbit.
@@ -3050,24 +3064,24 @@ public class ModelImporterWindow
             gizmoDrag = gizmoHover;
             gizmoStartMouse = mouse;
             gizmoStartValue = GizmoValue(gizmoKind);
-            Vector2 m = mouse - PreviewToScreen(gizmoStartCentre);
-            gizmoLastAngle = MathF.Atan2(m.Y, m.X);
+            Vector2 mouseFromCentre = mouse - PreviewToScreen(gizmoStartCentre);
+            gizmoLastAngle = MathF.Atan2(mouseFromCentre.Y, mouseFromCentre.X);
             gizmoTurned = 0f;
             return true;
         }
         return false;
     }
 
-    // An arrow moves along its axis as far as the mouse goes along the arrow on screen; a centre
-    // moves across the view; a ring turns about its (world) axis as far as the mouse goes round
-    // the centre. Ctrl snaps moved values to whole units.
+    /* An arrow moves along its axis as far as the mouse goes along the arrow on screen; a centre
+       moves across the view; a ring turns about its (world) axis as far as the mouse goes round
+       the centre. Ctrl snaps moved values to whole units. */
     void DragGizmo(Vector2 mouse)
     {
-        Vector3 o = gizmoStartCentre;
+        Vector3 centre = gizmoStartCentre;
         if (gizmoKind == GizmoRotate)
         {
-            Vector2 m = mouse - PreviewToScreen(o);
-            float angle = MathF.Atan2(m.Y, m.X);
+            Vector2 mouseFromCentre = mouse - PreviewToScreen(centre);
+            float angle = MathF.Atan2(mouseFromCentre.Y, mouseFromCentre.X);
             float step = angle - gizmoLastAngle;
             if (step > MathF.PI)
             {
@@ -3082,57 +3096,57 @@ public class ModelImporterWindow
             // about an axis that points at the camera
             Vector3 axis = GizmoAxis(gizmoDrag);
             float sign = 1f;
-            if (Vector3.Dot(axis, orbit.Camera.Position - o) > 0f)
+            if (Vector3.Dot(axis, orbitCamera.Camera.Position - centre) > 0f)
             {
                 sign = -1f;
             }
             gizmoTurned += sign * step * 180f / MathF.PI;
-            Mat4 start = Mat4.Euler(gizmoStartValue.X, gizmoStartValue.Y, gizmoStartValue.Z);
-            Mat4 turned = Mat4.Rotation(axis.X, axis.Y, axis.Z, gizmoTurned) * start;
+            Matrix4 start = Matrix4.EulerAngles(gizmoStartValue.X, gizmoStartValue.Y, gizmoStartValue.Z);
+            Matrix4 turned = Matrix4.Rotation(axis.X, axis.Y, axis.Z, gizmoTurned) * start;
             SetGizmoValue(gizmoKind, EulerOf(turned));
             return;
         }
-        Vector2 md = mouse - gizmoStartMouse;
+        Vector2 mouseMoved = mouse - gizmoStartMouse;
         Vector3 world;
         if (gizmoDrag == 3)
         {
-            float dist = Vector3.Distance(orbit.Camera.Position, o);
-            float perPixel = 2f * dist * MathF.Tan(orbit.Camera.FovY * 0.5f * MathF.PI / 180f) / Math.Max(previewH, 1);
-            world = (orbit.Right * md.X - orbit.Up * md.Y) * perPixel;
+            float distance = Vector3.Distance(orbitCamera.Camera.Position, centre);
+            float perPixel = 2f * distance * MathF.Tan(orbitCamera.Camera.FovY * 0.5f * MathF.PI / 180f) / Math.Max(previewTextureHeight, 1);
+            world = (orbitCamera.Right * mouseMoved.X - orbitCamera.Up * mouseMoved.Y) * perPixel;
         }
         else
         {
             Vector3 axis = GizmoAxis(gizmoDrag);
-            Vector2 d = PreviewToScreen(o + axis * gizmoLength) - PreviewToScreen(o);
-            if (d.LengthSquared() < 4f)
+            Vector2 arrowOnScreen = PreviewToScreen(centre + axis * gizmoLength) - PreviewToScreen(centre);
+            if (arrowOnScreen.LengthSquared() < 4f)
             {
-                return;                                // the arrow points at the camera
+                return; // the arrow points at the camera
             }
-            world = axis * (Vector2.Dot(md, d) / d.LengthSquared() * gizmoLength);
+            world = axis * (Vector2.Dot(mouseMoved, arrowOnScreen) / arrowOnScreen.LengthSquared() * gizmoLength);
         }
-        float s = viewScene.ModelScale(PreviewRadius());
-        Vector3 at = gizmoStartValue + world / s;
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        Vector3 newValue = gizmoStartValue + world / modelScale;
         if (Raylib.IsKeyDown(KeyboardKey.LeftControl) || Raylib.IsKeyDown(KeyboardKey.RightControl))
         {
             if (gizmoDrag == 0 || gizmoDrag == 3)
             {
-                at.X = MathF.Round(at.X);
+                newValue.X = MathF.Round(newValue.X);
             }
             if (gizmoDrag == 1 || gizmoDrag == 3)
             {
-                at.Y = MathF.Round(at.Y);
+                newValue.Y = MathF.Round(newValue.Y);
             }
             if (gizmoDrag == 2 || gizmoDrag == 3)
             {
-                at.Z = MathF.Round(at.Z);
+                newValue.Z = MathF.Round(newValue.Z);
             }
         }
-        SetGizmoValue(gizmoKind, at);
+        SetGizmoValue(gizmoKind, newValue);
     }
 
-    // Red X, green Y, blue Z, drawn over the model: Move's and Pivot's arrows (Move with a ball
-    // in the middle; Pivot shorter, square tips, a small white cube) and Rotate's rings (the far half faint). The handle
-    // under the mouse or being dragged turns yellow.
+    /* Red X, green Y, blue Z, drawn over the model: Move's and Pivot's arrows (Move with a ball
+       in the middle; Pivot shorter, square tips, a small white cube) and Rotate's rings (the far
+       half faint). The handle under the mouse or being dragged turns yellow. */
     void DrawGizmos()
     {
         if (!GizmoShown(GizmoMove) && !GizmoShown(GizmoRotate) && !GizmoShown(GizmoPivot))
@@ -3142,86 +3156,86 @@ public class ModelImporterWindow
         Rlgl.DrawRenderBatchActive();
         Rlgl.DisableDepthTest();
         int litKind = gizmoHoverKind;
-        int lit = gizmoHover;
+        int litHandle = gizmoHover;
         if (gizmoKind >= 0)
         {
             litKind = gizmoKind;
-            lit = gizmoDrag;
+            litHandle = gizmoDrag;
         }
         Color[] colors = { new Color(230, 70, 70, 255), new Color(120, 200, 60, 255), new Color(70, 130, 240, 255) };
-        float len = GizmoLength();
+        float baseLength = GizmoLength();
         if (GizmoShown(GizmoRotate))
         {
-            Vector3 c = GizmoCentre(GizmoRotate);
+            Vector3 ringCentre = GizmoCentre(GizmoRotate);
             if (gizmoKind == GizmoRotate)
             {
-                c = gizmoStartCentre;
+                ringCentre = gizmoStartCentre;
             }
-            float r = RingRadius();
+            float ringRadius = RingRadius();
             for (int k = 0; k < 3; k++)
             {
-                Color col = colors[k];
-                if (litKind == GizmoRotate && lit == k)
+                Color colour = colors[k];
+                if (litKind == GizmoRotate && litHandle == k)
                 {
-                    col = Color.Yellow;
+                    colour = Color.Yellow;
                 }
-                Color faint = new Color(col.R, col.G, col.B, (byte)60);
-                Vector3 prev = RingPoint(c, k, r, 0f);
+                Color faint = new Color(colour.R, colour.G, colour.B, (byte)60);
+                Vector3 previousPoint = RingPoint(ringCentre, k, ringRadius, 0f);
                 for (int i = 1; i <= RingSegments; i++)
                 {
-                    Vector3 next = RingPoint(c, k, r, i * 2f * MathF.PI / RingSegments);
-                    Color piece = col;
-                    if (RingBack(c, prev, next))
+                    Vector3 nextPoint = RingPoint(ringCentre, k, ringRadius, i * 2f * MathF.PI / RingSegments);
+                    Color piece = colour;
+                    if (RingBack(ringCentre, previousPoint, nextPoint))
                     {
                         piece = faint;
                     }
-                    Raylib.DrawCylinderEx(prev, next, len * 0.012f, len * 0.012f, 4, piece);
-                    prev = next;
+                    Raylib.DrawCylinderEx(previousPoint, nextPoint, baseLength * 0.012f, baseLength * 0.012f, 4, piece);
+                    previousPoint = nextPoint;
                 }
             }
         }
         int[] arrowKinds = { GizmoMove, GizmoPivot };
-        foreach (int g in arrowKinds)
+        foreach (int arrowKind in arrowKinds)
         {
-            if (!GizmoShown(g))
+            if (!GizmoShown(arrowKind))
             {
                 continue;
             }
-            Vector3 o = GizmoCentre(g);
+            Vector3 gizmoCentre = GizmoCentre(arrowKind);
             for (int k = 0; k < 3; k++)
             {
-                Color col = colors[k];
-                if (litKind == g && lit == k)
+                Color colour = colors[k];
+                if (litKind == arrowKind && litHandle == k)
                 {
-                    col = Color.Yellow;
+                    colour = Color.Yellow;
                 }
                 Vector3 axis = GizmoAxis(k);
-                float arrow = ArrowLength(g);
-                if (g == GizmoPivot)
+                float arrow = ArrowLength(arrowKind);
+                if (arrowKind == GizmoPivot)
                 {
                     // Pivot: a shorter shaft with a square tip
-                    float tip = len * 0.07f;
-                    Raylib.DrawCylinderEx(o, o + axis * (arrow - tip * 0.5f), len * 0.015f, len * 0.015f, 6, col);
-                    Raylib.DrawCube(o + axis * arrow, tip, tip, tip, col);
+                    float tipSize = baseLength * 0.07f;
+                    Raylib.DrawCylinderEx(gizmoCentre, gizmoCentre + axis * (arrow - tipSize * 0.5f), baseLength * 0.015f, baseLength * 0.015f, 6, colour);
+                    Raylib.DrawCube(gizmoCentre + axis * arrow, tipSize, tipSize, tipSize, colour);
                     continue;
                 }
-                Vector3 neck = o + axis * (arrow * 0.8f);
-                Raylib.DrawCylinderEx(o, neck, len * 0.015f, len * 0.015f, 6, col);
-                Raylib.DrawCylinderEx(neck, o + axis * arrow, len * 0.06f, 0f, 8, col);
+                Vector3 neck = gizmoCentre + axis * (arrow * 0.8f);
+                Raylib.DrawCylinderEx(gizmoCentre, neck, baseLength * 0.015f, baseLength * 0.015f, 6, colour);
+                Raylib.DrawCylinderEx(neck, gizmoCentre + axis * arrow, baseLength * 0.06f, 0f, 8, colour);
             }
             Color centre = Color.White;
-            if (litKind == g && lit == 3)
+            if (litKind == arrowKind && litHandle == 3)
             {
                 centre = Color.Yellow;
             }
-            float box = len * 0.08f;
-            if (g == GizmoMove)
+            float centreSize = baseLength * 0.08f;
+            if (arrowKind == GizmoMove)
             {
-                Raylib.DrawSphere(o, box * 0.7f, centre);
+                Raylib.DrawSphere(gizmoCentre, centreSize * 0.7f, centre);
             }
             else
             {
-                Raylib.DrawCube(o, box * 0.6f, box * 0.6f, box * 0.6f, centre);
+                Raylib.DrawCube(gizmoCentre, centreSize * 0.6f, centreSize * 0.6f, centreSize * 0.6f, centre);
             }
         }
         Rlgl.DrawRenderBatchActive();
@@ -3232,17 +3246,17 @@ public class ModelImporterWindow
     // around node 0, not the idle extent, so Rotate does not move or resize it.
     void DrawFloorGrid(bool compare)
     {
-        float s = viewScene.ModelScale(PreviewRadius());
-        float centre = viewScene.StandShift(previewModel, s).X + s * previewModel.RestNodeZero.X;
-        float reach = s * PreviewRadius();
+        float modelScale = viewScene.ModelScale(PreviewRadius());
+        float centre = viewScene.StandShift(previewModel, modelScale).X + modelScale * previewModel.RestNodeZero.X;
+        float reach = modelScale * PreviewRadius();
         float left = centre - reach;
         float right = centre + reach;
         float deep = 2f * reach;
         if (compare)
         {
-            float sc = viewScene.ModelScale(compareRadius);
-            left = MathF.Min(left, compareOffsetX + sc * compareLeft);
-            deep = MathF.Max(deep, sc * MathF.Max(compareRight - compareLeft, compareHeight));
+            float compareModelScale = viewScene.ModelScale(compareRadius);
+            left = MathF.Min(left, compareOffsetX + compareModelScale * compareLeft);
+            deep = MathF.Max(deep, compareModelScale * MathF.Max(compareRight - compareLeft, compareHeight));
         }
         ViewScene.DrawFloorGrid(left, right, deep);
     }
@@ -3268,6 +3282,4 @@ public class ModelImporterWindow
     }
 
 #endif
-
-
 }

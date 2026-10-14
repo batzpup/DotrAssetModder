@@ -5,14 +5,14 @@ public static class GameImageManager
 {
     public static GameTexture CurrentTexture = new();
 
-    public static void RemapColourInBitmap(SKBitmap bitmap, SKColor oldCol, SKColor newCol)
+    public static void RemapColourInBitmap(SKBitmap bitmap, SKColor oldColour, SKColor newColour)
     {
         unsafe
         {
             uint* pixels = (uint*)bitmap.GetPixels().ToPointer();
             int count = bitmap.Width * bitmap.Height;
-            uint oldBgra = (uint)((oldCol.Alpha << 24) | (oldCol.Blue << 16) | (oldCol.Green << 8) | oldCol.Red);
-            uint newBgra = (uint)((newCol.Alpha << 24) | (newCol.Blue << 16) | (newCol.Green << 8) | newCol.Red);
+            uint oldBgra = (uint)((oldColour.Alpha << 24) | (oldColour.Blue << 16) | (oldColour.Green << 8) | oldColour.Red);
+            uint newBgra = (uint)((newColour.Alpha << 24) | (newColour.Blue << 16) | (newColour.Green << 8) | newColour.Red);
             for (int i = 0; i < count; i++)
             {
                 if (pixels[i] == oldBgra)
@@ -32,38 +32,38 @@ public static class GameImageManager
             var resized = new SKBitmap(targetWidth, targetHeight);
             using var canvas = new SKCanvas(resized);
 
-            SKRect srcRect, dstRect;
+            SKRect sourceRect, destinationRect;
             if (cropToFit)
             {
-                float srcRatio = (float)bitmap.Width / bitmap.Height;
-                float dstRatio = (float)targetWidth / targetHeight;
-                int srcX, srcY, srcW, srcH;
-                if (Math.Abs(srcRatio - dstRatio) < 0.01f)
+                float sourceAspect = (float)bitmap.Width / bitmap.Height;
+                float destinationAspect = (float)targetWidth / targetHeight;
+                int sourceX, sourceY, sourceWidth, sourceHeight;
+                if (Math.Abs(sourceAspect - destinationAspect) < 0.01f)
                 {
-                    srcX = 0; srcY = 0;
-                    srcW = bitmap.Width; srcH = bitmap.Height;
+                    sourceX = 0; sourceY = 0;
+                    sourceWidth = bitmap.Width; sourceHeight = bitmap.Height;
                 }
-                else if (srcRatio > dstRatio)
+                else if (sourceAspect > destinationAspect)
                 {
-                    srcH = bitmap.Height;
-                    srcW = (int)(bitmap.Height * dstRatio);
-                    srcX = (bitmap.Width - srcW) / 2;
-                    srcY = 0;
+                    sourceHeight = bitmap.Height;
+                    sourceWidth = (int)(bitmap.Height * destinationAspect);
+                    sourceX = (bitmap.Width - sourceWidth) / 2;
+                    sourceY = 0;
                 }
                 else
                 {
-                    srcW = bitmap.Width;
-                    srcH = (int)(bitmap.Width / dstRatio);
-                    srcX = 0;
-                    srcY = (bitmap.Height - srcH) / 2;
+                    sourceWidth = bitmap.Width;
+                    sourceHeight = (int)(bitmap.Width / destinationAspect);
+                    sourceX = 0;
+                    sourceY = (bitmap.Height - sourceHeight) / 2;
                 }
-                srcRect = new SKRect(srcX, srcY, srcX + srcW, srcY + srcH);
-                dstRect = new SKRect(0, 0, targetWidth, targetHeight);
+                sourceRect = new SKRect(sourceX, sourceY, sourceX + sourceWidth, sourceY + sourceHeight);
+                destinationRect = new SKRect(0, 0, targetWidth, targetHeight);
             }
             else
             {
-                srcRect = new SKRect(0, 0, bitmap.Width, bitmap.Height);
-                dstRect = new SKRect(0, 0, targetWidth, targetHeight);
+                sourceRect = new SKRect(0, 0, bitmap.Width, bitmap.Height);
+                destinationRect = new SKRect(0, 0, targetWidth, targetHeight);
             }
 
             bool isUpscaling = targetWidth > bitmap.Width || targetHeight > bitmap.Height;
@@ -71,7 +71,7 @@ public static class GameImageManager
             {
                 FilterQuality = isUpscaling ? SKFilterQuality.None : SKFilterQuality.High
             };
-            canvas.DrawBitmap(bitmap, srcRect, dstRect, paint);
+            canvas.DrawBitmap(bitmap, sourceRect, destinationRect, paint);
             bitmap.Dispose();
             bitmap = resized;
         }

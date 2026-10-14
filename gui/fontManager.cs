@@ -21,16 +21,16 @@ public static class FontManager
     public static void LoadFonts()
     {
         int[] sizes = { 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32 };
-        foreach (var kvp in FontNames)
+        foreach (var familyEntry in FontNames)
         {
 
-            var sizeDict = new Dictionary<int, ImFontPtr>();
+            var fontsBySize = new Dictionary<int, ImFontPtr>();
             foreach (int size in sizes)
             {
-                ImFontPtr font = LoadCustomFont(kvp.Value, size);
-                sizeDict[size] = font;
+                ImFontPtr font = LoadCustomFont(familyEntry.Value, size);
+                fontsBySize[size] = font;
             }
-            Fonts[kvp.Key] = sizeDict;
+            Fonts[familyEntry.Key] = fontsBySize;
         }
         ImGui.GetIO().Fonts.Build();
         rlImGui.ReloadFonts();
@@ -38,18 +38,17 @@ public static class FontManager
 
     public static ImFontPtr GetFont(FontFamily family, int requestedSize)
     {
-        if (!Fonts.TryGetValue(family, out var dict))
+        if (!Fonts.TryGetValue(family, out var fontsBySize))
             return IntPtr.Zero;
 
-        int closest = dict.Keys.OrderBy(s => Math.Abs(s - requestedSize)).First();
-        return dict[closest];
+        int closest = fontsBySize.Keys.OrderBy(availableSize => Math.Abs(availableSize - requestedSize)).First();
+        return fontsBySize[closest];
     }
 
     public static ImFontPtr LoadCustomFont(string fontPath = "NotoSansJP-Regular.ttf", int pixelSize = 32)
     {
         Assembly assembly = Assembly.GetExecutingAssembly();
         string resourceName = $"{assembly.GetName().Name}.fonts.{fontPath}";
-        //Console.WriteLine($"Loading resource: {resourceName}");
         ImFontPtr font;
         using (Stream? stream = assembly.GetManifestResourceStream(resourceName))
         {

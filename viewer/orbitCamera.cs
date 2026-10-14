@@ -26,8 +26,8 @@ public sealed class OrbitCamera
     {
         get
         {
-            float cp = MathF.Cos(Pitch);
-            return -new Vector3(cp * MathF.Sin(Yaw), MathF.Sin(Pitch), cp * MathF.Cos(Yaw));
+            float cosPitch = MathF.Cos(Pitch);
+            return -new Vector3(cosPitch * MathF.Sin(Yaw), MathF.Sin(Pitch), cosPitch * MathF.Cos(Yaw));
         }
     }
 

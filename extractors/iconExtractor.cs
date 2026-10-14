@@ -1,11 +1,11 @@
 using SkiaSharp;
-using System.Buffers.Binary;
 using System.Numerics;
 using SharpGLTF.Geometry;
 using SharpGLTF.Geometry.VertexTypes;
 using SharpGLTF.Materials;
 using SharpGLTF.Memory;
 using SharpGLTF.Scenes;
+using static DotrAssetModder.Bin;
 
 namespace DotrAssetModder;
 
@@ -21,66 +21,66 @@ public static class IconExtractor
 
     record struct IcnBlock(int IcnOffset, uint AnimShapes, uint TexType, int VertCount, int TexOffset);
 
-    static List<IcnBlock> ScanIcns(byte[] data)
+    static List<IcnBlock> ScanIcns(byte[] mrgBytes)
     {
         var results = new List<IcnBlock>();
-        int pos = 0;
-        while (pos <= data.Length - 20)
+        int searchStart = 0;
+        while (searchStart <= mrgBytes.Length - 20)
         {
 
-            int idx = -1;
-            for (int i = pos; i <= data.Length - 4; i += 4)
+            int magicOffset = -1;
+            for (int i = searchStart; i <= mrgBytes.Length - 4; i += 4)
             {
-                if (BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(i, 4)) == IcnMagic)
+                if (ReadU32(mrgBytes, i) == IcnMagic)
                 {
-                    idx = i;
+                    magicOffset = i;
                     break;
                 }
             }
-            if (idx < 0)
+            if (magicOffset < 0)
             {
                 break;   
             }
              
 
-            uint animShapes = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(idx + 4, 4));
-            uint texType = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(idx + 8, 4));
-            int vertCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(idx + 16, 4));
+            uint animShapes = ReadU32(mrgBytes, magicOffset + 4);
+            uint texType = ReadU32(mrgBytes, magicOffset + 8);
+            int vertCount = (int)ReadU32(mrgBytes, magicOffset + 16);
 
             if (animShapes < 1 || animShapes > 16 || vertCount < 3 || vertCount % 3 != 0 || vertCount > 20000)
             {
-                pos = idx + 4;
+                searchStart = magicOffset + 4;
                 continue;
             }
-            int vtxEnd = idx + 20 + (int)animShapes * vertCount * 24;
-            if (vtxEnd + 24 > data.Length)
+            int vertexEnd = magicOffset + 20 + (int)animShapes * vertCount * 24;
+            if (vertexEnd + 24 > mrgBytes.Length)
             {
-                pos = idx + 4;
+                searchStart = magicOffset + 4;
                 continue;
             }
-            uint numFrames = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(vtxEnd + 16, 4));
-            int texOffset = vtxEnd + 24 + (int)numFrames * 12;
+            uint numFrames = ReadU32(mrgBytes, vertexEnd + 16);
+            int texOffset = vertexEnd + 24 + (int)numFrames * 12;
 
-            if (texOffset + TexBytes > data.Length)
+            if (texOffset + TexBytes > mrgBytes.Length)
             {
-                pos = idx + 4;
+                searchStart = magicOffset + 4;
                 continue;
             }
 
-            results.Add(new IcnBlock(idx, animShapes, texType, vertCount, texOffset));
-            pos = texOffset + TexBytes;
+            results.Add(new IcnBlock(magicOffset, animShapes, texType, vertCount, texOffset));
+            searchStart = texOffset + TexBytes;
         }
         return results;
     }
 
-    public static ExtractResult Extract(byte[] mrgBytes, string outDir, string stem)
+    public static ExtractResult Extract(byte[] mrgBytes, string outputDirectory, string fileNameStem)
     {
-        Directory.CreateDirectory(outDir);
+        Directory.CreateDirectory(outputDirectory);
         int written = 0, failed = 0;
         var failures = new List<FailureInfo>();
 
-        var icns = ScanIcns(mrgBytes);
-        if (icns.Count == 0)
+        var iconBlocks = ScanIcns(mrgBytes);
+        if (iconBlocks.Count == 0)
         {
             return new ExtractResult(AssetKind.Ps2Icon, 0, 1, 1)
             {
@@ -88,40 +88,40 @@ public static class IconExtractor
             };
         }
 
-        for (int i = 0; i < icns.Count; i++)
+        for (int i = 0; i < iconBlocks.Count; i++)
         {
-            var block = icns[i];
+            var block = iconBlocks[i];
             string suffix = i < Suffixes.Length ? Suffixes[i] : $"_{i}";
 
             byte[]? texPng = null;
             try
             {
-                PS2Icon.CurrentTextureIndex = i < PS2Icon.TextureOffsets.Length ? i : 0;
-                int texLen = (i + 1 < icns.Count ? icns[i + 1].IcnOffset : mrgBytes.Length) - block.TexOffset;
+                Ps2Icon.CurrentTextureIndex = i < Ps2Icon.TextureOffsets.Length ? i : 0;
+                int texLen = (i + 1 < iconBlocks.Count ? iconBlocks[i + 1].IcnOffset : mrgBytes.Length) - block.TexOffset;
                 var slotBytes = mrgBytes.AsSpan(block.TexOffset, texLen).ToArray();
-                using var bmp = PS2Icon.ExtractIconTexture(slotBytes);
-                using var rgba = bmp.Copy(SKColorType.Rgba8888);
-                var ms = new MemoryStream();
-                rgba.Encode(ms, SKEncodedImageFormat.Png, 100);
-                texPng = ms.ToArray();
-                File.WriteAllBytes(Path.Combine(outDir, $"{stem}{suffix}.png"), texPng);
+                using var iconBitmap = Ps2Icon.ExtractIconTexture(slotBytes);
+                using var rgbaBitmap = iconBitmap.Copy(SKColorType.Rgba8888);
+                var pngStream = new MemoryStream();
+                rgbaBitmap.Encode(pngStream, SKEncodedImageFormat.Png, 100);
+                texPng = pngStream.ToArray();
+                File.WriteAllBytes(Path.Combine(outputDirectory, $"{fileNameStem}{suffix}.png"), texPng);
                 written++;
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                failures.Add(new FailureInfo(i, $"texture{suffix}", ex.Message));
+                failures.Add(new FailureInfo(i, $"texture{suffix}", exception.Message));
                 failed++;
             }
 
             try
             {
-                string glbPath = Path.Combine(outDir, $"{stem}{suffix}.glb");
-                ExportGlb(mrgBytes, block, texPng, glbPath, stem + suffix);
+                string glbPath = Path.Combine(outputDirectory, $"{fileNameStem}{suffix}.glb");
+                ExportGlb(mrgBytes, block, texPng, glbPath, fileNameStem + suffix);
                 written++;
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                failures.Add(new FailureInfo(i, $"model{suffix}", ex.Message));
+                failures.Add(new FailureInfo(i, $"model{suffix}", exception.Message));
                 failed++;
             }
         }
@@ -132,9 +132,9 @@ public static class IconExtractor
         };
     }
 
-    static void ExportGlb(byte[] data, IcnBlock block, byte[]? texPng, string outPath, string name)
+    static void ExportGlb(byte[] mrgBytes, IcnBlock block, byte[]? texPng, string outputPath, string name)
     {
-        var span = data.AsSpan(block.IcnOffset);
+        var iconSpan = mrgBytes.AsSpan(block.IcnOffset);
         uint texType = block.TexType;
         int vertCount = block.VertCount;
         var positions = new Vector3[vertCount];
@@ -144,18 +144,18 @@ public static class IconExtractor
         
         for (int i = 0; i < vertCount; i++)
         {
-            int o = shapeBase + i * 24;
+            int vertexOffset = shapeBase + i * 24;
             positions[i] = new Vector3(
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 0, 2)) / 4096f,
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 2, 2)) / 4096f,
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 4, 2)) / 4096f);
+                ReadI16(iconSpan, vertexOffset + 0) / 4096f,
+                ReadI16(iconSpan, vertexOffset + 2) / 4096f,
+                ReadI16(iconSpan, vertexOffset + 4) / 4096f);
             normals[i] = new Vector3(
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 8, 2)) / 4096f,
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 10, 2)) / 4096f,
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 12, 2)) / 4096f);
+                ReadI16(iconSpan, vertexOffset + 8) / 4096f,
+                ReadI16(iconSpan, vertexOffset + 10) / 4096f,
+                ReadI16(iconSpan, vertexOffset + 12) / 4096f);
             uvs[i] = new Vector2(
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 16, 2)) / 4096f,
-                BinaryPrimitives.ReadInt16LittleEndian(span.Slice(o + 18, 2)) / 4096f);
+                ReadI16(iconSpan, vertexOffset + 16) / 4096f,
+                ReadI16(iconSpan, vertexOffset + 18) / 4096f);
         }
 
         bool hasTexture = (texType & 0x4) != 0 && texPng != null;
@@ -182,6 +182,6 @@ public static class IconExtractor
 
         var scene = new SceneBuilder(name);
         scene.AddRigidMesh(meshBuilder, Matrix4x4.Identity);
-        scene.ToGltf2().SaveGLB(outPath);
+        scene.ToGltf2().SaveGLB(outputPath);
     }
 }

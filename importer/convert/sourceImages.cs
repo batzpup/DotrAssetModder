@@ -3,9 +3,9 @@ using SkiaSharp;
 namespace DotrAssetModder;
 // Mostly AI
 
-// Loads texture files once each, looking next to the model and up to two folders below; a
-// port of toglb.py's Images. SkiaSharp decodes PNG, JPEG, BMP, GIF and WebP (Pillow also read
-// TGA/DDS; no source seen so far uses them).
+/* Loads texture files once each, looking next to the model and up to two folders below; a
+   port of toglb.py's Images. SkiaSharp decodes PNG, JPEG, BMP, GIF and WebP (Pillow also read
+   TGA/DDS; no source seen so far uses them). */
 public sealed class SourceImages
 {
     // file name (lower case) -> path, per model folder: the folder and two levels below it, so
@@ -34,27 +34,27 @@ public sealed class SourceImages
                 for (int depth = 0; depth < 3; depth++)
                 {
                     List<string> below = new List<string>();
-                    foreach (string d in level)
+                    foreach (string directory in level)
                     {
                         string[] entries;
                         try
                         {
-                            entries = Directory.GetFileSystemEntries(d);
+                            entries = Directory.GetFileSystemEntries(directory);
                         }
                         catch (Exception)
                         {
                             continue;
                         }
                         Array.Sort(entries, StringComparer.Ordinal);
-                        foreach (string e in entries)
+                        foreach (string entry in entries)
                         {
-                            if (File.Exists(e))
+                            if (File.Exists(entry))
                             {
-                                files.TryAdd(Path.GetFileName(e).ToLowerInvariant(), e);
+                                files.TryAdd(Path.GetFileName(entry).ToLowerInvariant(), entry);
                             }
-                            else if (Directory.Exists(e))
+                            else if (Directory.Exists(entry))
                             {
-                                below.Add(e);
+                                below.Add(entry);
                             }
                         }
                     }
@@ -82,14 +82,14 @@ public sealed class SourceImages
                 return null;
             }
             SKImageInfo info = new SKImageInfo(codec.Info.Width, codec.Info.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
-            SKBitmap bmp = new SKBitmap(info);
-            SKCodecResult r = codec.GetPixels(info, bmp.GetPixels());
-            if (r != SKCodecResult.Success && r != SKCodecResult.IncompleteInput)
+            SKBitmap bitmap = new SKBitmap(info);
+            SKCodecResult decodeResult = codec.GetPixels(info, bitmap.GetPixels());
+            if (decodeResult != SKCodecResult.Success && decodeResult != SKCodecResult.IncompleteInput)
             {
-                bmp.Dispose();
+                bitmap.Dispose();
                 return null;
             }
-            return bmp;
+            return bitmap;
         }
         catch (Exception)
         {
@@ -110,11 +110,11 @@ public sealed class SourceImages
         }
         tries.Add(Path.Combine(baseDir, name));
         tries.Add(Path.Combine(baseDir, file));
-        foreach (string t in tries)
+        foreach (string candidate in tries)
         {
-            if (File.Exists(t))
+            if (File.Exists(candidate))
             {
-                return t;
+                return candidate;
             }
         }
         return Find(file);
@@ -125,10 +125,10 @@ public sealed class SourceImages
     {
         if (data != null && data.Length > 0)
         {
-            SKBitmap? im = Decode(data);
-            if (im != null)
+            SKBitmap? decoded = Decode(data);
+            if (decoded != null)
             {
-                return im;
+                return decoded;
             }
         }
         foreach (string raw in names)

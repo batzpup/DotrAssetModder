@@ -5,12 +5,12 @@ namespace DotrAssetModder;
 
 public class MainWindow
 {
-    Windows current_window = Windows.Extractor;
+    Windows currentWindow = Windows.Extractor;
 
-    ExtractorWindow extract_window;
-    TextureEditorWindow texture_window;
-    ModelViewerWindow model_window;
-    ModelImporterWindow import_window;
+    ExtractorWindow extractWindow;
+    TextureEditorWindow textureWindow;
+    ModelViewerWindow modelWindow;
+    ModelImporterWindow importWindow;
 
 
     public enum Windows
@@ -24,12 +24,12 @@ public class MainWindow
 
     public MainWindow()
     {
-        glRD.Io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard | ImGuiConfigFlags.DpiEnableScaleFonts | ImGuiConfigFlags.DpiEnableScaleViewports;
+        GuiContext.Io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard | ImGuiConfigFlags.DpiEnableScaleFonts | ImGuiConfigFlags.DpiEnableScaleViewports;
 
-        extract_window = new();
-        texture_window = new();
-        model_window = new();
-        import_window = new();
+        extractWindow = new();
+        textureWindow = new();
+        modelWindow = new();
+        importWindow = new();
     }
 
 
@@ -42,47 +42,47 @@ public class MainWindow
 
             if (files.Length > 0)
             {
-                string ext = Path.GetExtension(files[0]).ToLowerInvariant();
-                if (ext == ".iso" && current_window == Windows.Extractor)
+                string extension = Path.GetExtension(files[0]).ToLowerInvariant();
+                if (extension == ".iso" && currentWindow == Windows.Extractor)
                 {
                     FileLoader.Instance.OpenIso(files[0]);
                 }
-                else if (ext is ".glb" or ".gltf")
+                else if (extension is ".glb" or ".gltf")
                 {
-                    if (current_window == Windows.ModelImporter)
+                    if (currentWindow == Windows.ModelImporter)
                     {
                         if (FileLoader.Instance.IsIsoLoaded)
                         {
-                            import_window.SetupModel(files[0]);
+                            importWindow.SetupModel(files[0]);
                         }
                     }
-                    else if (current_window == Windows.ModelView)
+                    else if (currentWindow == Windows.ModelView)
                     {
-                        model_window.LoadModel(files[0]);
+                        modelWindow.LoadModel(files[0]);
                     }
 
                 }
-                else if (ext is ".fbx" or ".dae")
+                else if (extension is ".fbx" or ".dae")
                 {
                     // Converted to a glb first, by the importer and by the viewer.
-                    if (current_window == Windows.ModelImporter)
+                    if (currentWindow == Windows.ModelImporter)
                     {
                         if (FileLoader.Instance.IsIsoLoaded)
                         {
-                            import_window.SetupModel(files[0]);
+                            importWindow.SetupModel(files[0]);
                         }
                     }
-                    else if (current_window == Windows.ModelView)
+                    else if (currentWindow == Windows.ModelView)
                     {
-                        model_window.LoadModel(files[0]);
+                        modelWindow.LoadModel(files[0]);
                     }
                 }
 
             }
         }
         
-        ImGui.PushFont(glRD.MainFont);
-        ImGui.SetNextWindowSize(glRD.cur_win_dims);
+        ImGui.PushFont(GuiContext.MainFont);
+        ImGui.SetNextWindowSize(GuiContext.WindowSize);
         ImGui.SetNextWindowPos(Vector2.Zero);
 
         // NoBringToFrontOnFocus: the full-screen main window stays behind floating windows (the
@@ -92,35 +92,35 @@ public class MainWindow
 
 
 
-        ImGui.PushStyleColor(ImGuiCol.TabSelected, new GuiColour(0, 189, 0).value);
-        ImGui.PushStyleColor(ImGuiCol.TabHovered, new GuiColour(128, 128, 0).value);
+        ImGui.PushStyleColor(ImGuiCol.TabSelected, new GuiColour(0, 189, 0).Value);
+        ImGui.PushStyleColor(ImGuiCol.TabHovered, new GuiColour(128, 128, 0).Value);
         if (ImGui.BeginTabBar("Mode"))
         {
 
             if (ImGui.BeginTabItem("Extractor"))
             {
-                current_window = Windows.Extractor;
-                extract_window.Render();
+                currentWindow = Windows.Extractor;
+                extractWindow.Render();
                 ImGui.EndTabItem();
             }
             if (ImGui.BeginTabItem("Texture Viewer"))
             {
-                current_window = Windows.TextureView;
-                texture_window.Render();
+                currentWindow = Windows.TextureView;
+                textureWindow.Render();
                 ImGui.EndTabItem();
             }
 
             if (ImGui.BeginTabItem("Model Viewer"))
             {
-                current_window = Windows.ModelView;
-                model_window.Render();
+                currentWindow = Windows.ModelView;
+                modelWindow.Render();
                 ImGui.EndTabItem();
 
             }
             if (ImGui.BeginTabItem("Model Importer"))
             {
-                current_window = Windows.ModelImporter;
-                import_window.Render();
+                currentWindow = Windows.ModelImporter;
+                importWindow.Render();
                 ImGui.EndTabItem();
             }
          

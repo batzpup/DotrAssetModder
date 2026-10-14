@@ -24,7 +24,7 @@ public class PaintCanvas
     bool isDirty;
     bool textureCreated;
     TextureFilter textureFilter = TextureFilter.Point;
-    SKPoint? lastPaintPos;
+    SKPoint? lastPaintPosition;
 
     readonly Stack<byte[]> undoStack = new();
     readonly Stack<byte[]> redoStack = new();
@@ -49,7 +49,6 @@ public class PaintCanvas
             ? bitmap.Copy(SKColorType.Rgba8888)
             : bitmap.Copy();
         CreateTexture();
-        UploadToTexture();
     }
 
     void CreateTexture()
@@ -59,9 +58,7 @@ public class PaintCanvas
             Raylib.UnloadTexture(texture);
             textureCreated = false;
         }
-        var img = Raylib.GenImageColor(Bitmap.Width, Bitmap.Height, Color.White);
-        texture = Raylib.LoadTextureFromImage(img);
-        Raylib.UnloadImage(img);
+        texture = TextureSlotManager.BitmapToTexture(Bitmap);
         Raylib.SetTextureFilter(texture, textureFilter);
         textureCreated = true;
     }
@@ -96,7 +93,7 @@ public class PaintCanvas
 
     public void BeginStroke()
     {
-        lastPaintPos = null;
+        lastPaintPosition = null;
         PushUndo();
     }
 
@@ -104,26 +101,26 @@ public class PaintCanvas
     {
         using var canvas = new SKCanvas(Bitmap);
         using var paint = MakePaint();
-        var pos = new SKPoint(bitmapX, bitmapY);
+        var position = new SKPoint(bitmapX, bitmapY);
         if (ActiveTool == Tool.Pencil || ActiveTool == Tool.Eraser)
         {
-            if (lastPaintPos.HasValue)
+            if (lastPaintPosition.HasValue)
             {
-                canvas.DrawLine(lastPaintPos.Value, pos, paint);
+                canvas.DrawLine(lastPaintPosition.Value, position, paint);
             }
             else
             {
                 paint.Style = SKPaintStyle.Fill;
-                canvas.DrawCircle(pos, BrushSize / 2f, paint);
+                canvas.DrawCircle(position, BrushSize / 2f, paint);
             }
         }
-        lastPaintPos = pos;
+        lastPaintPosition = position;
         isDirty = true;
     }
 
     public void EndStroke()
     {
-        lastPaintPos = null;
+        lastPaintPosition = null;
     }
 
     public void FloodFill(int x, int y)
@@ -136,25 +133,25 @@ public class PaintCanvas
             return;
         }
 
-        var stack = new Stack<(int x, int y)>();
-        stack.Push((x, y));
-        int w = Bitmap.Width, h = Bitmap.Height;
-        while (stack.Count > 0)
+        var pendingPixels = new Stack<(int x, int y)>();
+        pendingPixels.Push((x, y));
+        int bitmapWidth = Bitmap.Width, bitmapHeight = Bitmap.Height;
+        while (pendingPixels.Count > 0)
         {
-            var (cx, cy) = stack.Pop();
-            if (cx < 0 || cx >= w || cy < 0 || cy >= h)
+            var (pixelX, pixelY) = pendingPixels.Pop();
+            if (pixelX < 0 || pixelX >= bitmapWidth || pixelY < 0 || pixelY >= bitmapHeight)
             {
                 continue;
             }
-            if (Bitmap.GetPixel(cx, cy) != targetColor)
+            if (Bitmap.GetPixel(pixelX, pixelY) != targetColor)
             {
                 continue;
             }
-            Bitmap.SetPixel(cx, cy, fillColor);
-            stack.Push((cx + 1, cy));
-            stack.Push((cx - 1, cy));
-            stack.Push((cx, cy + 1));
-            stack.Push((cx, cy - 1));
+            Bitmap.SetPixel(pixelX, pixelY, fillColor);
+            pendingPixels.Push((pixelX + 1, pixelY));
+            pendingPixels.Push((pixelX - 1, pixelY));
+            pendingPixels.Push((pixelX, pixelY + 1));
+            pendingPixels.Push((pixelX, pixelY - 1));
         }
         isDirty = true;
     }
@@ -188,11 +185,11 @@ public class PaintCanvas
         redoStack.Clear();
         if (undoStack.Count > MaxUndoSteps)
         {
-            var temp = undoStack.ToArray();
+            var undoSnapshots = undoStack.ToArray();
             undoStack.Clear();
-            foreach (var s in temp.Take(MaxUndoSteps - 1).Reverse())
+            foreach (var snapshot in undoSnapshots.Take(MaxUndoSteps - 1).Reverse())
             {
-                undoStack.Push(s);
+                undoStack.Push(snapshot);
             }
         }
     }
@@ -222,15 +219,15 @@ public class PaintCanvas
         isDirty = true;
     }
 
-    void RestoreBitmap(byte[] data)
+    void RestoreBitmap(byte[] bitmapBytes)
     {
-        var copy = data.ToArray();
-        var handle = GCHandle.Alloc(copy, GCHandleType.Pinned);
+        var pixelCopy = bitmapBytes.ToArray();
+        var handle = GCHandle.Alloc(pixelCopy, GCHandleType.Pinned);
         Bitmap.InstallPixels(
             Bitmap.Info,
             handle.AddrOfPinnedObject(),
             Bitmap.RowBytes,
-            (addr, ctx) => ((GCHandle)ctx).Free(),
+            (pixelAddress, handleContext) => ((GCHandle)handleContext).Free(),
             (object)handle);
     }
 
@@ -243,8 +240,8 @@ public class PaintCanvas
         }
 
         string path = result.Path;
-        string ext = Path.GetExtension(path).ToLowerInvariant();
-        SKEncodedImageFormat format = ext switch {
+        string extension = Path.GetExtension(path).ToLowerInvariant();
+        SKEncodedImageFormat format = extension switch {
             ".webp" => SKEncodedImageFormat.Webp,
             ".jpg" or ".jpeg" => SKEncodedImageFormat.Jpeg,
             _ => SKEncodedImageFormat.Png,

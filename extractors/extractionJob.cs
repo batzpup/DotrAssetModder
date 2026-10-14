@@ -15,8 +15,8 @@ public sealed class ExtractionProgress
     {
         get
         {
-            int t = Total;
-            return t <= 0 ? 0f : (float)Done / t;
+            int totalCount = Total;
+            return totalCount <= 0 ? 0f : (float)Done / totalCount;
         }
     }
 
@@ -42,11 +42,11 @@ public sealed class ExtractionJob
         Progress = progress;
     }
 
-    public static ExtractionJob Start(byte[] data, string outDir, string stem, IList<string>? names = null)
+    public static ExtractionJob Start(byte[] assetBytes, string outputDirectory, string fileNameStem, IList<string>? assetNames = null)
     {
         var progress = new ExtractionProgress();
         var extractor = new AssetExtractor();
-        var task = Task.Run(() => extractor.Extract(data, outDir, stem, names, progress));
+        var task = Task.Run(() => extractor.Extract(assetBytes, outputDirectory, fileNameStem, assetNames, progress));
         return new ExtractionJob(task, progress);
     }
 

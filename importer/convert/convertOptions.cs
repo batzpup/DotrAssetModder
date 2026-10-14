@@ -14,16 +14,16 @@ public sealed class ConvertOptions
     public double TranslateX;
     public double TranslateY;
     public double TranslateZ;
-    // Node 0 is the source's own origin. Where node 1 (what the game scales and turns the model
-    // about, and the camera aims at) sits, in game units from node 0; Move does not change it.
-    // The body stays put around node 0.
+    /* Where node 1 (what the game scales and turns the model about, and the camera aims at)
+       sits, in game units from node 0 (the source's own origin). Translate does not change it;
+       the body stays put around node 0. */
     public double[] PivotPoint = new double[3];
     // Bind at the first animation's frame 0 instead of the skin's bind pose.
     public bool RestFromAnim;
     // The source's UVs are already top-left (Unity rips; found by itself for FBX).
     public bool FlipUv;
     // Comma-separated animation names to keep, in this order; name=new renames.
-    public string? Anims;
+    public string? Animations;
     // Files of the same model to take animations from, matched by node name (3DS rips).
     public List<string> AnimsFrom = new List<string>();
 }

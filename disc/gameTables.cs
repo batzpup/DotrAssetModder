@@ -1,8 +1,9 @@
+using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-// Which disc this is. The tables below live at different addresses in every build, so nothing
-// here is read without a version. US is the only one measured; guessing the EU/JP addresses
-// would silently corrupt a disc.
+/* Which disc this is. The tables below live at different addresses in every build, so nothing
+   here is read without a version. US is the only one measured; guessed EU/JP addresses would
+   corrupt a disc. */
 public enum GameVersion
 {
     Unknown,
@@ -11,65 +12,62 @@ public enum GameVersion
     JpUnsupported, // SLPS/SLPM_*: the JP build names the tables but at other addresses
 }
 
-// Where each table is in one version's boot ELF: EE virtual addresses (DotR-PC
-// NOTES/model-mrg.md, NOTES/file-layer.md), turned into file offsets through the ELF's own
-// program headers.
+/* Where each table is in one version's boot ELF: EE virtual addresses (DotR-PC
+   NOTES/model-mrg.md, NOTES/file-layer.md), turned into file offsets through the ELF's own
+   program headers. */
 public class GameTableAddresses
 {
     public string BootElf;
-    public uint AnOfsModel;
+    public uint ModelMrgOffsets;
     public int ModelEntryCount;     // 81 entries + the file size terminator
-    public uint AnOfsStageCam;
+    public uint StageCamMrgOffsets;
     public int StageCamEntryCount;  // 10 + terminator
-    public uint AnOfsIcon;
+    public uint IconMrgOffsets;
     public int IconEntryCount;      // 4 + terminator
-    public uint AnOfsTexEtc;
+    public uint TexEtcMrgOffsets;
     public int TexEtcRegionCount;   // 3 regions: bounds[n]..bounds[n+1]
-    public uint PackFirst;          // first model id per pack
+    public uint FirstPack;          // first model id per pack
     public uint PackSubCount;       // sub-models bound per pack
     public uint PackOfsPointers;    // pointer to each pack's sub-offset table
     public int PackCount;
     public uint ShareData;          // load address + first pack index per model type
     public int ShareDataCount;
-    // SzModel_Load @ 0x1E8780, model type 1: lSzModel_LoadModelPack(id, path,
-    // 0x10AA800 + side * 0xA000, size, ofs, size). The two sides are 0xA000 apart, so a
-    // window can never exceed 0xA000 - and every retail window is exactly 0xA000.
+    /* SzModel_Load @ 0x1E8780, model type 1: lSzModel_LoadModelPack(id, path,
+       0x10AA800 + side * 0xA000, size, ofs, size). The two sides are 0xA000 apart, so a
+       window can never exceed 0xA000 - and every retail window is exactly 0xA000. */
     public uint WindowBufferBase;
     public uint WindowBufferSize;
-    // Same function, types 4-6: dest size and read size are both 0x100000.
-    public uint MonsterSlotSize;
-    // The message table (SzMsg_LoadFont_Pipe @ 0x1FD680): u32 offset[count], message i starts at
-    // blob + 2 * offset[i]. Card names are messages 320 + card id.
+    /* The message table (SzMsg_LoadFont_Pipe @ 0x1FD680): u32 offset[count], message i starts at
+       blob + 2 * offset[i]. Card names are messages 320 + card id. */
     public uint MessageOffsets;
     public uint MessageBlob;
     public int MessageCount;
     public int CardNameMessage;
-    // Target_Model_Y: one signed byte per card, how high the map (Home_Camp_3D_LeaderModel @
-    // 0x22B060) stands the deck leader's node 0 above the arena point (every ArenaYPos is 0),
-    // with the model at scale 0.5.
+    /* Target_Model_Y: one signed byte per card, how high the map (Home_Camp_3D_LeaderModel @
+       0x22B060) stands the deck leader's node 0 above the arena point (every ArenaYPos is 0),
+       with the model at scale 0.5. */
     public uint MapLeaderY;
     public int MapLeaderYCount;
-    // DuelistArenaDetailsArray: one 0x34-byte record per map arena: X, Y, Z (floats), then at
-    // +0x10 and +0x12 the two EVENT2 sub-models the map (Home_Camp_3D @ 0x22A710) draws there,
-    // a pedestal (8-10) and the marker on it (11-26).
+    /* DuelistArenaDetailsArray: one 0x34-byte record per map arena: X, Y, Z (floats), then at
+       +0x10 and +0x12 the two EVENT2 sub-models the map (Home_Camp_3D @ 0x22A710) draws there,
+       a pedestal (8-10) and the marker on it (11-26). */
     public uint Arenas;
     public int ArenaCount;
     public int ArenaStride;
 
-    public static readonly GameTableAddresses Us = new GameTableAddresses
+    public static readonly GameTableAddresses UsSlus20515 = new GameTableAddresses
     {
         BootElf = "SLUS_205.15",
-        AnOfsModel = 0x292A50, ModelEntryCount = 81,
-        AnOfsStageCam = 0x292170, StageCamEntryCount = 10,
-        AnOfsIcon = 0x29B050, IconEntryCount = 4,
-        AnOfsTexEtc = 0x293CC0, TexEtcRegionCount = 3,
-        PackFirst = 0x292CA0,
+        ModelMrgOffsets = 0x292A50, ModelEntryCount = 81,
+        StageCamMrgOffsets = 0x292170, StageCamEntryCount = 10,
+        IconMrgOffsets = 0x29B050, IconEntryCount = 4,
+        TexEtcMrgOffsets = 0x293CC0, TexEtcRegionCount = 3,
+        FirstPack = 0x292CA0,
         PackSubCount = 0x292DE0,
         PackOfsPointers = 0x292E80,
         PackCount = 39,
         ShareData = 0x292BA0, ShareDataCount = 7,
         WindowBufferBase = 0x10AA800, WindowBufferSize = 0xA000,
-        MonsterSlotSize = 0x100000,
         MessageOffsets = 0x2D19D0, MessageBlob = 0x2D49D4, MessageCount = 3073,
         CardNameMessage = 320,
         MapLeaderY = 0x299A30, MapLeaderYCount = 0x356,
@@ -80,7 +78,7 @@ public class GameTableAddresses
     {
         if (version == GameVersion.UsSlus20515)
         {
-            return Us;
+            return UsSlus20515;
         }
         if (version == GameVersion.EuUnsupported)
         {
@@ -94,10 +92,10 @@ public class GameTableAddresses
     }
 }
 
-// aShareData @ 0x292BA0 (US): 7 x { u32 EE load address, u16 first pack index, u16
-// invalidation mask }, one per model type. SzModel_LoadMerge reads pack `Base +
-// shareDataIndex` into `Buffer`; dest size = read size = the pack's own size, so there is NO
-// separate capacity constant for a pack in the ELF.
+/* aShareData @ 0x292BA0 (US): 7 x { u32 EE load address, u16 first pack index, u16
+   invalidation mask }, one per model type. SzModel_LoadMerge reads pack `Base +
+   shareDataIndex` into `Buffer`; dest size = read size = the pack's own size, so the ELF has
+   no separate capacity constant for a pack. */
 public class ShareDataEntry
 {
     public uint Buffer;
@@ -107,51 +105,54 @@ public class ShareDataEntry
 // Every table in the boot ELF that locates data on the disc, read out of the ELF.
 public class GameTables
 {
+    // One MONSTER.MRG slot (one card's RH0 block). SzModel_Load @ 0x1E8780, model types 4-6: dest
+    // size and read size are both 0x100000.
+    public const int MonsterSlotSize = 0x100000;
+
     public GameVersion Version;
     public GameTableAddresses Addresses;
     public string BootElfIsoPath;       // the disc path the ELF was read from
 
     // Each anOfs_* table is `entries + 1` u32: the last value is the file's size, which is what
     // lets a region be read as [table[n], table[n+1]).
-    public uint[] AnOfsModel;
-    public uint[] AnOfsStageCam;
-    public uint[] AnOfsIcon;
-    public uint[] AnOfsTexEtc;
-    public uint[] PackFirst;
+    public uint[] ModelMrgOffsets;
+    public uint[] StageCamMrgOffsets;
+    public uint[] IconMrgOffsets;
+    public uint[] TexEtcMrgOffsets;
+    public uint[] FirstPack;
     public uint[] PackSubCount;
     public uint[][] PackSubOffsets;     // one per pack: COUNT[p]+1 values, last = pack size
     public ShareDataEntry[] ShareData;
 
-    byte[] elf;
-    // Loadable pieces of the boot ELF, used to turn an EE virtual address into a file offset. The
-    // retail SLUS_205.15 has 835 program headers (one per overlay landing zone); exactly one has a
-    // non-zero file size, and that is the one that holds every table here. The mapping is still
-    // done through the headers rather than a hard-coded delta, because the JP/EU builds differ.
-    List<uint> segVa = new List<uint>();
-    List<uint> segOffset = new List<uint>();
-    List<uint> segSize = new List<uint>();
+    byte[] bootElfBytes;
+    /* Loadable pieces of the boot ELF, used to turn an EE virtual address into a file offset. The
+       retail SLUS_205.15 has 835 program headers (one per overlay landing zone); exactly one has a
+       non-zero file size, and it holds every table here. The mapping goes through the headers,
+       not a hard-coded delta, because the JP/EU builds differ. */
+    List<uint> segmentVirtualAddresses = new List<uint>();
+    List<uint> segmentFileOffsets = new List<uint>();
+    List<uint> segmentFileSizes = new List<uint>();
 
     public int ModelEntryCount => Addresses.ModelEntryCount;
     public int PackCount => Addresses.PackCount;
     public uint WindowBufferBase => Addresses.WindowBufferBase;
     public uint WindowBufferSize => Addresses.WindowBufferSize;
-    public uint MonsterSlotSize => Addresses.MonsterSlotSize;
 
     // SYSTEM.CNF is 57 bytes of "BOOT2 = cdrom0:\SLUS_205.15;1" and friends.
     public static string BootElfNameFrom(string systemCnf)
     {
         foreach (string line in systemCnf.Split('\n'))
         {
-            int eq = line.IndexOf('=');
-            if (eq < 0 || !line[..eq].Trim().Equals("BOOT2", StringComparison.OrdinalIgnoreCase))
+            int equalsIndex = line.IndexOf('=');
+            if (equalsIndex < 0 || !line[..equalsIndex].Trim().Equals("BOOT2", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
-            string value = line[(eq + 1)..].Trim().TrimEnd('\r');
-            int colon = value.IndexOf(':');
-            if (colon >= 0)
+            string value = line[(equalsIndex + 1)..].Trim().TrimEnd('\r');
+            int colonIndex = value.IndexOf(':');
+            if (colonIndex >= 0)
             {
-                value = value[(colon + 1)..];
+                value = value[(colonIndex + 1)..];
             }
             return IsoPaths.FileName(value.Replace('/', '\\'));
         }
@@ -160,21 +161,21 @@ public class GameTables
 
     public static GameVersion DetectVersion(FileLoader disc)
     {
-        var cnf = disc.Find("SYSTEM.CNF");
-        if (cnf is null)
+        var systemCnfFile = disc.Find("SYSTEM.CNF");
+        if (systemCnfFile is null)
         {
             return GameVersion.Unknown;
         }
-        string boot = BootElfNameFrom(System.Text.Encoding.ASCII.GetString(disc.ReadFile(cnf))).ToUpperInvariant();
-        if (boot == "SLUS_205.15")
+        string bootElfName = BootElfNameFrom(System.Text.Encoding.ASCII.GetString(disc.ReadFile(systemCnfFile))).ToUpperInvariant();
+        if (bootElfName == "SLUS_205.15")
         {
             return GameVersion.UsSlus20515;
         }
-        if (boot.StartsWith("SLES"))
+        if (bootElfName.StartsWith("SLES"))
         {
             return GameVersion.EuUnsupported;
         }
-        if (boot.StartsWith("SLPS") || boot.StartsWith("SLPM"))
+        if (bootElfName.StartsWith("SLPS") || bootElfName.StartsWith("SLPM"))
         {
             return GameVersion.JpUnsupported;
         }
@@ -189,9 +190,9 @@ public class GameTables
     }
 
     // For working on a loose ELF (OriginalGameData) with no disc.
-    public static GameTables FromElf(byte[] elf, GameVersion version)
+    public static GameTables FromElf(byte[] elfBytes, GameVersion version)
     {
-        return new GameTables(version, elf, GameTableAddresses.For(version).BootElf);
+        return new GameTables(version, elfBytes, GameTableAddresses.For(version).BootElf);
     }
 
     GameTables(GameVersion version, byte[] elfBytes, string bootElfIsoPath)
@@ -199,210 +200,210 @@ public class GameTables
         Version = version;
         Addresses = GameTableAddresses.For(version);
         BootElfIsoPath = bootElfIsoPath;
-        elf = elfBytes;
+        bootElfBytes = elfBytes;
 
-        if (elf.Length < 0x34 || elf[0] != 0x7F || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F')
+        if (bootElfBytes.Length < 0x34 || bootElfBytes[0] != 0x7F || bootElfBytes[1] != 'E' || bootElfBytes[2] != 'L' || bootElfBytes[3] != 'F')
         {
             throw new InvalidDataException("not an ELF");
         }
-        uint phOff = BitConverter.ToUInt32(elf, 0x1C);
-        ushort phEntSize = BitConverter.ToUInt16(elf, 0x2A);
-        ushort phNum = BitConverter.ToUInt16(elf, 0x2C);
-        for (int i = 0; i < phNum; i++)
+        uint programHeaderOffset = ReadU32(bootElfBytes, 0x1C);
+        ushort programHeaderEntrySize = ReadU16(bootElfBytes, 0x2A);
+        ushort programHeaderCount = ReadU16(bootElfBytes, 0x2C);
+        for (int i = 0; i < programHeaderCount; i++)
         {
-            int p = (int)phOff + i * phEntSize;
-            uint type = BitConverter.ToUInt32(elf, p);
-            uint fileSize = BitConverter.ToUInt32(elf, p + 16);
-            if (type == 1 && fileSize != 0)
+            int programHeaderFileOffset = (int)programHeaderOffset + i * programHeaderEntrySize;
+            uint segmentType = ReadU32(bootElfBytes, programHeaderFileOffset);
+            uint segmentFileSize = ReadU32(bootElfBytes, programHeaderFileOffset + 16);
+            if (segmentType == 1 && segmentFileSize != 0)
             {
-                segOffset.Add(BitConverter.ToUInt32(elf, p + 4));
-                segVa.Add(BitConverter.ToUInt32(elf, p + 8));
-                segSize.Add(fileSize);
+                segmentFileOffsets.Add(ReadU32(bootElfBytes, programHeaderFileOffset + 4));
+                segmentVirtualAddresses.Add(ReadU32(bootElfBytes, programHeaderFileOffset + 8));
+                segmentFileSizes.Add(segmentFileSize);
             }
         }
-        if (segVa.Count == 0)
+        if (segmentVirtualAddresses.Count == 0)
         {
             throw new InvalidDataException("ELF has no loadable segment with file contents");
         }
 
-        GameTableAddresses a = Addresses;
-        AnOfsModel = U32s(a.AnOfsModel, a.ModelEntryCount + 1);
-        AnOfsStageCam = U32s(a.AnOfsStageCam, a.StageCamEntryCount + 1);
-        AnOfsIcon = U32s(a.AnOfsIcon, a.IconEntryCount + 1);
-        AnOfsTexEtc = U32s(a.AnOfsTexEtc, a.TexEtcRegionCount + 1);
+        GameTableAddresses tableAddresses = Addresses;
+        ModelMrgOffsets = ReadU32Table(tableAddresses.ModelMrgOffsets, tableAddresses.ModelEntryCount + 1);
+        StageCamMrgOffsets = ReadU32Table(tableAddresses.StageCamMrgOffsets, tableAddresses.StageCamEntryCount + 1);
+        IconMrgOffsets = ReadU32Table(tableAddresses.IconMrgOffsets, tableAddresses.IconEntryCount + 1);
+        TexEtcMrgOffsets = ReadU32Table(tableAddresses.TexEtcMrgOffsets, tableAddresses.TexEtcRegionCount + 1);
 
-        PackFirst = U32s(a.PackFirst, a.PackCount);
-        PackSubCount = U32s(a.PackSubCount, a.PackCount);
-        uint[] packOfsPointers = U32s(a.PackOfsPointers, a.PackCount);
-        PackSubOffsets = new uint[a.PackCount][];
-        for (int p = 0; p < a.PackCount; p++)
+        FirstPack = ReadU32Table(tableAddresses.FirstPack, tableAddresses.PackCount);
+        PackSubCount = ReadU32Table(tableAddresses.PackSubCount, tableAddresses.PackCount);
+        uint[] packOfsPointers = ReadU32Table(tableAddresses.PackOfsPointers, tableAddresses.PackCount);
+        PackSubOffsets = new uint[tableAddresses.PackCount][];
+        for (int packIndex = 0; packIndex < tableAddresses.PackCount; packIndex++)
         {
-            PackSubOffsets[p] = U32s(packOfsPointers[p], (int)PackSubCount[p] + 1);
+            PackSubOffsets[packIndex] = ReadU32Table(packOfsPointers[packIndex], (int)PackSubCount[packIndex] + 1);
         }
 
-        ShareData = new ShareDataEntry[a.ShareDataCount];
-        int shareOffset = VaToOffset(a.ShareData);
-        for (int i = 0; i < a.ShareDataCount; i++)
+        ShareData = new ShareDataEntry[tableAddresses.ShareDataCount];
+        int shareOffset = VirtualAddressToFileOffset(tableAddresses.ShareData);
+        for (int i = 0; i < tableAddresses.ShareDataCount; i++)
         {
-            int p = shareOffset + i * 8;
+            int shareEntryFileOffset = shareOffset + i * 8;
             ShareData[i] = new ShareDataEntry
             {
-                Buffer = BitConverter.ToUInt32(elf, p),
-                Base = BitConverter.ToUInt16(elf, p + 4),
+                Buffer = ReadU32(bootElfBytes, shareEntryFileOffset),
+                Base = ReadU16(bootElfBytes, shareEntryFileOffset + 4),
             };
         }
     }
 
-    int VaToOffset(uint va)
+    int VirtualAddressToFileOffset(uint virtualAddress)
     {
-        for (int i = 0; i < segVa.Count; i++)
+        for (int i = 0; i < segmentVirtualAddresses.Count; i++)
         {
-            if (va >= segVa[i] && va < segVa[i] + segSize[i])
+            if (virtualAddress >= segmentVirtualAddresses[i] && virtualAddress < segmentVirtualAddresses[i] + segmentFileSizes[i])
             {
-                return (int)(segOffset[i] + (va - segVa[i]));
+                return (int)(segmentFileOffsets[i] + (virtualAddress - segmentVirtualAddresses[i]));
             }
         }
-        throw new ArgumentOutOfRangeException(nameof(va), $"0x{va:X8} is not inside any loadable segment");
+        throw new ArgumentOutOfRangeException(nameof(virtualAddress), $"0x{virtualAddress:X8} is not inside any loadable segment");
     }
 
-    uint[] U32s(uint address, int count)
+    uint[] ReadU32Table(uint address, int count)
     {
-        int p = VaToOffset(address);
+        int tableFileOffset = VirtualAddressToFileOffset(address);
         uint[] values = new uint[count];
         for (int i = 0; i < count; i++)
         {
-            values[i] = BitConverter.ToUInt32(elf, p + i * 4);
+            values[i] = ReadU32(bootElfBytes, tableFileOffset + i * 4);
         }
         return values;
     }
 
-    // Byte range of MODEL.MRG entry `i` (packs 0-38, then the 42 windows).
-    public (uint Offset, uint Size) ModelEntry(int i)
+    // Byte range of MODEL.MRG entry `entryIndex` (packs 0-38, then the 42 windows).
+    public (uint Offset, uint Size) ModelEntry(int entryIndex)
     {
-        return (AnOfsModel[i], AnOfsModel[i + 1] - AnOfsModel[i]);
+        return (ModelMrgOffsets[entryIndex], ModelMrgOffsets[entryIndex + 1] - ModelMrgOffsets[entryIndex]);
     }
 
-    public (uint Offset, uint Size) TexEtcRegion(int i)
+    public (uint Offset, uint Size) TexEtcRegion(int regionIndex)
     {
-        return (AnOfsTexEtc[i], AnOfsTexEtc[i + 1] - AnOfsTexEtc[i]);
+        return (TexEtcMrgOffsets[regionIndex], TexEtcMrgOffsets[regionIndex + 1] - TexEtcMrgOffsets[regionIndex]);
     }
 
-    // ---- messages (DotR-PC tools/usmsg.py, NOTES/cards.md) -------------------------------------
-    // Each u16 word: bit 15 last word, bit 14 a two-word back-reference (`w & 0x3F` words,
-    // starting `(w & 0x1FFF) >> 6` words into message `next & 0x3FFF`), bits 0-12 the glyph.
-    // There is no character table: a glyph index is the character.
-    const int MsgEnd = 0x8000;
-    const int MsgRef = 0x4000;
+    /* ---- messages (DotR-PC tools/usmsg.py, NOTES/cards.md) ----
+       Each u16 word: bit 15 last word, bit 14 a two-word back-reference (`w & 0x3F` words,
+       starting `(w & 0x1FFF) >> 6` words into message `next & 0x3FFF`), bits 0-12 the glyph.
+       There is no character table: a glyph index is the character. */
+    const int MessageEndFlag = 0x8000;
+    const int MessageReferenceFlag = 0x4000;
     const int NameBuffer = 2;   // message the game writes the player's name into at runtime
 
-    static string[] glyphs;
+    static string[] cachedGlyphs;
 
     static string[] Glyphs()
     {
-        if (glyphs != null)
+        if (cachedGlyphs != null)
         {
-            return glyphs;
+            return cachedGlyphs;
         }
-        string[] g = new string[0x2000];
-        g[0] = "\n";
-        g[1] = "○";
-        g[2] = ",";
-        g[3] = "●";
-        g[335] = "∞";
-        g[336] = "?";
-        g[337] = "?";
-        g[338] = ":";
-        g[339] = "…";
-        g[348] = "・";
-        g[361] = "α";
-        g[362] = "<";
-        g[363] = ">";
-        g[364] = "3.";
-        g[365] = "□";
-        g[366] = "△";
-        g[367] = "×";
-        g[368] = ";";
-        string upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        string lower = "abcdefghijklmnopqrstuvwxyz";
+        string[] glyphTable = new string[0x2000];
+        glyphTable[0] = "\n";
+        glyphTable[1] = "○";
+        glyphTable[2] = ",";
+        glyphTable[3] = "●";
+        glyphTable[335] = "∞";
+        glyphTable[336] = "?";
+        glyphTable[337] = "?";
+        glyphTable[338] = ":";
+        glyphTable[339] = "…";
+        glyphTable[348] = "・";
+        glyphTable[361] = "α";
+        glyphTable[362] = "<";
+        glyphTable[363] = ">";
+        glyphTable[364] = "3.";
+        glyphTable[365] = "□";
+        glyphTable[366] = "△";
+        glyphTable[367] = "×";
+        glyphTable[368] = ";";
+        string uppercaseLetters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        string lowercaseLetters = "abcdefghijklmnopqrstuvwxyz";
         // Full-width set. 30 is an empty bitmap: a full-width space.
-        string full = upper + "　[]" + lower + "()" + "123456789" + "0!\"#$%&'=^-¥,./_";
+        string fullWidthGlyphs = uppercaseLetters + "　[]" + lowercaseLetters + "()" + "123456789" + "0!\"#$%&'=^-¥,./_";
         // Half-width set: the same order, but it has no comma.
-        string half = upper + " []" + lower + "()" + "123456789" + "0!\"#$%&'=^-¥./_";
-        for (int i = 0; i < full.Length; i++)
+        string halfWidthGlyphs = uppercaseLetters + " []" + lowercaseLetters + "()" + "123456789" + "0!\"#$%&'=^-¥./_";
+        for (int i = 0; i < fullWidthGlyphs.Length; i++)
         {
-            g[4 + i] = full[i].ToString();
+            glyphTable[4 + i] = fullWidthGlyphs[i].ToString();
         }
-        for (int i = 0; i < half.Length; i++)
+        for (int i = 0; i < halfWidthGlyphs.Length; i++)
         {
-            g[86 + i] = half[i].ToString();
+            glyphTable[86 + i] = halfWidthGlyphs[i].ToString();
         }
-        glyphs = g;
-        return g;
+        cachedGlyphs = glyphTable;
+        return glyphTable;
     }
 
     int MessageWord(int fileOffset)
     {
-        return BitConverter.ToUInt16(elf, fileOffset);
+        return ReadU16(bootElfBytes, fileOffset);
     }
 
-    int MessageStart(int i)
+    int MessageStart(int messageIndex)
     {
-        uint offset = BitConverter.ToUInt32(elf, VaToOffset(Addresses.MessageOffsets) + 4 * i);
-        return VaToOffset(Addresses.MessageBlob) + 2 * (int)offset;
+        uint messageWordOffset = ReadU32(bootElfBytes, VirtualAddressToFileOffset(Addresses.MessageOffsets) + 4 * messageIndex);
+        return VirtualAddressToFileOffset(Addresses.MessageBlob) + 2 * (int)messageWordOffset;
     }
 
-    // Appends one element at `at`; returns how many words it took.
-    int MessageElement(int at, System.Text.StringBuilder sb)
+    // Appends one element at `elementFileOffset`; returns how many words it took.
+    int MessageElement(int elementFileOffset, System.Text.StringBuilder stringBuilder)
     {
-        int w = MessageWord(at);
-        if ((w & MsgRef) != 0)
+        int messageWord = MessageWord(elementFileOffset);
+        if ((messageWord & MessageReferenceFlag) != 0)
         {
-            int target = MessageWord(at + 2) & 0x3FFF;
-            int skip = (w & 0x1FFF) >> 6;
-            int left = w & 0x3F;
-            if (target == NameBuffer)
+            int referencedMessage = MessageWord(elementFileOffset + 2) & 0x3FFF;
+            int wordsToSkip = (messageWord & 0x1FFF) >> 6;
+            int wordsLeft = messageWord & 0x3F;
+            if (referencedMessage == NameBuffer)
             {
-                sb.Append("{NAME}");
+                stringBuilder.Append("{NAME}");
                 return 2;
             }
-            int src = MessageStart(target) + 2 * skip;
-            while (left > 0)
+            int sourceFileOffset = MessageStart(referencedMessage) + 2 * wordsToSkip;
+            while (wordsLeft > 0)
             {
-                int n = MessageElement(src, sb);
-                if ((MessageWord(src + 2 * (n - 1)) & MsgEnd) != 0)
+                int wordsTaken = MessageElement(sourceFileOffset, stringBuilder);
+                if ((MessageWord(sourceFileOffset + 2 * (wordsTaken - 1)) & MessageEndFlag) != 0)
                 {
                     break;
                 }
-                left -= n;
-                src += 2 * n;
+                wordsLeft -= wordsTaken;
+                sourceFileOffset += 2 * wordsTaken;
             }
             return 2;
         }
-        int code = w & 0x1FFF;
-        string? c = Glyphs()[code];
-        if (c == null)
+        int code = messageWord & 0x1FFF;
+        string? glyphText = Glyphs()[code];
+        if (glyphText == null)
         {
-            sb.Append($"<{code}>");
+            stringBuilder.Append($"<{code}>");
         }
         else
         {
-            sb.Append(c);
+            stringBuilder.Append(glyphText);
         }
         return 1;
     }
 
-    public string Message(int i)
+    public string Message(int messageIndex)
     {
-        var sb = new System.Text.StringBuilder();
-        int at = MessageStart(i);
+        var stringBuilder = new System.Text.StringBuilder();
+        int elementFileOffset = MessageStart(messageIndex);
         while (true)
         {
-            int n = MessageElement(at, sb);
-            if ((MessageWord(at + 2 * (n - 1)) & MsgEnd) != 0)
+            int wordsTaken = MessageElement(elementFileOffset, stringBuilder);
+            if ((MessageWord(elementFileOffset + 2 * (wordsTaken - 1)) & MessageEndFlag) != 0)
             {
-                return sb.ToString();
+                return stringBuilder.ToString();
             }
-            at += 2 * n;
+            elementFileOffset += 2 * wordsTaken;
         }
     }
 
@@ -413,30 +414,30 @@ public class GameTables
         {
             return 0;
         }
-        return (sbyte)elf[MapLeaderYOffset(cardId)];
+        return (sbyte)bootElfBytes[MapLeaderYOffset(cardId)];
     }
 
     // Where card `cardId`'s Target_Model_Y byte is in the boot ELF file.
     public int MapLeaderYOffset(int cardId)
     {
-        return VaToOffset(Addresses.MapLeaderY) + cardId;
+        return VirtualAddressToFileOffset(Addresses.MapLeaderY) + cardId;
     }
 
     // Changes the map height in the ELF read here only; saving it to the disc is the caller's.
     public void SetMapLeaderY(int cardId, int y)
     {
-        elf[MapLeaderYOffset(cardId)] = (byte)(sbyte)y;
+        bootElfBytes[MapLeaderYOffset(cardId)] = (byte)(sbyte)y;
     }
 
     // Where map arena `arena` is, and the two EVENT2 sub-models drawn there.
     public void Arena(int arena, out float x, out float y, out float z, out int pedestal, out int marker)
     {
-        int p = VaToOffset(Addresses.Arenas) + arena * Addresses.ArenaStride;
-        x = BitConverter.ToSingle(elf, p);
-        y = BitConverter.ToSingle(elf, p + 4);
-        z = BitConverter.ToSingle(elf, p + 8);
-        pedestal = BitConverter.ToInt16(elf, p + 0x10);
-        marker = BitConverter.ToInt16(elf, p + 0x12);
+        int arenaFileOffset = VirtualAddressToFileOffset(Addresses.Arenas) + arena * Addresses.ArenaStride;
+        x = ReadF32(bootElfBytes, arenaFileOffset);
+        y = ReadF32(bootElfBytes, arenaFileOffset + 4);
+        z = ReadF32(bootElfBytes, arenaFileOffset + 8);
+        pedestal = ReadI16(bootElfBytes, arenaFileOffset + 0x10);
+        marker = ReadI16(bootElfBytes, arenaFileOffset + 0x12);
     }
 
     public string CardName(int cardId)

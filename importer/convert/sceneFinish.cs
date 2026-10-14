@@ -1,11 +1,11 @@
 namespace DotrAssetModder;
 // Mostly AI
 
-// The DotR layout step, a port of tools/toglb.py's pose_worlds / skin_blend / posed_points /
-// rebind / finish (DotR-PC). Rest pose -> bind pose, nodes that hold nothing folded into their
-// children, axes -> +Y up / +Z front, scale.
+/* The DotR layout step, a port of tools/toglb.py's pose_worlds / skin_blend / posed_points /
+   rebind / finish (DotR-PC). Rest pose -> bind pose, nodes that hold nothing folded into their
+   children, axes -> +Y up / +Z front, scale. */
 
-// What finish() measured while it fitted the model.
+// What Finish measured while it fitted the model.
 public sealed class SceneFit
 {
     public double Scale;
@@ -16,26 +16,26 @@ public sealed class SceneFit
 public static class SceneFinish
 {
     // World matrix of every node at a frame of `anim` (null: the rest pose).
-    public static Mat4[] PoseWorlds(Scene sc, SceneAnim? anim, int frame)
+    public static Matrix4[] PoseWorlds(Scene scene, SceneAnim? anim, int frame)
     {
-        int n = sc.Nodes.Count;
-        Mat4[] world = new Mat4[n];
-        List<int> order = sc.Order();
+        int nodeCount = scene.Nodes.Count;
+        Matrix4[] world = new Matrix4[nodeCount];
+        List<int> order = scene.Order();
         foreach (int i in order)
         {
-            Mat4 local = sc.Nodes[i].Local;
+            Matrix4 local = scene.Nodes[i].Local;
             if (anim != null)
             {
-                Mat4[]? tr;
-                if (anim.Tracks.TryGetValue(i, out tr))
+                Matrix4[]? track;
+                if (anim.Tracks.TryGetValue(i, out track))
                 {
-                    local = tr[frame];
+                    local = track[frame];
                 }
             }
-            int p = sc.Nodes[i].Parent;
-            if (p >= 0)
+            int parentIndex = scene.Nodes[i].Parent;
+            if (parentIndex >= 0)
             {
-                world[i] = world[p] * local;
+                world[i] = world[parentIndex] * local;
             }
             else
             {
@@ -47,176 +47,176 @@ public static class SceneFinish
 
     // Per-vertex skinning matrix (16 doubles a vertex, row-major): sum of weight * world *
     // inverse(rest world).
-    public static double[] SkinBlend(SceneMesh m, Mat4[] world, Mat4[] restWorld, int n)
+    public static double[] SkinBlend(SceneMesh mesh, Matrix4[] world, Matrix4[] restWorld, int nodeCount)
     {
-        int verts = m.VertexCount;
-        double[] mats = new double[(n + 1) * 16]; // index n: no influence
-        bool[] seen = new bool[n];
-        int[] jnt = m.Jnt!;
-        double[] wgt = m.Wgt!;
-        for (int k = 0; k < jnt.Length; k++)
+        int vertexCount = mesh.VertexCount;
+        double[] jointMatrices = new double[(nodeCount + 1) * 16]; // index n: no influence
+        bool[] jointSeen = new bool[nodeCount];
+        int[] joints = mesh.Joints!;
+        double[] jointWeights = mesh.Weights!;
+        for (int k = 0; k < joints.Length; k++)
         {
-            int j = jnt[k];
-            if (j < 0 || seen[j])
+            int j = joints[k];
+            if (j < 0 || jointSeen[j])
             {
                 continue;
             }
-            seen[j] = true;
-            Mat4 b = world[j] * restWorld[j].Inverse();
-            for (int t = 0; t < 16; t++)
+            jointSeen[j] = true;
+            Matrix4 skinMatrix = world[j] * restWorld[j].Inverse();
+            for (int element = 0; element < 16; element++)
             {
-                mats[j * 16 + t] = b.M[t];
+                jointMatrices[j * 16 + element] = skinMatrix.Elements[element];
             }
         }
-        double[] blend = new double[verts * 16];
-        for (int v = 0; v < verts; v++)
+        double[] blendMatrices = new double[vertexCount * 16];
+        for (int vertex = 0; vertex < vertexCount; vertex++)
         {
             for (int k = 0; k < 8; k++)
             {
-                double w = wgt[v * 8 + k];
-                int j = jnt[v * 8 + k];
-                int idx = n;
+                double w = jointWeights[vertex * 8 + k];
+                int j = joints[vertex * 8 + k];
+                int matrixSlot = nodeCount;
                 if (j >= 0)
                 {
-                    idx = j;
+                    matrixSlot = j;
                 }
-                for (int t = 0; t < 16; t++)
+                for (int element = 0; element < 16; element++)
                 {
-                    blend[v * 16 + t] += w * mats[idx * 16 + t];
+                    blendMatrices[vertex * 16 + element] += w * jointMatrices[matrixSlot * 16 + element];
                 }
             }
         }
-        return blend;
+        return blendMatrices;
     }
 
     // Every mesh vertex in world space (3 doubles a vertex), at a frame of `anim` (null: the
     // rest pose).
-    public static double[] PosedPoints(Scene sc, Mat4[] restWorld, SceneAnim? anim, int frame)
+    public static double[] PosedPoints(Scene scene, Matrix4[] restWorld, SceneAnim? anim, int frame)
     {
-        Mat4[] world = PoseWorlds(sc, anim, frame);
+        Matrix4[] world = PoseWorlds(scene, anim, frame);
         int total = 0;
-        foreach (SceneMesh m in sc.Meshes)
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            total += m.VertexCount;
+            total += mesh.VertexCount;
         }
-        double[] pts = new double[total * 3];
-        int at = 0;
-        foreach (SceneMesh m in sc.Meshes)
+        double[] points = new double[total * 3];
+        int pointCursor = 0;
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            int verts = m.VertexCount;
-            if (m.Skinned)
+            int vertexCount = mesh.VertexCount;
+            if (mesh.Skinned)
             {
-                double[] blend = SkinBlend(m, world, restWorld, sc.Nodes.Count);
-                for (int v = 0; v < verts; v++)
+                double[] blendMatrices = SkinBlend(mesh, world, restWorld, scene.Nodes.Count);
+                for (int vertex = 0; vertex < vertexCount; vertex++)
                 {
-                    double x = m.Pos[v * 3];
-                    double y = m.Pos[v * 3 + 1];
-                    double z = m.Pos[v * 3 + 2];
-                    int b = v * 16;
-                    pts[at] = blend[b] * x + blend[b + 1] * y + blend[b + 2] * z + blend[b + 3];
-                    pts[at + 1] = blend[b + 4] * x + blend[b + 5] * y + blend[b + 6] * z + blend[b + 7];
-                    pts[at + 2] = blend[b + 8] * x + blend[b + 9] * y + blend[b + 10] * z + blend[b + 11];
-                    at += 3;
+                    double x = mesh.Positions[vertex * 3];
+                    double y = mesh.Positions[vertex * 3 + 1];
+                    double z = mesh.Positions[vertex * 3 + 2];
+                    int blendOffset = vertex * 16;
+                    points[pointCursor] = blendMatrices[blendOffset] * x + blendMatrices[blendOffset + 1] * y + blendMatrices[blendOffset + 2] * z + blendMatrices[blendOffset + 3];
+                    points[pointCursor + 1] = blendMatrices[blendOffset + 4] * x + blendMatrices[blendOffset + 5] * y + blendMatrices[blendOffset + 6] * z + blendMatrices[blendOffset + 7];
+                    points[pointCursor + 2] = blendMatrices[blendOffset + 8] * x + blendMatrices[blendOffset + 9] * y + blendMatrices[blendOffset + 10] * z + blendMatrices[blendOffset + 11];
+                    pointCursor += 3;
                 }
             }
             else
             {
-                Mat4 w = world[m.Node];
-                for (int v = 0; v < verts; v++)
+                Matrix4 w = world[mesh.Node];
+                for (int vertex = 0; vertex < vertexCount; vertex++)
                 {
-                    w.TransformPoint(m.Pos[v * 3], m.Pos[v * 3 + 1], m.Pos[v * 3 + 2],
-                        out pts[at], out pts[at + 1], out pts[at + 2]);
-                    at += 3;
+                    w.TransformPoint(mesh.Positions[vertex * 3], mesh.Positions[vertex * 3 + 1], mesh.Positions[vertex * 3 + 2],
+                        out points[pointCursor], out points[pointCursor + 1], out points[pointCursor + 2]);
+                    pointCursor += 3;
                 }
             }
         }
-        return pts;
+        return points;
     }
 
     // Make frame 0 of `anim` the rest pose: skinned vertices are posed into it and every
     // animated node takes its frame-0 local. Returns the new rest world matrices.
-    public static Mat4[] Rebind(Scene sc, Mat4[] restWorld, SceneAnim anim, Action<string> warn)
+    public static Matrix4[] Rebind(Scene scene, Matrix4[] restWorld, SceneAnim anim, Action<string> warn)
     {
-        int n = sc.Nodes.Count;
-        Mat4[] world = PoseWorlds(sc, anim, 0);
-        foreach (SceneMesh m in sc.Meshes)
+        int nodeCount = scene.Nodes.Count;
+        Matrix4[] world = PoseWorlds(scene, anim, 0);
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            if (!m.Skinned)
+            if (!mesh.Skinned)
             {
                 continue;
             }
-            foreach (int j in UniqueJoints(m))
+            foreach (int j in UniqueJoints(mesh))
             {
-                Mat4 a = world[j];
-                double lo = double.MaxValue;
-                double hi = 0;
-                for (int c = 0; c < 3; c++)
+                Matrix4 jointWorld = world[j];
+                double smallestAxisScale = double.MaxValue;
+                double largestAxisScale = 0;
+                for (int column = 0; column < 3; column++)
                 {
-                    double norm = Math.Sqrt(a[0, c] * a[0, c] + a[1, c] * a[1, c] + a[2, c] * a[2, c]);
-                    if (norm < lo)
+                    double columnLength = Math.Sqrt(jointWorld[0, column] * jointWorld[0, column] + jointWorld[1, column] * jointWorld[1, column] + jointWorld[2, column] * jointWorld[2, column]);
+                    if (columnLength < smallestAxisScale)
                     {
-                        lo = norm;
+                        smallestAxisScale = columnLength;
                     }
-                    if (norm > hi)
+                    if (columnLength > largestAxisScale)
                     {
-                        hi = norm;
+                        largestAxisScale = columnLength;
                     }
                 }
-                if (!(hi > 0) || lo < hi * 1e-6)
+                if (!(largestAxisScale > 0) || smallestAxisScale < largestAxisScale * 1e-6)
                 {
-                    warn($"{anim.Name} frame 0 hides joint {sc.Nodes[j].Name} (scale 0); kept the bind pose as rest");
+                    warn($"{anim.Name} frame 0 hides joint {scene.Nodes[j].Name} (scale 0); kept the bind pose as rest");
                     return restWorld;
                 }
             }
         }
-        foreach (SceneMesh m in sc.Meshes)
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            if (!m.Skinned)
+            if (!mesh.Skinned)
             {
                 continue;
             }
-            double[] blend = SkinBlend(m, world, restWorld, n);
-            int verts = m.VertexCount;
-            double[] pos = new double[verts * 3];
-            double[] nrm = new double[verts * 3];
-            for (int v = 0; v < verts; v++)
+            double[] blendMatrices = SkinBlend(mesh, world, restWorld, nodeCount);
+            int vertexCount = mesh.VertexCount;
+            double[] positions = new double[vertexCount * 3];
+            double[] normals = new double[vertexCount * 3];
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                int b = v * 16;
-                double x = m.Pos[v * 3];
-                double y = m.Pos[v * 3 + 1];
-                double z = m.Pos[v * 3 + 2];
-                pos[v * 3] = blend[b] * x + blend[b + 1] * y + blend[b + 2] * z + blend[b + 3];
-                pos[v * 3 + 1] = blend[b + 4] * x + blend[b + 5] * y + blend[b + 6] * z + blend[b + 7];
-                pos[v * 3 + 2] = blend[b + 8] * x + blend[b + 9] * y + blend[b + 10] * z + blend[b + 11];
-                double nx = m.Nrm[v * 3];
-                double ny = m.Nrm[v * 3 + 1];
-                double nz = m.Nrm[v * 3 + 2];
-                double ox = blend[b] * nx + blend[b + 1] * ny + blend[b + 2] * nz;
-                double oy = blend[b + 4] * nx + blend[b + 5] * ny + blend[b + 6] * nz;
-                double oz = blend[b + 8] * nx + blend[b + 9] * ny + blend[b + 10] * nz;
-                double ln = Math.Sqrt(ox * ox + oy * oy + oz * oz);
-                if (ln > 1e-12)
+                int blendOffset = vertex * 16;
+                double x = mesh.Positions[vertex * 3];
+                double y = mesh.Positions[vertex * 3 + 1];
+                double z = mesh.Positions[vertex * 3 + 2];
+                positions[vertex * 3] = blendMatrices[blendOffset] * x + blendMatrices[blendOffset + 1] * y + blendMatrices[blendOffset + 2] * z + blendMatrices[blendOffset + 3];
+                positions[vertex * 3 + 1] = blendMatrices[blendOffset + 4] * x + blendMatrices[blendOffset + 5] * y + blendMatrices[blendOffset + 6] * z + blendMatrices[blendOffset + 7];
+                positions[vertex * 3 + 2] = blendMatrices[blendOffset + 8] * x + blendMatrices[blendOffset + 9] * y + blendMatrices[blendOffset + 10] * z + blendMatrices[blendOffset + 11];
+                double normalX = mesh.Normals[vertex * 3];
+                double normalY = mesh.Normals[vertex * 3 + 1];
+                double normalZ = mesh.Normals[vertex * 3 + 2];
+                double resultX = blendMatrices[blendOffset] * normalX + blendMatrices[blendOffset + 1] * normalY + blendMatrices[blendOffset + 2] * normalZ;
+                double resultY = blendMatrices[blendOffset + 4] * normalX + blendMatrices[blendOffset + 5] * normalY + blendMatrices[blendOffset + 6] * normalZ;
+                double resultZ = blendMatrices[blendOffset + 8] * normalX + blendMatrices[blendOffset + 9] * normalY + blendMatrices[blendOffset + 10] * normalZ;
+                double resultLength = Math.Sqrt(resultX * resultX + resultY * resultY + resultZ * resultZ);
+                if (resultLength > 1e-12)
                 {
-                    nrm[v * 3] = ox / ln;
-                    nrm[v * 3 + 1] = oy / ln;
-                    nrm[v * 3 + 2] = oz / ln;
+                    normals[vertex * 3] = resultX / resultLength;
+                    normals[vertex * 3 + 1] = resultY / resultLength;
+                    normals[vertex * 3 + 2] = resultZ / resultLength;
                 }
                 else
                 {
-                    nrm[v * 3] = nx;
-                    nrm[v * 3 + 1] = ny;
-                    nrm[v * 3 + 2] = nz;
+                    normals[vertex * 3] = normalX;
+                    normals[vertex * 3 + 1] = normalY;
+                    normals[vertex * 3 + 2] = normalZ;
                 }
             }
-            m.Pos = pos;
-            m.Nrm = nrm;
+            mesh.Positions = positions;
+            mesh.Normals = normals;
         }
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < nodeCount; i++)
         {
-            Mat4[]? tr;
-            if (anim.Tracks.TryGetValue(i, out tr))
+            Matrix4[]? track;
+            if (anim.Tracks.TryGetValue(i, out track))
             {
-                sc.Nodes[i].Local = tr[0].Copy();
+                scene.Nodes[i].Local = track[0].Copy();
             }
         }
         return world;
@@ -224,81 +224,81 @@ public static class SceneFinish
 
     // Rest pose -> bind pose, axes -> +Y up / +Z front, scale, then the model moved by translate
     // (game units, after the turn and scale).
-    public static SceneFit Finish(Scene sc, double scale, double[] rotate,
+    public static SceneFit Finish(Scene scene, double scale, double[] rotate,
         double[] translate, bool restFromAnim, Action<string> warn)
     {
-        List<int> order = sc.Order();
-        int n = sc.Nodes.Count;
-        Mat4[] world = new Mat4[n];
-        Mat4[] local = new Mat4[n];
-        for (int i = 0; i < n; i++)
+        List<int> order = scene.Order();
+        int nodeCount = scene.Nodes.Count;
+        Matrix4[] world = new Matrix4[nodeCount];
+        Matrix4[] local = new Matrix4[nodeCount];
+        for (int i = 0; i < nodeCount; i++)
         {
-            world[i] = Mat4.Identity();
-            local[i] = Mat4.Identity();
+            world[i] = Matrix4.Identity();
+            local[i] = Matrix4.Identity();
         }
         foreach (int i in order)
         {
-            int p = sc.Nodes[i].Parent;
-            Mat4 baseWorld = Mat4.Identity();
-            if (p >= 0)
+            int parentIndex = scene.Nodes[i].Parent;
+            Matrix4 baseWorld = Matrix4.Identity();
+            if (parentIndex >= 0)
             {
-                baseWorld = world[p];
+                baseWorld = world[parentIndex];
             }
-            if (sc.Nodes[i].Bind != null)
+            if (scene.Nodes[i].Bind != null)
             {
-                world[i] = sc.Nodes[i].Bind!;
+                world[i] = scene.Nodes[i].Bind!;
             }
             else
             {
-                world[i] = baseWorld * sc.Nodes[i].Local;
+                world[i] = baseWorld * scene.Nodes[i].Local;
             }
             local[i] = baseWorld.Inverse() * world[i];
         }
-        foreach (SceneAnim anim in sc.Anims)
+        foreach (SceneAnim anim in scene.Anims)
         {
-            for (int i = 0; i < n; i++)
+            for (int i = 0; i < nodeCount; i++)
             {
-                if (!anim.Tracks.ContainsKey(i) && !Mat4.AllClose(local[i], sc.Nodes[i].Local, 1e-6))
+                if (!anim.Tracks.ContainsKey(i) && !Matrix4.AllClose(local[i], scene.Nodes[i].Local, 1e-6))
                 {
-                    anim.Tracks[i] = Repeat(sc.Nodes[i].Local, anim.Frames);
+                    anim.Tracks[i] = Repeat(scene.Nodes[i].Local, anim.Frames);
                 }
             }
         }
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < nodeCount; i++)
         {
-            sc.Nodes[i].Local = local[i];
+            scene.Nodes[i].Local = local[i];
         }
 
-        // Fold every node that is neither a joint nor a rigid mesh's node into its children. An
-        // exporter's axis turn rides on such nodes (Blender's armature object at -90 X, undone
-        // by +90 X on the root bone), so a viewer or importer that treats them differently
-        // sees the model lying down; folded, the bones carry the real turn themselves.
+        /* Fold every node that is neither a joint nor a rigid mesh's node into its children. An
+           exporter's axis turn rides on such nodes (Blender's armature object at -90 X, undone
+           by +90 X on the root bone), so a viewer or importer that treats them differently
+           sees the model lying down; folded, the bones carry the real turn themselves. */
         HashSet<int> used = new HashSet<int>();
-        foreach (SceneMesh m in sc.Meshes)
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            if (m.Skinned)
+            if (mesh.Skinned)
             {
-                foreach (int j in UniqueJoints(m))
+                foreach (int j in UniqueJoints(mesh))
                 {
                     used.Add(j);
                 }
             }
             else
             {
-                used.Add(m.Node);
+                used.Add(mesh.Node);
             }
         }
         // Top-down, a node's children are still its original ones when it is reached.
-        List<int>[] kids = new List<int>[n];
-        for (int i = 0; i < n; i++)
+        List<int>[] children = new List<int>[nodeCount];
+        for (int i = 0; i < nodeCount; i++)
         {
-            kids[i] = new List<int>();
+            children[i] = new List<int>();
         }
         foreach (int i in order)
         {
-            if (sc.Nodes[i].Parent >= 0)
+            if (scene.Nodes[i].Parent >= 0)
             {
-                kids[sc.Nodes[i].Parent].Add(i);
+                children[scene.Nodes[i].Parent].Add(i);
             }
         }
         foreach (int i in order)
@@ -307,299 +307,299 @@ public static class SceneFinish
             {
                 continue;
             }
-            foreach (int kid in kids[i])
+            foreach (int child in children[i])
             {
-                foreach (SceneAnim anim in sc.Anims)
+                foreach (SceneAnim anim in scene.Anims)
                 {
-                    if (anim.Tracks.ContainsKey(i) || anim.Tracks.ContainsKey(kid))
+                    if (anim.Tracks.ContainsKey(i) || anim.Tracks.ContainsKey(child))
                     {
-                        Mat4[] pt = TrackOr(anim, i, sc.Nodes[i].Local);
-                        Mat4[] ct = TrackOr(anim, kid, sc.Nodes[kid].Local);
-                        Mat4[] both = new Mat4[anim.Frames];
-                        for (int f = 0; f < anim.Frames; f++)
+                        Matrix4[] parentTrack = TrackOrRest(anim, i, scene.Nodes[i].Local);
+                        Matrix4[] childTrack = TrackOrRest(anim, child, scene.Nodes[child].Local);
+                        Matrix4[] combinedTrack = new Matrix4[anim.Frames];
+                        for (int frame = 0; frame < anim.Frames; frame++)
                         {
-                            both[f] = pt[f] * ct[f];
+                            combinedTrack[frame] = parentTrack[frame] * childTrack[frame];
                         }
-                        anim.Tracks[kid] = both;
+                        anim.Tracks[child] = combinedTrack;
                     }
                 }
-                sc.Nodes[kid].Local = sc.Nodes[i].Local * sc.Nodes[kid].Local;
-                sc.Nodes[kid].Parent = sc.Nodes[i].Parent;
+                scene.Nodes[child].Local = scene.Nodes[i].Local * scene.Nodes[child].Local;
+                scene.Nodes[child].Parent = scene.Nodes[i].Parent;
             }
-            foreach (SceneAnim anim in sc.Anims)
+            foreach (SceneAnim anim in scene.Anims)
             {
                 anim.Tracks.Remove(i);
             }
         }
-        order = sc.Order();
+        order = scene.Order();
 
-        // The importer binds at the rest pose. On request that is the first animation's frame
-        // 0 rather than the bind pose, for a bind pose the animations never show (a rip lying
-        // flat, stood up by the root bone's motion).
-        if (sc.Anims.Count > 0 && restFromAnim)
+        /* The importer binds at the rest pose. On request (restFromAnim) that is the first
+           animation's frame 0 rather than the bind pose, for a bind pose the animations never
+           show (a rip lying flat, stood up by the root bone's motion). */
+        if (scene.Anims.Count > 0 && restFromAnim)
         {
-            world = Rebind(sc, world, sc.Anims[0], warn);
+            world = Rebind(scene, world, scene.Anims[0], warn);
         }
 
         // The lowest point and size from the idle animation, the pose the model holds on the
         // field (an attack that reaches out would otherwise set it); the rest pose if there is none.
-        Mat4 rot = Mat4.Euler(rotate[0], rotate[1], rotate[2]) * sc.Axis;
-        if (sc.Meshes.Count == 0)
+        Matrix4 rotation = Matrix4.EulerAngles(rotate[0], rotate[1], rotate[2]) * scene.Axis;
+        if (scene.Meshes.Count == 0)
         {
             throw new InvalidDataException("no meshes found");
         }
-        SceneAnim? idle = IdleAnim(sc.Anims);
-        List<SceneAnim> sampled = sc.Anims;
-        if (idle != null)
+        SceneAnim? idleAnim = IdleAnim(scene.Anims);
+        List<SceneAnim> sampled = scene.Anims;
+        if (idleAnim != null)
         {
-            sampled = new List<SceneAnim> { idle };
+            sampled = new List<SceneAnim> { idleAnim };
         }
         List<double[]> idlePoses = new List<double[]>();
         foreach (SceneAnim anim in sampled)
         {
-            foreach (int f in SampleFrames(anim.Frames))
+            foreach (int frame in SampleFrames(anim.Frames))
             {
-                idlePoses.Add(Rotated(PosedPoints(sc, world, anim, f), rot));
+                idlePoses.Add(RotatedPoints(PosedPoints(scene, world, anim, frame), rotation));
             }
         }
         if (idlePoses.Count == 0)
         {
-            idlePoses.Add(Rotated(PosedPoints(sc, world, null, 0), rot));
+            idlePoses.Add(RotatedPoints(PosedPoints(scene, world, null, 0), rotation));
         }
-        double s = sc.Unit * scale;
+        double totalScale = scene.Unit * scale;
         // The source's own origin stays node 0's; moving it the other way moves the model by translate.
-        double[] c = new double[3];
-        if (s != 0)
+        double[] centre = new double[3];
+        if (totalScale != 0)
         {
             for (int k = 0; k < 3; k++)
             {
-                c[k] -= translate[k] / s;
+                centre[k] -= translate[k] / totalScale;
             }
         }
         double lowest = 0;
-        bool first = true;
-        foreach (double[] p in idlePoses)
+        bool isFirstPose = true;
+        foreach (double[] pose in idlePoses)
         {
-            double[] lo = new double[3];
-            double[] hi = new double[3];
-            Bounds(p, lo, hi);
-            if (first || lo[1] < lowest)
+            double[] poseMinimum = new double[3];
+            double[] poseMaximum = new double[3];
+            PointBounds(pose, poseMinimum, poseMaximum);
+            if (isFirstPose || poseMinimum[1] < lowest)
             {
-                lowest = lo[1];
-                first = false;
+                lowest = poseMinimum[1];
+                isFirstPose = false;
             }
         }
 
-        Mat4 lin = Mat4.Identity();
-        for (int r = 0; r < 3; r++)
+        Matrix4 linear = Matrix4.Identity();
+        for (int row = 0; row < 3; row++)
         {
-            for (int cc = 0; cc < 3; cc++)
+            for (int column = 0; column < 3; column++)
             {
-                lin[r, cc] = s * rot[r, cc];
+                linear[row, column] = totalScale * rotation[row, column];
             }
         }
-        Mat4 linInv = lin.Inverse();
-        // The game puts node 0's origin at the unit's place (retail monsters have it inside the
-        // body, 41-76% of the way up, median 61%, idle frame 0). Roots take the shift; skinned
-        // positions are world, so they take it too.
-        Mat4 aff = lin.Copy();
+        Matrix4 linearInverse = linear.Inverse();
+        /* The game puts node 0's origin at the unit's place (retail monsters have it inside the
+           body, 41-76% of the way up, median 61%, idle frame 0). Roots take the shift; skinned
+           positions are world, so they take it too. */
+        Matrix4 affine = linear.Copy();
         for (int k = 0; k < 3; k++)
         {
-            aff[k, 3] = -s * c[k];
+            affine[k, 3] = -totalScale * centre[k];
         }
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < nodeCount; i++)
         {
-            if (sc.Nodes[i].Parent < 0)
+            if (scene.Nodes[i].Parent < 0)
             {
-                sc.Nodes[i].Local = aff * sc.Nodes[i].Local * linInv;
+                scene.Nodes[i].Local = affine * scene.Nodes[i].Local * linearInverse;
             }
             else
             {
-                sc.Nodes[i].Local = lin * sc.Nodes[i].Local * linInv;
+                scene.Nodes[i].Local = linear * scene.Nodes[i].Local * linearInverse;
             }
         }
-        foreach (SceneAnim anim in sc.Anims)
+        foreach (SceneAnim anim in scene.Anims)
         {
             foreach (int i in TrackNodes(anim))
             {
-                Mat4[] tr = anim.Tracks[i];
-                Mat4[] outTr = new Mat4[tr.Length];
-                for (int f = 0; f < tr.Length; f++)
+                Matrix4[] track = anim.Tracks[i];
+                Matrix4[] outputTrack = new Matrix4[track.Length];
+                for (int frame = 0; frame < track.Length; frame++)
                 {
-                    if (sc.Nodes[i].Parent < 0)
+                    if (scene.Nodes[i].Parent < 0)
                     {
-                        outTr[f] = aff * tr[f] * linInv;
+                        outputTrack[frame] = affine * track[frame] * linearInverse;
                     }
                     else
                     {
-                        outTr[f] = lin * tr[f] * linInv;
+                        outputTrack[frame] = linear * track[frame] * linearInverse;
                     }
                 }
-                anim.Tracks[i] = outTr;
+                anim.Tracks[i] = outputTrack;
             }
         }
-        foreach (SceneMesh m in sc.Meshes)
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            int verts = m.VertexCount;
-            for (int v = 0; v < verts; v++)
+            int vertexCount = mesh.VertexCount;
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                double x = m.Pos[v * 3];
-                double y = m.Pos[v * 3 + 1];
-                double z = m.Pos[v * 3 + 2];
+                double x = mesh.Positions[vertex * 3];
+                double y = mesh.Positions[vertex * 3 + 1];
+                double z = mesh.Positions[vertex * 3 + 2];
                 for (int k = 0; k < 3; k++)
                 {
-                    double o = s * (rot[k, 0] * x + rot[k, 1] * y + rot[k, 2] * z);
-                    if (m.Skinned)
+                    double component = totalScale * (rotation[k, 0] * x + rotation[k, 1] * y + rotation[k, 2] * z);
+                    if (mesh.Skinned)
                     {
-                        o -= s * c[k];
+                        component -= totalScale * centre[k];
                     }
-                    m.Pos[v * 3 + k] = o;
+                    mesh.Positions[vertex * 3 + k] = component;
                 }
-                double nx = m.Nrm[v * 3];
-                double ny = m.Nrm[v * 3 + 1];
-                double nz = m.Nrm[v * 3 + 2];
+                double normalX = mesh.Normals[vertex * 3];
+                double normalY = mesh.Normals[vertex * 3 + 1];
+                double normalZ = mesh.Normals[vertex * 3 + 2];
                 for (int k = 0; k < 3; k++)
                 {
-                    m.Nrm[v * 3 + k] = rot[k, 0] * nx + rot[k, 1] * ny + rot[k, 2] * nz;
+                    mesh.Normals[vertex * 3 + k] = rotation[k, 0] * normalX + rotation[k, 1] * normalY + rotation[k, 2] * normalZ;
                 }
             }
         }
 
-        // Take each node's uniform rest scale out of its frame (L' = K_parent L K^-1): world
-        // positions are unchanged, but the importer encodes vertices bone-local in s16, and a
-        // bone at scale 100 (DoDModels) leaves them 1/100 the size, quantised to blocks.
-        Mat4[] wk = new Mat4[n];
-        double[] k2 = new double[n];
-        for (int i = 0; i < n; i++)
+        /* Take each node's uniform rest scale out of its frame (L' = K_parent L K^-1): world
+           positions are unchanged, but the importer encodes vertices bone-local in s16, and a
+           bone at scale 100 (DoDModels) leaves them 1/100 the size, quantised to blocks. */
+        Matrix4[] worldWithScale = new Matrix4[nodeCount];
+        double[] restScale = new double[nodeCount];
+        for (int i = 0; i < nodeCount; i++)
         {
-            k2[i] = 1.0;
+            restScale[i] = 1.0;
         }
         foreach (int i in order)
         {
-            int p = sc.Nodes[i].Parent;
-            if (p >= 0)
+            int parentIndex = scene.Nodes[i].Parent;
+            if (parentIndex >= 0)
             {
-                wk[i] = wk[p] * sc.Nodes[i].Local;
+                worldWithScale[i] = worldWithScale[parentIndex] * scene.Nodes[i].Local;
             }
             else
             {
-                wk[i] = sc.Nodes[i].Local;
+                worldWithScale[i] = scene.Nodes[i].Local;
             }
             double sum = 0;
-            for (int cc = 0; cc < 3; cc++)
+            for (int column = 0; column < 3; column++)
             {
-                sum += Math.Sqrt(wk[i][0, cc] * wk[i][0, cc] + wk[i][1, cc] * wk[i][1, cc] + wk[i][2, cc] * wk[i][2, cc]);
+                sum += Math.Sqrt(worldWithScale[i][0, column] * worldWithScale[i][0, column] + worldWithScale[i][1, column] * worldWithScale[i][1, column] + worldWithScale[i][2, column] * worldWithScale[i][2, column]);
             }
-            double ws = sum / 3.0;
-            if (ws > 1e-6)
+            double averageScale = sum / 3.0;
+            if (averageScale > 1e-6)
             {
-                k2[i] = ws;
+                restScale[i] = averageScale;
             }
         }
-        Mat4[] kmat = new Mat4[n];
-        Mat4[] kinv = new Mat4[n];
-        for (int i = 0; i < n; i++)
+        Matrix4[] scaleMatrices = new Matrix4[nodeCount];
+        Matrix4[] inverseScaleMatrices = new Matrix4[nodeCount];
+        for (int i = 0; i < nodeCount; i++)
         {
-            kmat[i] = Mat4.Scale(k2[i], k2[i], k2[i]);
-            kinv[i] = Mat4.Scale(1 / k2[i], 1 / k2[i], 1 / k2[i]);
+            scaleMatrices[i] = Matrix4.Scale(restScale[i], restScale[i], restScale[i]);
+            inverseScaleMatrices[i] = Matrix4.Scale(1 / restScale[i], 1 / restScale[i], 1 / restScale[i]);
         }
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < nodeCount; i++)
         {
-            int p = sc.Nodes[i].Parent;
-            Mat4 kp = Mat4.Identity();
-            if (p >= 0)
+            int parentIndex = scene.Nodes[i].Parent;
+            Matrix4 parentScale = Matrix4.Identity();
+            if (parentIndex >= 0)
             {
-                kp = kmat[p];
+                parentScale = scaleMatrices[parentIndex];
             }
-            sc.Nodes[i].Local = kp * sc.Nodes[i].Local * kinv[i];
-            foreach (SceneAnim anim in sc.Anims)
+            scene.Nodes[i].Local = parentScale * scene.Nodes[i].Local * inverseScaleMatrices[i];
+            foreach (SceneAnim anim in scene.Anims)
             {
-                Mat4[]? tr;
-                if (anim.Tracks.TryGetValue(i, out tr))
+                Matrix4[]? track;
+                if (anim.Tracks.TryGetValue(i, out track))
                 {
-                    Mat4[] outTr = new Mat4[tr.Length];
-                    for (int f = 0; f < tr.Length; f++)
+                    Matrix4[] outputTrack = new Matrix4[track.Length];
+                    for (int frame = 0; frame < track.Length; frame++)
                     {
-                        outTr[f] = kp * tr[f] * kinv[i];
+                        outputTrack[frame] = parentScale * track[frame] * inverseScaleMatrices[i];
                     }
-                    anim.Tracks[i] = outTr;
+                    anim.Tracks[i] = outputTrack;
                 }
             }
         }
-        foreach (SceneMesh m in sc.Meshes)
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            if (!m.Skinned)
+            if (!mesh.Skinned)
             {
-                double f = k2[m.Node];
-                for (int t = 0; t < m.Pos.Length; t++)
+                double meshScale = restScale[mesh.Node];
+                for (int component = 0; component < mesh.Positions.Length; component++)
                 {
-                    m.Pos[t] *= f;
+                    mesh.Positions[component] *= meshScale;
                 }
             }
         }
         SceneFit fit = new SceneFit();
-        fit.Scale = s;
-        fit.Lowest = s * (lowest - c[1]);
+        fit.Scale = totalScale;
+        fit.Lowest = totalScale * (lowest - centre[1]);
         for (int i = 0; i < idlePoses.Count; i++)
         {
-            double[] lo = new double[3];
-            double[] hi = new double[3];
-            Bounds(idlePoses[i], lo, hi);
+            double[] minimumCorner = new double[3];
+            double[] maximumCorner = new double[3];
+            PointBounds(idlePoses[i], minimumCorner, maximumCorner);
             for (int k = 0; k < 3; k++)
             {
-                double d = hi[k] - lo[k];
-                if (i == 0 || d > fit.Size[k])
+                double extent = maximumCorner[k] - minimumCorner[k];
+                if (i == 0 || extent > fit.Size[k])
                 {
-                    fit.Size[k] = d;
+                    fit.Size[k] = extent;
                 }
             }
         }
         for (int k = 0; k < 3; k++)
         {
-            fit.Size[k] *= s;
+            fit.Size[k] *= totalScale;
         }
         return fit;
     }
 
     // The distinct joints a skinned mesh uses, ascending (numpy unique).
-    public static List<int> UniqueJoints(SceneMesh m)
+    public static List<int> UniqueJoints(SceneMesh mesh)
     {
-        List<int> js = new List<int>();
-        if (m.Jnt == null)
+        List<int> jointList = new List<int>();
+        if (mesh.Joints == null)
         {
-            return js;
+            return jointList;
         }
-        SortedSet<int> set = new SortedSet<int>();
-        for (int k = 0; k < m.Jnt.Length; k++)
+        SortedSet<int> jointSet = new SortedSet<int>();
+        for (int k = 0; k < mesh.Joints.Length; k++)
         {
-            if (m.Jnt[k] >= 0)
+            if (mesh.Joints[k] >= 0)
             {
-                set.Add(m.Jnt[k]);
+                jointSet.Add(mesh.Joints[k]);
             }
         }
-        foreach (int j in set)
+        foreach (int j in jointSet)
         {
-            js.Add(j);
+            jointList.Add(j);
         }
-        return js;
+        return jointList;
     }
 
-    static Mat4[] Repeat(Mat4 m, int frames)
+    static Matrix4[] Repeat(Matrix4 matrix, int frames)
     {
-        Mat4[] tr = new Mat4[frames];
-        for (int f = 0; f < frames; f++)
+        Matrix4[] track = new Matrix4[frames];
+        for (int frame = 0; frame < frames; frame++)
         {
-            tr[f] = m;
+            track[frame] = matrix;
         }
-        return tr;
+        return track;
     }
 
-    static Mat4[] TrackOr(SceneAnim anim, int node, Mat4 local)
+    static Matrix4[] TrackOrRest(SceneAnim anim, int node, Matrix4 local)
     {
-        Mat4[]? tr;
-        if (anim.Tracks.TryGetValue(node, out tr))
+        Matrix4[]? track;
+        if (anim.Tracks.TryGetValue(node, out track))
         {
-            return tr;
+            return track;
         }
         return Repeat(local, anim.Frames);
     }
@@ -608,50 +608,50 @@ public static class SceneFinish
     public static List<int> TrackNodes(SceneAnim anim)
     {
         List<int> nodes = new List<int>();
-        foreach (KeyValuePair<int, Mat4[]> kv in anim.Tracks)
+        foreach (KeyValuePair<int, Matrix4[]> track in anim.Tracks)
         {
-            nodes.Add(kv.Key);
+            nodes.Add(track.Key);
         }
         return nodes;
     }
 
-    // The animation the importer puts in motion slot 0 (idle), by its rule
-    // (RebuildPipeline.AssignSlotIds): "slot_N" in the name, else a role word, else the free
-    // slots in the order 0, 2, 4, 5, 6, 1, 3. Null when there is none.
+    /* The animation the importer puts in motion slot 0 (idle), by its rule
+       (RebuildPipeline.AssignSlotIds): "slot_N" in the name, else a role word, else the free
+       slots in the order 0, 2, 4, 5, 6, 1, 3. Null when there is none. */
     static SceneAnim? IdleAnim(List<SceneAnim> anims)
     {
         int[] fillOrder = { 0, 2, 4, 5, 6, 1, 3 };
-        int[] slots = new int[anims.Count];
+        int[] slotNumbers = new int[anims.Count];
         HashSet<int> used = new HashSet<int>();
         for (int i = 0; i < anims.Count; i++)
         {
-            int s = NameSlot(anims[i].Name);
-            if (s < 0)
+            int slotNumber = NameSlot(anims[i].Name);
+            if (slotNumber < 0)
             {
-                s = RoleSlot(anims[i].Name);
+                slotNumber = RoleSlot(anims[i].Name);
             }
-            if (s >= 0 && !used.Add(s))
+            if (slotNumber >= 0 && !used.Add(slotNumber))
             {
-                s = -1;
+                slotNumber = -1;
             }
-            else if (s < 0)
+            else if (slotNumber < 0)
             {
-                s = -2;
+                slotNumber = -2;
             }
-            slots[i] = s;
+            slotNumbers[i] = slotNumber;
         }
         for (int i = 0; i < anims.Count; i++)
         {
-            if (slots[i] != -2)
+            if (slotNumbers[i] != -2)
             {
                 continue;
             }
-            slots[i] = -1;
+            slotNumbers[i] = -1;
             foreach (int k in fillOrder)
             {
                 if (!used.Contains(k))
                 {
-                    slots[i] = k;
+                    slotNumbers[i] = k;
                     used.Add(k);
                     break;
                 }
@@ -659,7 +659,7 @@ public static class SceneFinish
         }
         for (int i = 0; i < anims.Count; i++)
         {
-            if (slots[i] == 0)
+            if (slotNumbers[i] == 0)
             {
                 return anims[i];
             }
@@ -670,19 +670,19 @@ public static class SceneFinish
     // "slot_N" in a name, N 0..7; -1 if none.
     static int NameSlot(string name)
     {
-        int p = name.IndexOf("slot_", StringComparison.OrdinalIgnoreCase);
-        if (p < 0)
+        int slotPosition = name.IndexOf("slot_", StringComparison.OrdinalIgnoreCase);
+        if (slotPosition < 0)
         {
             return -1;
         }
-        int e = p + 5;
-        while (e < name.Length && char.IsDigit(name[e]))
+        int digitsEnd = slotPosition + 5;
+        while (digitsEnd < name.Length && char.IsDigit(name[digitsEnd]))
         {
-            e++;
+            digitsEnd++;
         }
-        if (e > p + 5 && int.TryParse(name.Substring(p + 5, e - p - 5), out int n) && n >= 0 && n <= 7)
+        if (digitsEnd > slotPosition + 5 && int.TryParse(name.Substring(slotPosition + 5, digitsEnd - slotPosition - 5), out int slotNumber) && slotNumber >= 0 && slotNumber <= 7)
         {
-            return n;
+            return slotNumber;
         }
         return -1;
     }
@@ -718,62 +718,62 @@ public static class SceneFinish
     // spread over the animation, truncated to integers.
     static List<int> SampleFrames(int frames)
     {
-        int num = Math.Min(frames, 16);
-        List<int> outf = new List<int>();
-        double stop = frames - 1;
-        for (int i = 0; i < num; i++)
+        int sampleCount = Math.Min(frames, 16);
+        List<int> sampledFrames = new List<int>();
+        double lastFrame = frames - 1;
+        for (int i = 0; i < sampleCount; i++)
         {
-            double v;
-            if (num == 1)
+            double position;
+            if (sampleCount == 1)
             {
-                v = 0;
+                position = 0;
             }
-            else if (i == num - 1)
+            else if (i == sampleCount - 1)
             {
-                v = stop;
+                position = lastFrame;
             }
             else
             {
-                v = i * (stop / (num - 1));
+                position = i * (lastFrame / (sampleCount - 1));
             }
-            int f = (int)v;
-            if (outf.Count == 0 || outf[outf.Count - 1] != f)
+            int frame = (int)position;
+            if (sampledFrames.Count == 0 || sampledFrames[sampledFrames.Count - 1] != frame)
             {
-                outf.Add(f);
+                sampledFrames.Add(frame);
             }
         }
-        return outf;
+        return sampledFrames;
     }
 
     // points @ rot.T
-    static double[] Rotated(double[] pts, Mat4 rot)
+    static double[] RotatedPoints(double[] points, Matrix4 rotation)
     {
-        double[] outp = new double[pts.Length];
-        for (int v = 0; v < pts.Length; v += 3)
+        double[] rotated = new double[points.Length];
+        for (int pointOffset = 0; pointOffset < points.Length; pointOffset += 3)
         {
-            rot.TransformDir(pts[v], pts[v + 1], pts[v + 2], out outp[v], out outp[v + 1], out outp[v + 2]);
+            rotation.TransformDir(points[pointOffset], points[pointOffset + 1], points[pointOffset + 2], out rotated[pointOffset], out rotated[pointOffset + 1], out rotated[pointOffset + 2]);
         }
-        return outp;
+        return rotated;
     }
 
-    static void Bounds(double[] pts, double[] lo, double[] hi)
+    static void PointBounds(double[] points, double[] minimum, double[] maximum)
     {
         for (int k = 0; k < 3; k++)
         {
-            lo[k] = double.MaxValue;
-            hi[k] = -double.MaxValue;
+            minimum[k] = double.MaxValue;
+            maximum[k] = -double.MaxValue;
         }
-        for (int v = 0; v < pts.Length; v += 3)
+        for (int pointOffset = 0; pointOffset < points.Length; pointOffset += 3)
         {
             for (int k = 0; k < 3; k++)
             {
-                if (pts[v + k] < lo[k])
+                if (points[pointOffset + k] < minimum[k])
                 {
-                    lo[k] = pts[v + k];
+                    minimum[k] = points[pointOffset + k];
                 }
-                if (pts[v + k] > hi[k])
+                if (points[pointOffset + k] > maximum[k])
                 {
-                    hi[k] = pts[v + k];
+                    maximum[k] = points[pointOffset + k];
                 }
             }
         }

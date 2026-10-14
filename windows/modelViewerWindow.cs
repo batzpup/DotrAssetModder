@@ -41,9 +41,9 @@ public class ModelViewerWindow
     bool resetPressed;
     bool showgrid = true;
 
-    // View: Feet on grid / Duel board / Map leader, as the game places a model (ViewScene). The
-    // board and map come from the loaded ISO; a file has no card, so the map height's card is
-    // picked, and no radius, so it is measured (the farthest point from the origin).
+    /* View: Feet on grid / Duel board / Map leader, as the game places a model (ViewScene). The
+       board and map come from the loaded ISO; a file has no card, so the map height's card is
+       picked, and no radius, so it is measured (the farthest point from the origin). */
     ViewScene viewScene = new ViewScene();
     ModelMrg viewSceneMrg;
     string viewSceneIso = string.Empty;
@@ -69,8 +69,8 @@ public class ModelViewerWindow
             return;
         }
 
-        int idx = Array.IndexOf(modelFiles, dialogResult.Path);
-        currentModelIndex = idx;
+        int fileIndex = Array.IndexOf(modelFiles, dialogResult.Path);
+        currentModelIndex = fileIndex;
         LoadModel(dialogResult.Path);
     }
 
@@ -90,16 +90,16 @@ public class ModelViewerWindow
         try
         {
             files = Directory.GetFiles(folderPath, "*.*")
-                .Where(f => f.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)
-                            || f.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)
-                            || f.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)
-                            || f.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(f => f, StringComparer.OrdinalIgnoreCase)
+                .Where(filePath => filePath.EndsWith(".glb", StringComparison.OrdinalIgnoreCase)
+                            || filePath.EndsWith(".gltf", StringComparison.OrdinalIgnoreCase)
+                            || filePath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)
+                            || filePath.EndsWith(".dae", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(filePath => filePath, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
-        catch (Exception e)
+        catch (Exception exception)
         {
-            loadError = e.Message;
+            loadError = exception.Message;
             return;
         }
 
@@ -131,8 +131,8 @@ public class ModelViewerWindow
         ImportedModel imported;
         try
         {
-            string ext = Path.GetExtension(path).ToLowerInvariant();
-            if (ext == ".fbx" || ext == ".dae")
+            string extension = Path.GetExtension(path).ToLowerInvariant();
+            if (extension == ".fbx" || extension == ".dae")
             {
                 ConvertOptions options = new ConvertOptions();
                 options.AnimsFrom = ModelConverter.FindMotionFiles(path);
@@ -146,9 +146,9 @@ public class ModelViewerWindow
                 imported = GlbImporter.Load(path);
             }
         }
-        catch (Exception e)
+        catch (Exception exception)
         {
-            loadError = e.Message;
+            loadError = exception.Message;
             return;
         }
 
@@ -163,8 +163,8 @@ public class ModelViewerWindow
 
         model.MeasureStanding(ModelImporterWindow.IdleAnimIndex(model), out viewLowest, out viewHeight,
             out viewLeft, out viewRight, out viewBack, out viewFront);
-        // the radius an import of this model writes (the importer's own measure), so the board
-        // and map show it at the size the game will; 0 (real size) if the importer cannot take it
+        // The radius an import writes (the importer's own measure), so the board and map show the
+        // size the game will; 0 (real size) if the importer cannot take the model.
         try
         {
             viewRadius = Rebuilder.MeasureRadius(imported, Array.Empty<byte>());
@@ -193,12 +193,12 @@ public class ModelViewerWindow
             orbit.Target = Vector3.Zero;
             return;
         }
-        float s = viewScene.ModelScale(viewRadius);
-        Vector3 shift = viewScene.StandShift(model, s);
-        float bottom = viewScene.StandY(viewLowest, mapCard) + shift.Y + s * viewLowest;
-        float top = bottom + s * viewHeight;
-        float left = shift.X + s * viewLeft;
-        float right = shift.X + s * viewRight;
+        float modelScale = viewScene.ModelScale(viewRadius);
+        Vector3 shift = viewScene.StandShift(model, modelScale);
+        float bottom = viewScene.StandY(viewLowest, mapCard) + shift.Y + modelScale * viewLowest;
+        float top = bottom + modelScale * viewHeight;
+        float left = shift.X + modelScale * viewLeft;
+        float right = shift.X + modelScale * viewRight;
         bottom = MathF.Min(bottom, 0f);                // keep the grid in view
         orbit.Frame(left, right, bottom, top, 0.3f);
     }
@@ -211,11 +211,11 @@ public class ModelViewerWindow
         {
             return;
         }
-        FileLoader fl = FileLoader.Instance;
+        FileLoader fileLoader = FileLoader.Instance;
         string iso = string.Empty;
-        if (fl.IsIsoLoaded && !string.IsNullOrEmpty(fl.CurrentIsoPath))
+        if (fileLoader.IsIsoLoaded && !string.IsNullOrEmpty(fileLoader.CurrentIsoPath))
         {
-            iso = fl.CurrentIsoPath;
+            iso = fileLoader.CurrentIsoPath;
         }
         if (iso == viewSceneIso)
         {
@@ -237,9 +237,9 @@ public class ModelViewerWindow
             viewSceneMrg = ModelMrg.Open(iso);
             viewScene.SetSource(viewSceneMrg);
         }
-        catch (Exception e)
+        catch (Exception exception)
         {
-            loadError = "Could not read the ISO's MODEL.MRG: " + e.Message;
+            loadError = "Could not read the ISO's MODEL.MRG: " + exception.Message;
         }
     }
 
@@ -250,7 +250,7 @@ public class ModelViewerWindow
         if (rightPressed)
         {
             savedMousePos = Raylib.GetMousePosition();
-            glRD.Io.ConfigFlags |= ImGuiConfigFlags.NoMouseCursorChange;
+            GuiContext.Io.ConfigFlags |= ImGuiConfigFlags.NoMouseCursorChange;
             Raylib.HideCursor();
             Raylib.SetMousePosition(Raylib.GetScreenWidth() / 2, Raylib.GetScreenHeight() / 2);
         }
@@ -258,7 +258,7 @@ public class ModelViewerWindow
         if (Raylib.IsMouseButtonReleased(MouseButton.Right))
         {
             Raylib.ShowCursor();
-            glRD.Io.ConfigFlags &= ~ImGuiConfigFlags.NoMouseCursorChange;
+            GuiContext.Io.ConfigFlags &= ~ImGuiConfigFlags.NoMouseCursorChange;
             Raylib.SetMousePosition((int)savedMousePos.X, (int)savedMousePos.Y);
         }
 
@@ -284,8 +284,8 @@ public class ModelViewerWindow
         Vector3 forward = orbit.Forward;
         Vector3 right = orbit.Right;
 
-        float dt = Raylib.GetFrameTime();
-        float moveSpeed = flySpeed * dt;
+        float frameSeconds = Raylib.GetFrameTime();
+        float moveSpeed = flySpeed * frameSeconds;
         if (Raylib.IsKeyDown(KeyboardKey.LeftShift)) moveSpeed *= 3f;
 
         Vector3 move = Vector3.Zero;
@@ -325,18 +325,18 @@ public class ModelViewerWindow
 
         if (model.AnimationCount > 0 && animPlaying)
         {
-            float dur = model.Duration(currentAnim);
-            if (dur > 0f)
+            float duration = model.Duration(currentAnim);
+            if (duration > 0f)
             {
                 animTime += Raylib.GetFrameTime() * animSpeed;
                 if (loopAnim)
                 {
-                    animTime %= dur;
-                    if (animTime < 0f) animTime += dur;
+                    animTime %= duration;
+                    if (animTime < 0f) animTime += duration;
                 }
-                else if (animTime >= dur)
+                else if (animTime >= duration)
                 {
-                    animTime = dur;
+                    animTime = duration;
                     animPlaying = false;
                 }
             }
@@ -411,7 +411,8 @@ public class ModelViewerWindow
         ImGui.Text("Hover for controls");
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("WASD to move, space and left Ctrl to go up and down\nleft click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
+            ImGui.SetTooltip(@"WASD to move, space and left Ctrl to go up and down
+left click drag to orbit, right click drag to free-look, middle click drag to pan, mouse wheel to zoom");
         }
 
         FileLoader isoLoader = FileLoader.Instance;
@@ -427,7 +428,8 @@ public class ModelViewerWindow
         {
             UpdateViewSceneSource();
             if (viewScene.DrawControls(true, ref mapCard, true,
-                "\nThe radius is measured from the model: the farthest point from its origin."))
+                @"
+The radius is measured from the model: the farthest point from its origin."))
             {
                 FrameStanding();
                 resetPressed = true;
@@ -480,8 +482,8 @@ public class ModelViewerWindow
                     needsAnimUpdate = true;
                 }
 
-                float dur = model.Duration(currentAnim);
-                int lastFrame = (int)MathF.Round(dur * FPS);
+                float duration = model.Duration(currentAnim);
+                int lastFrame = (int)MathF.Round(duration * FPS);
                 if (lastFrame < 1) lastFrame = 1;
                 int currentFrame = (int)MathF.Round(animTime * FPS);
                 if (currentFrame > lastFrame) currentFrame = lastFrame;
@@ -511,9 +513,9 @@ public class ModelViewerWindow
 
         ImGui.BeginChild("viewport");
 
-        Vector2 avail = ImGui.GetContentRegionAvail();
-        int width = Math.Max((int)avail.X, 1);
-        int height = Math.Max((int)avail.Y, 1);
+        Vector2 available = ImGui.GetContentRegionAvail();
+        int width = Math.Max((int)available.X, 1);
+        int height = Math.Max((int)available.Y, 1);
 
         if (width != viewportWidth || height != viewportHeight)
         {
@@ -545,8 +547,8 @@ public class ModelViewerWindow
         {
             if (modelLoaded)
             {
-                float s = viewScene.ModelScale(viewRadius);
-                ViewScene.DrawFloorGrid(s * viewLeft, s * viewRight, s * MathF.Max(viewRight - viewLeft, viewHeight));
+                float modelScale = viewScene.ModelScale(viewRadius);
+                ViewScene.DrawFloorGrid(modelScale * viewLeft, modelScale * viewRight, modelScale * MathF.Max(viewRight - viewLeft, viewHeight));
             }
             else
             {

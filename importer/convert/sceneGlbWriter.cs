@@ -6,9 +6,9 @@ using SkiaSharp;
 namespace DotrAssetModder;
 // Mostly AI
 
-// A finished Scene -> the .glb DotrAssetModder's custom-model import reads, a port of
-// tools/toglb.py's png_bytes and write_glb (DotR-PC), written with SharpGLTF like every other
-// glb here. The glb comes back as bytes; nothing is written to disk here.
+/* A finished Scene -> the .glb DotrAssetModder's custom-model import reads, a port of
+   tools/toglb.py's png_bytes and write_glb (DotR-PC), written with SharpGLTF. The glb comes
+   back as bytes; nothing is written to disk here. */
 
 public sealed class GlbAnimInfo
 {
@@ -28,76 +28,76 @@ public sealed class GlbWriteInfo
     public int Nodes;
     public int Joints;
     public int Textures;
-    public int Flat;
-    public int Tris;
-    public int Verts;
-    public List<GlbAnimInfo> Anims = new List<GlbAnimInfo>();
+    public int FlatColourMaterials;
+    public int Triangles;
+    public int Vertices;
+    public List<GlbAnimInfo> Animations = new List<GlbAnimInfo>();
 }
 
 public static class SceneGlbWriter
 {
     // A PNG of the image, at most max_tex pixels a side. An image whose alpha is all opaque
     // loses its alpha channel, as Pillow's convert("RGB") does.
-    public static byte[] PngBytes(SKBitmap im, int maxTex)
+    public static byte[] PngBytes(SKBitmap sourceBitmap, int maxTextureSize)
     {
-        SKBitmap bmp = im;
+        SKBitmap bitmap = sourceBitmap;
         bool opaque = true;
-        for (int y = 0; y < bmp.Height && opaque; y++)
+        for (int y = 0; y < bitmap.Height && opaque; y++)
         {
-            for (int x = 0; x < bmp.Width; x++)
+            for (int x = 0; x < bitmap.Width; x++)
             {
-                if (bmp.GetPixel(x, y).Alpha != 255)
+                if (bitmap.GetPixel(x, y).Alpha != 255)
                 {
                     opaque = false;
                     break;
                 }
             }
         }
-        int w = bmp.Width;
-        int h = bmp.Height;
-        if (Math.Max(w, h) > maxTex)
+        int width = bitmap.Width;
+        int height = bitmap.Height;
+        if (Math.Max(width, height) > maxTextureSize)
         {
             // Pillow's thumbnail: the largest side becomes max_tex, the other keeps the aspect
             // ratio (floored or ceiled, whichever is nearer), and never drops below 1.
-            double aspect = (double)w / h;
-            w = maxTex;
-            h = maxTex;
-            if ((double)w / h >= aspect)
+            double aspect = (double)width / height;
+            width = maxTextureSize;
+            height = maxTextureSize;
+            if ((double)width / height >= aspect)
             {
-                w = RoundAspect(h * aspect, h, aspect, true);
+                width = RoundAspect(height * aspect, height, aspect, true);
             }
             else
             {
-                h = RoundAspect(w / aspect, w, aspect, false);
+                height = RoundAspect(width / aspect, width, aspect, false);
             }
         }
-        if (w != bmp.Width || h != bmp.Height)
+        if (width != bitmap.Width || height != bitmap.Height)
         {
-            SKBitmap small = bmp.Resize(new SKImageInfo(w, h, SKColorType.Rgba8888, SKAlphaType.Unpremul),
+            SKBitmap resized = bitmap.Resize(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Unpremul),
                 SKFilterQuality.High);
-            bmp = small;
+            bitmap = resized;
         }
         if (opaque)
         {
-            SKBitmap rgb = new SKBitmap(new SKImageInfo(bmp.Width, bmp.Height, SKColorType.Rgba8888, SKAlphaType.Opaque));
-            bmp.CopyTo(rgb, SKColorType.Rgba8888);
-            bmp = rgb;
+            SKBitmap opaqueCopy = new SKBitmap(new SKImageInfo(bitmap.Width, bitmap.Height, SKColorType.Rgba8888, SKAlphaType.Opaque));
+            bitmap.CopyTo(opaqueCopy, SKColorType.Rgba8888);
+            bitmap = opaqueCopy;
         }
-        SKData data = bmp.Encode(SKEncodedImageFormat.Png, 100);
+        SKData data = bitmap.Encode(SKEncodedImageFormat.Png, 100);
         return data.ToArray();
     }
 
     // Pillow's round_aspect: floor or ceil, whichever comes nearer the aspect ratio, at least 1.
     static int RoundAspect(double number, int other, double aspect, bool widthSide)
     {
-        int lo = (int)Math.Floor(number);
-        int hi = (int)Math.Ceiling(number);
-        double dlo = Key(lo, other, aspect, widthSide);
-        double dhi = Key(hi, other, aspect, widthSide);
-        int best = lo;
-        if (dhi < dlo)
+        int lower = (int)Math.Floor(number);
+        int upper = (int)Math.Ceiling(number);
+        double lowerError = AspectError(lower, other, aspect, widthSide);
+        double upperError = AspectError(upper, other, aspect, widthSide);
+        int best = lower;
+        if (upperError < lowerError)
         {
-            best = hi;
+            best = upper;
         }
         if (best < 1)
         {
@@ -106,17 +106,17 @@ public static class SceneGlbWriter
         return best;
     }
 
-    static double Key(int n, int other, double aspect, bool widthSide)
+    static double AspectError(int size, int other, double aspect, bool widthSide)
     {
         if (widthSide)
         {
-            return Math.Abs(aspect - (double)n / other);
+            return Math.Abs(aspect - (double)size / other);
         }
-        if (n == 0)
+        if (size == 0)
         {
             return 0;
         }
-        return Math.Abs(aspect - (double)other / n);
+        return Math.Abs(aspect - (double)other / size);
     }
 
     // A rigid mesh's node and the meshes on it, in the order the meshes were read.
@@ -126,199 +126,198 @@ public static class SceneGlbWriter
         public List<SceneMesh> Meshes = new List<SceneMesh>();
     }
 
-    public static GlbWriteInfo WriteGlb(Scene sc, int maxTex, bool flipUv, double[]? pivotAt = null)
+    public static GlbWriteInfo WriteGlb(Scene scene, int maxTextureSize, bool flipUv, double[]? pivotAt = null)
     {
-        int n = sc.Nodes.Count;
-        List<int> order = sc.Order();
-        List<int>[] kids = new List<int>[n];
-        for (int i = 0; i < n; i++)
+        int nodeCount = scene.Nodes.Count;
+        List<int> order = scene.Order();
+        List<int>[] children = new List<int>[nodeCount];
+        for (int i = 0; i < nodeCount; i++)
         {
-            kids[i] = new List<int>();
+            children[i] = new List<int>();
         }
         foreach (int i in order)
         {
-            if (sc.Nodes[i].Parent >= 0)
+            if (scene.Nodes[i].Parent >= 0)
             {
-                kids[sc.Nodes[i].Parent].Add(i);
+                children[scene.Nodes[i].Parent].Add(i);
             }
         }
         HashSet<int> joints = new HashSet<int>();
-        List<RigidGroup> rigid = new List<RigidGroup>();
-        List<SceneMesh> skinned = new List<SceneMesh>();
-        foreach (SceneMesh m in sc.Meshes)
+        List<RigidGroup> rigidGroups = new List<RigidGroup>();
+        List<SceneMesh> skinnedMeshes = new List<SceneMesh>();
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            if (m.Skinned)
+            if (mesh.Skinned)
             {
-                skinned.Add(m);
-                foreach (int jn in SceneFinish.UniqueJoints(m))
+                skinnedMeshes.Add(mesh);
+                foreach (int jointNode in SceneFinish.UniqueJoints(mesh))
                 {
-                    joints.Add(jn);
+                    joints.Add(jointNode);
                 }
             }
             else
             {
-                RigidGroup? g = null;
-                foreach (RigidGroup r in rigid)
+                RigidGroup? nodeGroup = null;
+                foreach (RigidGroup candidate in rigidGroups)
                 {
-                    if (r.Node == m.Node)
+                    if (candidate.Node == mesh.Node)
                     {
-                        g = r;
+                        nodeGroup = candidate;
                     }
                 }
-                if (g == null)
+                if (nodeGroup == null)
                 {
-                    g = new RigidGroup();
-                    g.Node = m.Node;
-                    rigid.Add(g);
+                    nodeGroup = new RigidGroup();
+                    nodeGroup.Node = mesh.Node;
+                    rigidGroups.Add(nodeGroup);
                 }
-                g.Meshes.Add(m);
+                nodeGroup.Meshes.Add(mesh);
             }
         }
-        bool[] isRigidNode = new bool[n];
-        foreach (RigidGroup r in rigid)
+        bool[] isRigidNode = new bool[nodeCount];
+        foreach (RigidGroup rigidGroup in rigidGroups)
         {
-            isRigidNode[r.Node] = true;
+            isRigidNode[rigidGroup.Node] = true;
         }
-        bool[] keep = new bool[n];
+        bool[] keepNode = new bool[nodeCount];
         for (int k = order.Count - 1; k >= 0; k--)
         {
             int i = order[k];
-            bool any = false;
-            foreach (int c in kids[i])
+            bool anyKeptChild = false;
+            foreach (int child in children[i])
             {
-                if (keep[c])
+                if (keepNode[child])
                 {
-                    any = true;
+                    anyKeptChild = true;
                 }
             }
-            keep[i] = joints.Contains(i) || isRigidNode[i] || any;
+            keepNode[i] = joints.Contains(i) || isRigidNode[i] || anyKeptChild;
         }
 
         ModelRoot model = ModelRoot.CreateModel();
         model.Asset.Generator = "DotrAssetModder";
-        // dotr_root: dropped by the importer. dotr_world: node 0, the world placement. dotr_pivot:
-        // node 1, the pivot. Both at the source's own origin, unless `pivotAt` moves the
-        // pivot; dotr_model then takes the opposite move so the body stays where it is
-        // around node 0.
-        // dotr_model: the holder of everything else; it needs two children or more, or the
-        // importer's wrapper peel walks past it and takes the wrong pair as node 0 and node 1.
-        // Nodes are made parents first, in Scene.Order, so their indices and child order are
-        // the scene's.
+        /* dotr_root: dropped by the importer. dotr_world: node 0, the world placement.
+           dotr_pivot: node 1, the pivot. Both at the source's own origin, unless `pivotAt`
+           moves the pivot; dotr_model then takes the opposite move so the body stays where it
+           is around node 0.
+           dotr_model: the holder of everything else; it needs two children or more, or the
+           importer's wrapper peel walks past it and takes the wrong pair as node 0 and node 1.
+           Nodes are made parents first, in Scene.Order, so their indices and child order are
+           the scene's. */
         Node root = model.UseScene(0).CreateNode("dotr_root");
         Node world = root.CreateNode("dotr_world");
         Node pivot = world.CreateNode("dotr_pivot");
         Node holder = pivot.CreateNode("dotr_model");
         if (pivotAt != null && (pivotAt[0] != 0 || pivotAt[1] != 0 || pivotAt[2] != 0))
         {
-            Vector3 at = V3(pivotAt, 0);
-            pivot.LocalTransform = new SharpGLTF.Transforms.AffineTransform(null, null, at);
-            holder.LocalTransform = new SharpGLTF.Transforms.AffineTransform(null, null, -at);
+            Vector3 pivotPosition = ToVector3(pivotAt, 0);
+            pivot.LocalTransform = new SharpGLTF.Transforms.AffineTransform(null, null, pivotPosition);
+            holder.LocalTransform = new SharpGLTF.Transforms.AffineTransform(null, null, -pivotPosition);
         }
-        Node?[] outNode = new Node?[n];
-        double[] t3 = new double[3];
-        double[] q4 = new double[4];
-        double[] s3 = new double[3];
+        Node?[] glbNodes = new Node?[nodeCount];
+        double[] translation = new double[3];
+        double[] rotation = new double[4];
+        double[] scale = new double[3];
         foreach (int i in order)
         {
-            if (!keep[i])
+            if (!keepNode[i])
             {
                 continue;
             }
             Node parent = holder;
-            if (sc.Nodes[i].Parent >= 0)
+            if (scene.Nodes[i].Parent >= 0)
             {
-                parent = outNode[sc.Nodes[i].Parent]!;
+                parent = glbNodes[scene.Nodes[i].Parent]!;
             }
-            Node nd = parent.CreateNode(sc.Nodes[i].Name);
-            sc.Nodes[i].Local.Decompose(t3, q4, s3);
-            nd.LocalTransform = new SharpGLTF.Transforms.AffineTransform(V3(s3, 0), Quat(q4, 0), V3(t3, 0));
-            outNode[i] = nd;
+            Node glbNode = parent.CreateNode(scene.Nodes[i].Name);
+            scene.Nodes[i].Local.Decompose(translation, rotation, scale);
+            glbNode.LocalTransform = new SharpGLTF.Transforms.AffineTransform(ToVector3(scale, 0), ToQuaternion(rotation, 0), ToVector3(translation, 0));
+            glbNodes[i] = glbNode;
         }
 
-        // materials
-        Material?[] matOut = new Material?[sc.Materials.Count];
-        List<byte[]> texKeys = new List<byte[]>();
-        List<Material> texMats = new List<Material>();
-        List<double[]> colKeys = new List<double[]>();
-        List<Material> colMats = new List<Material>();
+        Material?[] glbMaterials = new Material?[scene.Materials.Count];
+        List<byte[]> texturePngs = new List<byte[]>();
+        List<Material> textureMaterials = new List<Material>();
+        List<double[]> colourKeys = new List<double[]>();
+        List<Material> colourMaterials = new List<Material>();
         Dictionary<SKBitmap, byte[]> pngCache = new Dictionary<SKBitmap, byte[]>();
-        List<int> used = new List<int>();
-        foreach (SceneMesh m in sc.Meshes)
+        List<int> usedMaterials = new List<int>();
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            HashSet<int> seen = new HashSet<int>();
-            foreach (int mi in m.TMat)
+            HashSet<int> seenMaterials = new HashSet<int>();
+            foreach (int materialIndex in mesh.TriangleMaterials)
             {
-                if (!seen.Add(mi))
+                if (!seenMaterials.Add(materialIndex))
                 {
                     continue;
                 }
-                if (!used.Contains(mi))
+                if (!usedMaterials.Contains(materialIndex))
                 {
-                    used.Add(mi);
+                    usedMaterials.Add(materialIndex);
                 }
             }
         }
-        foreach (int mi in used)
+        foreach (int materialIndex in usedMaterials)
         {
-            SceneMaterial mat = sc.Materials[mi];
-            if (mat.Image != null)
+            SceneMaterial sceneMaterial = scene.Materials[materialIndex];
+            if (sceneMaterial.Image != null)
             {
                 byte[]? png;
-                if (!pngCache.TryGetValue(mat.Image, out png))
+                if (!pngCache.TryGetValue(sceneMaterial.Image, out png))
                 {
-                    png = PngBytes(mat.Image, maxTex);
-                    pngCache[mat.Image] = png;
+                    png = PngBytes(sceneMaterial.Image, maxTextureSize);
+                    pngCache[sceneMaterial.Image] = png;
                 }
-                Material? same = null;
-                for (int k = 0; k < texKeys.Count; k++)
+                Material? existingMaterial = null;
+                for (int k = 0; k < texturePngs.Count; k++)
                 {
-                    if (SameBytes(texKeys[k], png!))
+                    if (SameBytes(texturePngs[k], png!))
                     {
-                        same = texMats[k];
+                        existingMaterial = textureMaterials[k];
                     }
                 }
-                if (same != null)
+                if (existingMaterial != null)
                 {
-                    matOut[mi] = same;
+                    glbMaterials[materialIndex] = existingMaterial;
                     continue;
                 }
-                int img = texKeys.Count;
-                Image im = model.CreateImage($"tex{img}");
-                im.Content = new MemoryImage(png!);
+                int imageNumber = texturePngs.Count;
+                Image glbImage = model.CreateImage($"tex{imageNumber}");
+                glbImage.Content = new MemoryImage(png!);
                 // no sampler: the importer and viewer take glTF's default, repeat
-                Texture tex = model.UseTexture(im, (TextureSampler)null!);
-                Material gm = NewMaterial(model, $"mat_tex{img}");
-                gm.FindChannel("BaseColor")!.Value.SetTexture(0, tex);
-                texKeys.Add(png!);
-                texMats.Add(gm);
-                matOut[mi] = gm;
+                Texture glbTexture = model.UseTexture(glbImage, (TextureSampler)null!);
+                Material glbMaterial = NewMaterial(model, $"mat_tex{imageNumber}");
+                glbMaterial.FindChannel("BaseColor")!.Value.SetTexture(0, glbTexture);
+                texturePngs.Add(png!);
+                textureMaterials.Add(glbMaterial);
+                glbMaterials[materialIndex] = glbMaterial;
             }
             else
             {
                 double[] key = new double[4];
                 for (int k = 0; k < 4; k++)
                 {
-                    key[k] = MeshBuild.NpRound(mat.Color[k], 3);
+                    key[k] = MeshBuild.RoundHalfToEven(sceneMaterial.Color[k], 3);
                 }
-                Material? same = null;
-                for (int k = 0; k < colKeys.Count; k++)
+                Material? existingMaterial = null;
+                for (int k = 0; k < colourKeys.Count; k++)
                 {
-                    if (SameColour(colKeys[k], key))
+                    if (SameColour(colourKeys[k], key))
                     {
-                        same = colMats[k];
+                        existingMaterial = colourMaterials[k];
                     }
                 }
-                if (same != null)
+                if (existingMaterial != null)
                 {
-                    matOut[mi] = same;
+                    glbMaterials[materialIndex] = existingMaterial;
                     continue;
                 }
-                Material gm = NewMaterial(model, $"mat_color{colKeys.Count}");
-                MaterialChannel bc = gm.FindChannel("BaseColor")!.Value;
-                bc.Color = new Vector4((float)key[0], (float)key[1], (float)key[2], (float)key[3]);
-                colKeys.Add(key);
-                colMats.Add(gm);
-                matOut[mi] = gm;
+                Material glbMaterial = NewMaterial(model, $"mat_color{colourKeys.Count}");
+                MaterialChannel baseColor = glbMaterial.FindChannel("BaseColor")!.Value;
+                baseColor.Color = new Vector4((float)key[0], (float)key[1], (float)key[2], (float)key[3]);
+                colourKeys.Add(key);
+                colourMaterials.Add(glbMaterial);
+                glbMaterials[materialIndex] = glbMaterial;
             }
         }
 
@@ -330,45 +329,45 @@ public static class SceneGlbWriter
                 jointList.Add(i);
             }
         }
-        int[] slot = new int[n + 1]; // node -> skin joint index; index n: no influence
+        int[] jointSlot = new int[nodeCount + 1]; // node -> skin joint index; index n: no influence
         for (int k = 0; k < jointList.Count; k++)
         {
-            slot[jointList[k]] = k;
+            jointSlot[jointList[k]] = k;
         }
 
-        foreach (RigidGroup r in rigid)
+        foreach (RigidGroup rigidGroup in rigidGroups)
         {
-            Mesh me = model.CreateMesh(r.Meshes[0].Name);
-            Primitives(model, me, r.Meshes, false, slot, matOut, n, flipUv);
-            outNode[r.Node]!.Mesh = me;
+            Mesh glbMesh = model.CreateMesh(rigidGroup.Meshes[0].Name);
+            Primitives(model, glbMesh, rigidGroup.Meshes, false, jointSlot, glbMaterials, nodeCount, flipUv);
+            glbNodes[rigidGroup.Node]!.Mesh = glbMesh;
         }
-        if (skinned.Count > 0)
+        if (skinnedMeshes.Count > 0)
         {
-            Mat4[] worldOf = new Mat4[n];
+            Matrix4[] nodeWorld = new Matrix4[nodeCount];
             foreach (int i in order)
             {
-                int p = sc.Nodes[i].Parent;
-                if (p >= 0)
+                int parentIndex = scene.Nodes[i].Parent;
+                if (parentIndex >= 0)
                 {
-                    worldOf[i] = worldOf[p] * sc.Nodes[i].Local;
+                    nodeWorld[i] = nodeWorld[parentIndex] * scene.Nodes[i].Local;
                 }
                 else
                 {
-                    worldOf[i] = sc.Nodes[i].Local;
+                    nodeWorld[i] = scene.Nodes[i].Local;
                 }
             }
-            List<(Node, Matrix4x4)> binds = new List<(Node, Matrix4x4)>();
-            foreach (int jn in jointList)
+            List<(Node, Matrix4x4)> jointBinds = new List<(Node, Matrix4x4)>();
+            foreach (int jointNode in jointList)
             {
-                binds.Add((outNode[jn]!, ToNumerics(worldOf[jn].Inverse())));
+                jointBinds.Add((glbNodes[jointNode]!, ToNumerics(nodeWorld[jointNode].Inverse())));
             }
             Skin skin = model.CreateSkin();
-            skin.BindJoints(binds);
-            Node nd = holder.CreateNode("dotr_skinned");
-            Mesh me = model.CreateMesh("skinned");
-            Primitives(model, me, skinned, true, slot, matOut, n, flipUv);
-            nd.Mesh = me;
-            nd.Skin = skin;
+            skin.BindJoints(jointBinds);
+            Node skinnedNode = holder.CreateNode("dotr_skinned");
+            Mesh glbMesh = model.CreateMesh("skinned");
+            Primitives(model, glbMesh, skinnedMeshes, true, jointSlot, glbMaterials, nodeCount, flipUv);
+            skinnedNode.Mesh = glbMesh;
+            skinnedNode.Skin = skin;
         }
 
         if (holder.VisualChildren.Count() < 2)
@@ -377,12 +376,12 @@ public static class SceneGlbWriter
         }
 
         List<GlbAnimInfo> animInfo = new List<GlbAnimInfo>();
-        foreach (SceneAnim anim in sc.Anims)
+        foreach (SceneAnim anim in scene.Anims)
         {
             List<int> tracks = new List<int>();
             foreach (int i in SceneFinish.TrackNodes(anim))
             {
-                if (keep[i])
+                if (keepNode[i])
                 {
                     tracks.Add(i);
                 }
@@ -392,97 +391,97 @@ public static class SceneGlbWriter
                 continue;
             }
             float[] times = new float[anim.Frames];
-            for (int f = 0; f < anim.Frames; f++)
+            for (int frame = 0; frame < anim.Frames; frame++)
             {
-                times[f] = (float)((double)f / Scene.Fps);
+                times[frame] = (float)((double)frame / Scene.Fps);
             }
-            Animation an = model.CreateAnimation(anim.Name);
+            Animation glbAnimation = model.CreateAnimation(anim.Name);
             bool anyChannel = false;
             foreach (int i in tracks)
             {
-                Mat4[] tr = anim.Tracks[i];
-                int frames = tr.Length;
-                double[] T = new double[frames * 3];
-                double[] Q = new double[frames * 4];
-                double[] S = new double[frames * 3];
-                for (int f = 0; f < frames; f++)
+                Matrix4[] track = anim.Tracks[i];
+                int frames = track.Length;
+                double[] translations = new double[frames * 3];
+                double[] rotations = new double[frames * 4];
+                double[] scales = new double[frames * 3];
+                for (int frame = 0; frame < frames; frame++)
                 {
-                    tr[f].Decompose(t3, q4, s3);
+                    track[frame].Decompose(translation, rotation, scale);
                     for (int k = 0; k < 3; k++)
                     {
-                        T[f * 3 + k] = t3[k];
-                        S[f * 3 + k] = s3[k];
+                        translations[frame * 3 + k] = translation[k];
+                        scales[frame * 3 + k] = scale[k];
                     }
                     for (int k = 0; k < 4; k++)
                     {
-                        Q[f * 4 + k] = q4[k];
+                        rotations[frame * 4 + k] = rotation[k];
                     }
                 }
-                for (int f = 1; f < frames; f++)
+                for (int frame = 1; frame < frames; frame++)
                 {
-                    double dot = 0;
+                    double dotProduct = 0;
                     for (int k = 0; k < 4; k++)
                     {
-                        dot += Q[f * 4 + k] * Q[(f - 1) * 4 + k];
+                        dotProduct += rotations[frame * 4 + k] * rotations[(frame - 1) * 4 + k];
                     }
-                    if (dot < 0)
+                    if (dotProduct < 0)
                     {
                         for (int k = 0; k < 4; k++)
                         {
-                            Q[f * 4 + k] = -Q[f * 4 + k];
+                            rotations[frame * 4 + k] = -rotations[frame * 4 + k];
                         }
                     }
                 }
-                double[] rt = new double[3];
-                double[] rq = new double[4];
-                double[] rs = new double[3];
-                sc.Nodes[i].Local.Decompose(rt, rq, rs);
-                // A channel that never leaves the rest value says nothing (the importer reads the
-                // rest value where there is no channel). The animation's first channel is kept
-                // either way, so the animation keeps its length even when nothing moves.
-                bool movesT = !CloseTo(T, rt, 3, 1e-5);
-                bool movesS = !CloseTo(S, rs, 3, 1e-6);
-                bool movesQ = false;
-                for (int f = 0; f < frames; f++)
+                double[] restTranslation = new double[3];
+                double[] restRotation = new double[4];
+                double[] restScale = new double[3];
+                scene.Nodes[i].Local.Decompose(restTranslation, restRotation, restScale);
+                /* A channel that never leaves the rest value says nothing (the importer reads the
+                   rest value where there is no channel). The animation's first channel is kept
+                   either way, so the animation keeps its length even when nothing moves. */
+                bool movesTranslation = !CloseTo(translations, restTranslation, 3, 1e-5);
+                bool movesScale = !CloseTo(scales, restScale, 3, 1e-6);
+                bool movesRotation = false;
+                for (int frame = 0; frame < frames; frame++)
                 {
-                    double dot = 0;
+                    double dotProduct = 0;
                     for (int k = 0; k < 4; k++)
                     {
-                        dot += Q[f * 4 + k] * rq[k];
+                        dotProduct += rotations[frame * 4 + k] * restRotation[k];
                     }
-                    if (Math.Abs(Math.Abs(dot) - 1.0) > 1e-10)
+                    if (Math.Abs(Math.Abs(dotProduct) - 1.0) > 1e-10)
                     {
-                        movesQ = true;
+                        movesRotation = true;
                     }
                 }
-                Node target = outNode[i]!;
-                if (movesT || !anyChannel)
+                Node target = glbNodes[i]!;
+                if (movesTranslation || !anyChannel)
                 {
-                    Dictionary<float, Vector3> keys = new Dictionary<float, Vector3>();
-                    for (int f = 0; f < frames; f++)
+                    Dictionary<float, Vector3> translationKeys = new Dictionary<float, Vector3>();
+                    for (int frame = 0; frame < frames; frame++)
                     {
-                        keys[times[f]] = V3(T, f * 3);
+                        translationKeys[times[frame]] = ToVector3(translations, frame * 3);
                     }
-                    an.CreateTranslationChannel(target, keys, true);
+                    glbAnimation.CreateTranslationChannel(target, translationKeys, true);
                     anyChannel = true;
                 }
-                if (movesQ)
+                if (movesRotation)
                 {
-                    Dictionary<float, Quaternion> keys = new Dictionary<float, Quaternion>();
-                    for (int f = 0; f < frames; f++)
+                    Dictionary<float, Quaternion> rotationKeys = new Dictionary<float, Quaternion>();
+                    for (int frame = 0; frame < frames; frame++)
                     {
-                        keys[times[f]] = Quat(Q, f * 4);
+                        rotationKeys[times[frame]] = ToQuaternion(rotations, frame * 4);
                     }
-                    an.CreateRotationChannel(target, keys, true);
+                    glbAnimation.CreateRotationChannel(target, rotationKeys, true);
                 }
-                if (movesS)
+                if (movesScale)
                 {
-                    Dictionary<float, Vector3> keys = new Dictionary<float, Vector3>();
-                    for (int f = 0; f < frames; f++)
+                    Dictionary<float, Vector3> scaleKeys = new Dictionary<float, Vector3>();
+                    for (int frame = 0; frame < frames; frame++)
                     {
-                        keys[times[f]] = V3(S, f * 3);
+                        scaleKeys[times[frame]] = ToVector3(scales, frame * 3);
                     }
-                    an.CreateScaleChannel(target, keys, true);
+                    glbAnimation.CreateScaleChannel(target, scaleKeys, true);
                 }
             }
             animInfo.Add(new GlbAnimInfo(anim.Name, anim.Frames));
@@ -491,14 +490,14 @@ public static class SceneGlbWriter
         GlbWriteInfo info = new GlbWriteInfo();
         info.Nodes = model.LogicalNodes.Count;
         info.Joints = jointList.Count;
-        info.Textures = texKeys.Count;
-        info.Flat = colKeys.Count;
-        foreach (SceneMesh m in sc.Meshes)
+        info.Textures = texturePngs.Count;
+        info.FlatColourMaterials = colourKeys.Count;
+        foreach (SceneMesh mesh in scene.Meshes)
         {
-            info.Tris += m.Tris.Length / 3;
-            info.Verts += m.VertexCount;
+            info.Triangles += mesh.Triangles.Length / 3;
+            info.Vertices += mesh.VertexCount;
         }
-        info.Anims = animInfo;
+        info.Animations = animInfo;
         info.Glb = model.WriteGLB().ToArray();
         return info;
     }
@@ -506,138 +505,138 @@ public static class SceneGlbWriter
     // A double-sided material, not metallic and fully rough, as toglb.py writes them.
     static Material NewMaterial(ModelRoot model, string name)
     {
-        Material gm = model.CreateMaterial(name);
-        gm.InitializePBRMetallicRoughness();
-        gm.DoubleSided = true;
-        MaterialChannel mr = gm.FindChannel("MetallicRoughness")!.Value;
-        mr.SetFactor("MetallicFactor", 0f);
-        mr.SetFactor("RoughnessFactor", 1f);
-        return gm;
+        Material glbMaterial = model.CreateMaterial(name);
+        glbMaterial.InitializePBRMetallicRoughness();
+        glbMaterial.DoubleSided = true;
+        MaterialChannel metallicRoughness = glbMaterial.FindChannel("MetallicRoughness")!.Value;
+        metallicRoughness.SetFactor("MetallicFactor", 0f);
+        metallicRoughness.SetFactor("RoughnessFactor", 1f);
+        return glbMaterial;
     }
 
-    static void Primitives(ModelRoot model, Mesh mesh, List<SceneMesh> meshes, bool skin, int[] slot,
-        Material?[] matOut, int n, bool flipUv)
+    static void Primitives(ModelRoot model, Mesh mesh, List<SceneMesh> meshes, bool skin, int[] jointSlot,
+        Material?[] glbMaterials, int noInfluenceSlot, bool flipUv)
     {
-        foreach (SceneMesh m in meshes)
+        foreach (SceneMesh sceneMesh in meshes)
         {
-            SortedSet<int> mats = new SortedSet<int>();
-            foreach (int mi in m.TMat)
+            SortedSet<int> materialSet = new SortedSet<int>();
+            foreach (int materialIndex in sceneMesh.TriangleMaterials)
             {
-                mats.Add(mi);
+                materialSet.Add(materialIndex);
             }
-            foreach (int mi in mats)
+            foreach (int materialIndex in materialSet)
             {
-                List<int> tris = new List<int>();
-                for (int t = 0; t < m.TMat.Length; t++)
+                List<int> triangleCorners = new List<int>();
+                for (int triangle = 0; triangle < sceneMesh.TriangleMaterials.Length; triangle++)
                 {
-                    if (m.TMat[t] == mi)
+                    if (sceneMesh.TriangleMaterials[triangle] == materialIndex)
                     {
-                        tris.Add(m.Tris[t * 3]);
-                        tris.Add(m.Tris[t * 3 + 1]);
-                        tris.Add(m.Tris[t * 3 + 2]);
+                        triangleCorners.Add(sceneMesh.Triangles[triangle * 3]);
+                        triangleCorners.Add(sceneMesh.Triangles[triangle * 3 + 1]);
+                        triangleCorners.Add(sceneMesh.Triangles[triangle * 3 + 2]);
                     }
                 }
-                SortedSet<int> uniq = new SortedSet<int>(tris);
-                int[] usedV = new int[uniq.Count];
-                Dictionary<int, int> back = new Dictionary<int, int>();
-                int at = 0;
-                foreach (int v in uniq)
+                SortedSet<int> uniqueVertices = new SortedSet<int>(triangleCorners);
+                int[] usedVertices = new int[uniqueVertices.Count];
+                Dictionary<int, int> newIndexOf = new Dictionary<int, int>();
+                int vertexCursor = 0;
+                foreach (int vertex in uniqueVertices)
                 {
-                    usedV[at] = v;
-                    back[v] = at;
-                    at++;
+                    usedVertices[vertexCursor] = vertex;
+                    newIndexOf[vertex] = vertexCursor;
+                    vertexCursor++;
                 }
-                int[] remap = new int[tris.Count];
-                for (int k = 0; k < tris.Count; k++)
+                int[] remappedCorners = new int[triangleCorners.Count];
+                for (int k = 0; k < triangleCorners.Count; k++)
                 {
-                    remap[k] = back[tris[k]];
+                    remappedCorners[k] = newIndexOf[triangleCorners[k]];
                 }
-                double[] pos = new double[usedV.Length * 3];
-                double[] nrm = new double[usedV.Length * 3];
-                double[] uv = new double[usedV.Length * 2];
-                for (int k = 0; k < usedV.Length; k++)
+                double[] positions = new double[usedVertices.Length * 3];
+                double[] normals = new double[usedVertices.Length * 3];
+                double[] uvs = new double[usedVertices.Length * 2];
+                for (int k = 0; k < usedVertices.Length; k++)
                 {
-                    for (int c = 0; c < 3; c++)
+                    for (int component = 0; component < 3; component++)
                     {
-                        pos[k * 3 + c] = m.Pos[usedV[k] * 3 + c];
-                        nrm[k * 3 + c] = m.Nrm[usedV[k] * 3 + c];
+                        positions[k * 3 + component] = sceneMesh.Positions[usedVertices[k] * 3 + component];
+                        normals[k * 3 + component] = sceneMesh.Normals[usedVertices[k] * 3 + component];
                     }
-                    uv[k * 2] = m.Uv[usedV[k] * 2];
-                    uv[k * 2 + 1] = m.Uv[usedV[k] * 2 + 1];
+                    uvs[k * 2] = sceneMesh.Uvs[usedVertices[k] * 2];
+                    uvs[k * 2 + 1] = sceneMesh.Uvs[usedVertices[k] * 2 + 1];
                     // FBX and COLLADA put the UV origin bottom-left, glTF top-left; --flip-uv is
                     // for sources already written top-left (Unity rips, e.g. Duel Links FBX)
                     if (!flipUv)
                     {
-                        uv[k * 2 + 1] = 1.0 - uv[k * 2 + 1];
+                        uvs[k * 2 + 1] = 1.0 - uvs[k * 2 + 1];
                     }
                 }
-                MeshPrimitive prim = mesh.CreatePrimitive();
-                prim.SetVertexAccessor("POSITION", FloatAccessor(model, pos, DimensionType.VEC3, 3));
-                prim.SetVertexAccessor("NORMAL", FloatAccessor(model, nrm, DimensionType.VEC3, 3));
-                prim.SetVertexAccessor("TEXCOORD_0", FloatAccessor(model, uv, DimensionType.VEC2, 2));
+                MeshPrimitive primitive = mesh.CreatePrimitive();
+                primitive.SetVertexAccessor("POSITION", FloatAccessor(model, positions, DimensionType.VEC3, 3));
+                primitive.SetVertexAccessor("NORMAL", FloatAccessor(model, normals, DimensionType.VEC3, 3));
+                primitive.SetVertexAccessor("TEXCOORD_0", FloatAccessor(model, uvs, DimensionType.VEC2, 2));
                 if (skin)
                 {
-                    int[] js0 = new int[usedV.Length * 4];
-                    int[] js1 = new int[usedV.Length * 4];
-                    double[] w0 = new double[usedV.Length * 4];
-                    double[] w1 = new double[usedV.Length * 4];
-                    bool second = false;
-                    for (int k = 0; k < usedV.Length; k++)
+                    int[] joints0 = new int[usedVertices.Length * 4];
+                    int[] joints1 = new int[usedVertices.Length * 4];
+                    double[] weights0 = new double[usedVertices.Length * 4];
+                    double[] weights1 = new double[usedVertices.Length * 4];
+                    bool needsSecondSet = false;
+                    for (int k = 0; k < usedVertices.Length; k++)
                     {
-                        for (int c = 0; c < 8; c++)
+                        for (int influence = 0; influence < 8; influence++)
                         {
-                            int jn = m.Jnt![usedV[k] * 8 + c];
-                            double w = m.Wgt![usedV[k] * 8 + c];
-                            int sl = slot[n];
-                            if (jn >= 0)
+                            int jointNode = sceneMesh.Joints![usedVertices[k] * 8 + influence];
+                            double w = sceneMesh.Weights![usedVertices[k] * 8 + influence];
+                            int skinSlot = jointSlot[noInfluenceSlot];
+                            if (jointNode >= 0)
                             {
-                                sl = slot[jn];
+                                skinSlot = jointSlot[jointNode];
                             }
                             else
                             {
                                 w = 0.0;
                             }
-                            if (c < 4)
+                            if (influence < 4)
                             {
-                                js0[k * 4 + c] = sl;
-                                w0[k * 4 + c] = w;
+                                joints0[k * 4 + influence] = skinSlot;
+                                weights0[k * 4 + influence] = w;
                             }
                             else
                             {
-                                js1[k * 4 + c - 4] = sl;
-                                w1[k * 4 + c - 4] = w;
+                                joints1[k * 4 + influence - 4] = skinSlot;
+                                weights1[k * 4 + influence - 4] = w;
                                 if (w > 0)
                                 {
-                                    second = true;
+                                    needsSecondSet = true;
                                 }
                             }
                         }
                     }
-                    prim.SetVertexAccessor("JOINTS_0", JointAccessor(model, js0));
-                    prim.SetVertexAccessor("WEIGHTS_0", FloatAccessor(model, w0, DimensionType.VEC4, 4));
-                    if (second)
+                    primitive.SetVertexAccessor("JOINTS_0", JointAccessor(model, joints0));
+                    primitive.SetVertexAccessor("WEIGHTS_0", FloatAccessor(model, weights0, DimensionType.VEC4, 4));
+                    if (needsSecondSet)
                     {
-                        prim.SetVertexAccessor("JOINTS_1", JointAccessor(model, js1));
-                        prim.SetVertexAccessor("WEIGHTS_1", FloatAccessor(model, w1, DimensionType.VEC4, 4));
+                        primitive.SetVertexAccessor("JOINTS_1", JointAccessor(model, joints1));
+                        primitive.SetVertexAccessor("WEIGHTS_1", FloatAccessor(model, weights1, DimensionType.VEC4, 4));
                     }
                 }
-                prim.Material = matOut[mi];
-                prim.SetIndexAccessor(IndexAccessor(model, remap));
+                primitive.Material = glbMaterials[materialIndex];
+                primitive.SetIndexAccessor(IndexAccessor(model, remappedCorners));
             }
         }
     }
 
-    static Accessor FloatAccessor(ModelRoot model, double[] data, DimensionType dim, int comps)
+    static Accessor FloatAccessor(ModelRoot model, double[] data, DimensionType dimension, int components)
     {
         byte[] bytes = new byte[data.Length * 4];
         for (int k = 0; k < data.Length; k++)
         {
             BitConverter.TryWriteBytes(new Span<byte>(bytes, k * 4, 4), (float)data[k]);
         }
-        Accessor acc = model.CreateAccessor();
-        acc.SetVertexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ARRAY_BUFFER), 0,
-            data.Length / comps, dim, EncodingType.FLOAT, false);
-        return acc;
+        Accessor accessor = model.CreateAccessor();
+        accessor.SetVertexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ARRAY_BUFFER), 0,
+            data.Length / components, dimension, EncodingType.FLOAT, false);
+        return accessor;
     }
 
     // JOINTS_n: four skin joint indices a vertex, as unsigned shorts.
@@ -648,10 +647,10 @@ public static class SceneGlbWriter
         {
             BitConverter.TryWriteBytes(new Span<byte>(bytes, k * 2, 2), (ushort)data[k]);
         }
-        Accessor acc = model.CreateAccessor();
-        acc.SetVertexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ARRAY_BUFFER), 0,
+        Accessor accessor = model.CreateAccessor();
+        accessor.SetVertexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ARRAY_BUFFER), 0,
             data.Length / 4, DimensionType.VEC4, EncodingType.UNSIGNED_SHORT, false);
-        return acc;
+        return accessor;
     }
 
     static Accessor IndexAccessor(ModelRoot model, int[] data)
@@ -661,38 +660,38 @@ public static class SceneGlbWriter
         {
             BitConverter.TryWriteBytes(new Span<byte>(bytes, k * 4, 4), (uint)data[k]);
         }
-        Accessor acc = model.CreateAccessor();
-        acc.SetIndexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ELEMENT_ARRAY_BUFFER), 0,
+        Accessor accessor = model.CreateAccessor();
+        accessor.SetIndexData(model.UseBufferView(bytes, 0, null, 0, BufferMode.ELEMENT_ARRAY_BUFFER), 0,
             data.Length, IndexEncodingType.UNSIGNED_INT);
-        return acc;
+        return accessor;
     }
 
-    static Vector3 V3(double[] v, int o)
+    static Vector3 ToVector3(double[] values, int offset)
     {
-        return new Vector3((float)v[o], (float)v[o + 1], (float)v[o + 2]);
+        return new Vector3((float)values[offset], (float)values[offset + 1], (float)values[offset + 2]);
     }
 
-    static Quaternion Quat(double[] q, int o)
+    static Quaternion ToQuaternion(double[] values, int offset)
     {
-        return new Quaternion((float)q[o], (float)q[o + 1], (float)q[o + 2], (float)q[o + 3]);
+        return new Quaternion((float)values[offset], (float)values[offset + 1], (float)values[offset + 2], (float)values[offset + 3]);
     }
 
-    // Mat4 keeps the translation in the right column; System.Numerics in the bottom row.
-    static Matrix4x4 ToNumerics(Mat4 m)
+    // Matrix4 keeps the translation in the right column; System.Numerics in the bottom row.
+    static Matrix4x4 ToNumerics(Matrix4 matrix)
     {
         return new Matrix4x4(
-            (float)m[0, 0], (float)m[1, 0], (float)m[2, 0], (float)m[3, 0],
-            (float)m[0, 1], (float)m[1, 1], (float)m[2, 1], (float)m[3, 1],
-            (float)m[0, 2], (float)m[1, 2], (float)m[2, 2], (float)m[3, 2],
-            (float)m[0, 3], (float)m[1, 3], (float)m[2, 3], (float)m[3, 3]);
+            (float)matrix[0, 0], (float)matrix[1, 0], (float)matrix[2, 0], (float)matrix[3, 0],
+            (float)matrix[0, 1], (float)matrix[1, 1], (float)matrix[2, 1], (float)matrix[3, 1],
+            (float)matrix[0, 2], (float)matrix[1, 2], (float)matrix[2, 2], (float)matrix[3, 2],
+            (float)matrix[0, 3], (float)matrix[1, 3], (float)matrix[2, 3], (float)matrix[3, 3]);
     }
 
     // numpy allclose with rtol 0: every frame's components against the rest value.
-    static bool CloseTo(double[] data, double[] rest, int comps, double atol)
+    static bool CloseTo(double[] data, double[] restValues, int components, double absoluteTolerance)
     {
         for (int k = 0; k < data.Length; k++)
         {
-            if (Math.Abs(data[k] - rest[k % comps]) > atol)
+            if (Math.Abs(data[k] - restValues[k % components]) > absoluteTolerance)
             {
                 return false;
             }
@@ -700,15 +699,15 @@ public static class SceneGlbWriter
         return true;
     }
 
-    static bool SameBytes(byte[] a, byte[] b)
+    static bool SameBytes(byte[] left, byte[] right)
     {
-        if (a.Length != b.Length)
+        if (left.Length != right.Length)
         {
             return false;
         }
-        for (int k = 0; k < a.Length; k++)
+        for (int k = 0; k < left.Length; k++)
         {
-            if (a[k] != b[k])
+            if (left[k] != right[k])
             {
                 return false;
             }
@@ -716,11 +715,11 @@ public static class SceneGlbWriter
         return true;
     }
 
-    static bool SameColour(double[] a, double[] b)
+    static bool SameColour(double[] left, double[] right)
     {
-        for (int k = 0; k < a.Length; k++)
+        for (int k = 0; k < left.Length; k++)
         {
-            if (a[k] != b[k])
+            if (left[k] != right[k])
             {
                 return false;
             }

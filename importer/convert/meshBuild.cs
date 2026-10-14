@@ -24,12 +24,12 @@ public static class MeshBuild
         public double[] Rows = new double[0];
         public int Width;
 
-        public int Compare(int a, int b)
+        public int Compare(int leftRow, int rightRow)
         {
             for (int k = 0; k < Width; k++)
             {
-                double x = Rows[a * Width + k];
-                double y = Rows[b * Width + k];
+                double x = Rows[leftRow * Width + k];
+                double y = Rows[rightRow * Width + k];
                 if (x < y)
                 {
                     return -1;
@@ -39,305 +39,305 @@ public static class MeshBuild
                     return 1;
                 }
             }
-            return a.CompareTo(b); // stable: the first corner of a vertex comes first
+            return leftRow.CompareTo(rightRow); // stable: the first corner of a vertex comes first
         }
     }
 
-    public static double NpRound(double x, int decimals)
+    public static double RoundHalfToEven(double x, int decimals)
     {
-        double f = Math.Pow(10, decimals);
-        return Math.Round(x * f, MidpointRounding.ToEven) / f;
+        double factor = Math.Pow(10, decimals);
+        return Math.Round(x * factor, MidpointRounding.ToEven) / factor;
     }
 
     // Polygons (first corner, corner count) -> triangle fans of corner indices, 3 a triangle.
-    public static int[] Fan(int[] starts, int[] sizes)
+    public static int[] FanTriangulate(int[] starts, int[] sizes)
     {
-        List<int> tris = new List<int>();
-        for (int p = 0; p < starts.Length; p++)
+        List<int> triangles = new List<int>();
+        for (int polygon = 0; polygon < starts.Length; polygon++)
         {
-            for (int k = 1; k < sizes[p] - 1; k++)
+            for (int k = 1; k < sizes[polygon] - 1; k++)
             {
-                tris.Add(starts[p]);
-                tris.Add(starts[p] + k);
-                tris.Add(starts[p] + k + 1);
+                triangles.Add(starts[polygon]);
+                triangles.Add(starts[polygon] + k);
+                triangles.Add(starts[polygon] + k + 1);
             }
         }
-        return tris.ToArray();
+        return triangles.ToArray();
     }
 
     // Corners -> unique vertices: the first corner of each vertex (in sorted key order, as
     // numpy's unique), and the vertex of each corner.
-    public static void Weld(int[] cornerCp, double[]? nrm, double[]? uv, out int[] first, out int[] inverse)
+    public static void Weld(int[] cornerCp, double[]? normals, double[]? uvs, out int[] first, out int[] inverse)
     {
-        int n = cornerCp.Length;
+        int cornerCount = cornerCp.Length;
         int width = 1;
-        if (nrm != null)
+        if (normals != null)
         {
             width += 3;
         }
-        if (uv != null)
+        if (uvs != null)
         {
             width += 2;
         }
-        double[] rows = new double[n * width];
-        for (int i = 0; i < n; i++)
+        double[] rows = new double[cornerCount * width];
+        for (int i = 0; i < cornerCount; i++)
         {
-            int o = i * width;
-            rows[o++] = cornerCp[i];
-            if (nrm != null)
+            int rowOffset = i * width;
+            rows[rowOffset++] = cornerCp[i];
+            if (normals != null)
             {
-                rows[o++] = NpRound(nrm[i * 3], 3);
-                rows[o++] = NpRound(nrm[i * 3 + 1], 3);
-                rows[o++] = NpRound(nrm[i * 3 + 2], 3);
+                rows[rowOffset++] = RoundHalfToEven(normals[i * 3], 3);
+                rows[rowOffset++] = RoundHalfToEven(normals[i * 3 + 1], 3);
+                rows[rowOffset++] = RoundHalfToEven(normals[i * 3 + 2], 3);
             }
-            if (uv != null)
+            if (uvs != null)
             {
-                rows[o++] = NpRound(uv[i * 2], 5);
-                rows[o++] = NpRound(uv[i * 2 + 1], 5);
+                rows[rowOffset++] = RoundHalfToEven(uvs[i * 2], 5);
+                rows[rowOffset++] = RoundHalfToEven(uvs[i * 2 + 1], 5);
             }
         }
-        int[] perm = new int[n];
-        for (int i = 0; i < n; i++)
+        int[] permutation = new int[cornerCount];
+        for (int i = 0; i < cornerCount; i++)
         {
-            perm[i] = i;
+            permutation[i] = i;
         }
-        RowComparer cmp = new RowComparer();
-        cmp.Rows = rows;
-        cmp.Width = width;
-        Array.Sort(perm, cmp);
+        RowComparer comparer = new RowComparer();
+        comparer.Rows = rows;
+        comparer.Width = width;
+        Array.Sort(permutation, comparer);
 
-        List<int> firsts = new List<int>();
-        inverse = new int[n];
-        for (int k = 0; k < n; k++)
+        List<int> firstList = new List<int>();
+        inverse = new int[cornerCount];
+        for (int k = 0; k < cornerCount; k++)
         {
-            bool fresh = k == 0;
-            if (!fresh)
+            bool startsGroup = k == 0;
+            if (!startsGroup)
             {
-                int a = perm[k - 1];
-                int b = perm[k];
-                for (int c = 0; c < width; c++)
+                int previousCorner = permutation[k - 1];
+                int corner = permutation[k];
+                for (int column = 0; column < width; column++)
                 {
-                    if (rows[a * width + c] != rows[b * width + c])
+                    if (rows[previousCorner * width + column] != rows[corner * width + column])
                     {
-                        fresh = true;
+                        startsGroup = true;
                         break;
                     }
                 }
             }
-            if (fresh)
+            if (startsGroup)
             {
-                firsts.Add(perm[k]);
+                firstList.Add(permutation[k]);
             }
-            inverse[perm[k]] = firsts.Count - 1;
+            inverse[permutation[k]] = firstList.Count - 1;
         }
-        first = firsts.ToArray();
+        first = firstList.ToArray();
     }
 
-    // cp: control points (3 each); cornerCp: control point of each corner; cornerNrm/cornerUv:
-    // per corner or null; triCorners: corner indices, 3 a triangle; triMat: material per
-    // triangle; cpInfl: influences per control point, or null for a rigid mesh.
-    public static void Build(SceneMesh mesh, double[] cp, int[] cornerCp, double[]? cornerNrm, double[]? cornerUv,
-        int[] triCorners, int[] triMat, List<Influence>[]? cpInfl)
+    /* controlPoints: 3 each; cornerCp: control point of each corner; cornerNrm/cornerUv: per
+       corner or null; triCorners: corner indices, 3 a triangle; triangleMaterials: material per
+       triangle; controlPointInfluences: per control point, or null for a rigid mesh. */
+    public static void Build(SceneMesh mesh, double[] controlPoints, int[] cornerCp, double[]? cornerNrm, double[]? cornerUv,
+        int[] triCorners, int[] triangleMaterials, List<Influence>[]? controlPointInfluences)
     {
         // Some exporters write one control point per corner; merge points at the same place
         // with the same influences, or no two triangles share a vertex (stripification, size).
-        int ncp = cp.Length / 3;
-        double big = 0;
-        for (int i = 0; i < cp.Length; i++)
+        int controlPointCount = controlPoints.Length / 3;
+        double largest = 0;
+        for (int i = 0; i < controlPoints.Length; i++)
         {
-            big = Math.Max(big, Math.Abs(cp[i]));
+            largest = Math.Max(largest, Math.Abs(controlPoints[i]));
         }
-        double step = Math.Max(big, 1e-9) * 1e-6;
-        Dictionary<string, int> canon = new Dictionary<string, int>();
-        int[] same = new int[ncp];
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        for (int i = 0; i < ncp; i++)
+        double step = Math.Max(largest, 1e-9) * 1e-6;
+        Dictionary<string, int> canonicalByKey = new Dictionary<string, int>();
+        int[] canonicalPoint = new int[controlPointCount];
+        System.Text.StringBuilder keyBuilder = new System.Text.StringBuilder();
+        for (int i = 0; i < controlPointCount; i++)
         {
-            sb.Clear();
-            for (int c = 0; c < 3; c++)
+            keyBuilder.Clear();
+            for (int component = 0; component < 3; component++)
             {
-                sb.Append((long)Math.Round(cp[i * 3 + c] / step, MidpointRounding.ToEven));
-                sb.Append(',');
+                keyBuilder.Append((long)Math.Round(controlPoints[i * 3 + component] / step, MidpointRounding.ToEven));
+                keyBuilder.Append(',');
             }
-            if (cpInfl != null)
+            if (controlPointInfluences != null)
             {
-                List<Influence> sorted = new List<Influence>(cpInfl[i]);
-                sorted.Sort((a, b) => a.Joint.CompareTo(b.Joint));
-                foreach (Influence f in sorted)
+                List<Influence> sorted = new List<Influence>(controlPointInfluences[i]);
+                sorted.Sort((left, right) => left.Joint.CompareTo(right.Joint));
+                foreach (Influence influence in sorted)
                 {
-                    sb.Append(f.Joint);
-                    sb.Append(':');
-                    sb.Append(Math.Round(f.Weight, 4, MidpointRounding.ToEven).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
-                    sb.Append(';');
+                    keyBuilder.Append(influence.Joint);
+                    keyBuilder.Append(':');
+                    keyBuilder.Append(Math.Round(influence.Weight, 4, MidpointRounding.ToEven).ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    keyBuilder.Append(';');
                 }
             }
-            string key = sb.ToString();
-            if (canon.TryGetValue(key, out int prev))
+            string key = keyBuilder.ToString();
+            if (canonicalByKey.TryGetValue(key, out int previousPoint))
             {
-                same[i] = prev;
+                canonicalPoint[i] = previousPoint;
             }
             else
             {
-                canon[key] = i;
-                same[i] = i;
+                canonicalByKey[key] = i;
+                canonicalPoint[i] = i;
             }
         }
-        int nc = cornerCp.Length;
-        int[] ccp = new int[nc];
-        for (int i = 0; i < nc; i++)
+        int cornerCount = cornerCp.Length;
+        int[] canonicalCornerPoints = new int[cornerCount];
+        for (int i = 0; i < cornerCount; i++)
         {
-            ccp[i] = same[cornerCp[i]];
+            canonicalCornerPoints[i] = canonicalPoint[cornerCp[i]];
         }
-        double[]? cn = null;
+        double[]? weldNormals = null;
         if (cornerNrm != null)
         {
-            cn = new double[nc * 3];
-            for (int i = 0; i < nc; i++)
+            weldNormals = new double[cornerCount * 3];
+            for (int i = 0; i < cornerCount; i++)
             {
                 double x = cornerNrm[i * 3];
                 double y = cornerNrm[i * 3 + 1];
                 double z = cornerNrm[i * 3 + 2];
-                double len = Math.Sqrt(x * x + y * y + z * z);
-                if (len <= 1e-12)
+                double length = Math.Sqrt(x * x + y * y + z * z);
+                if (length <= 1e-12)
                 {
-                    len = 1;
+                    length = 1;
                 }
-                cn[i * 3] = x / len;
-                cn[i * 3 + 1] = y / len;
-                cn[i * 3 + 2] = z / len;
+                weldNormals[i * 3] = x / length;
+                weldNormals[i * 3 + 1] = y / length;
+                weldNormals[i * 3 + 2] = z / length;
             }
         }
 
-        Weld(ccp, cn, cornerUv, out int[] first, out int[] inv);
-        int nv = first.Length;
-        int[] vcp = new int[nv];
-        for (int v = 0; v < nv; v++)
+        Weld(canonicalCornerPoints, weldNormals, cornerUv, out int[] firstCornerOfVertex, out int[] vertexOfCorner);
+        int vertexCount = firstCornerOfVertex.Length;
+        int[] vertexPoint = new int[vertexCount];
+        for (int vertex = 0; vertex < vertexCount; vertex++)
         {
-            vcp[v] = ccp[first[v]];
+            vertexPoint[vertex] = canonicalCornerPoints[firstCornerOfVertex[vertex]];
         }
-        mesh.Pos = new double[nv * 3];
-        for (int v = 0; v < nv; v++)
+        mesh.Positions = new double[vertexCount * 3];
+        for (int vertex = 0; vertex < vertexCount; vertex++)
         {
-            mesh.Pos[v * 3] = cp[vcp[v] * 3];
-            mesh.Pos[v * 3 + 1] = cp[vcp[v] * 3 + 1];
-            mesh.Pos[v * 3 + 2] = cp[vcp[v] * 3 + 2];
+            mesh.Positions[vertex * 3] = controlPoints[vertexPoint[vertex] * 3];
+            mesh.Positions[vertex * 3 + 1] = controlPoints[vertexPoint[vertex] * 3 + 1];
+            mesh.Positions[vertex * 3 + 2] = controlPoints[vertexPoint[vertex] * 3 + 2];
         }
-        mesh.Tris = new int[triCorners.Length];
+        mesh.Triangles = new int[triCorners.Length];
         for (int i = 0; i < triCorners.Length; i++)
         {
-            mesh.Tris[i] = inv[triCorners[i]];
+            mesh.Triangles[i] = vertexOfCorner[triCorners[i]];
         }
-        mesh.TMat = (int[])triMat.Clone();
-        mesh.Uv = new double[nv * 2];
+        mesh.TriangleMaterials = (int[])triangleMaterials.Clone();
+        mesh.Uvs = new double[vertexCount * 2];
         if (cornerUv != null)
         {
-            for (int v = 0; v < nv; v++)
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                mesh.Uv[v * 2] = cornerUv[first[v] * 2];
-                mesh.Uv[v * 2 + 1] = cornerUv[first[v] * 2 + 1];
+                mesh.Uvs[vertex * 2] = cornerUv[firstCornerOfVertex[vertex] * 2];
+                mesh.Uvs[vertex * 2 + 1] = cornerUv[firstCornerOfVertex[vertex] * 2 + 1];
             }
         }
-        mesh.Nrm = new double[nv * 3];
-        if (cn != null)
+        mesh.Normals = new double[vertexCount * 3];
+        if (weldNormals != null)
         {
-            for (int v = 0; v < nv; v++)
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                mesh.Nrm[v * 3] = cn[first[v] * 3];
-                mesh.Nrm[v * 3 + 1] = cn[first[v] * 3 + 1];
-                mesh.Nrm[v * 3 + 2] = cn[first[v] * 3 + 2];
+                mesh.Normals[vertex * 3] = weldNormals[firstCornerOfVertex[vertex] * 3];
+                mesh.Normals[vertex * 3 + 1] = weldNormals[firstCornerOfVertex[vertex] * 3 + 1];
+                mesh.Normals[vertex * 3 + 2] = weldNormals[firstCornerOfVertex[vertex] * 3 + 2];
             }
         }
         else
         {
             // smooth normals per control point, area weighted
-            double[] acc = new double[cp.Length];
-            for (int t = 0; t < triCorners.Length / 3; t++)
+            double[] accumulatedNormals = new double[controlPoints.Length];
+            for (int triangle = 0; triangle < triCorners.Length / 3; triangle++)
             {
-                int a = ccp[triCorners[t * 3]];
-                int b = ccp[triCorners[t * 3 + 1]];
-                int c = ccp[triCorners[t * 3 + 2]];
-                double ux = cp[b * 3] - cp[a * 3];
-                double uy = cp[b * 3 + 1] - cp[a * 3 + 1];
-                double uz = cp[b * 3 + 2] - cp[a * 3 + 2];
-                double wx = cp[c * 3] - cp[a * 3];
-                double wy = cp[c * 3 + 1] - cp[a * 3 + 1];
-                double wz = cp[c * 3 + 2] - cp[a * 3 + 2];
-                double fx = uy * wz - uz * wy;
-                double fy = uz * wx - ux * wz;
-                double fz = ux * wy - uy * wx;
-                foreach (int p in new[] { a, b, c })
+                int point0 = canonicalCornerPoints[triCorners[triangle * 3]];
+                int point1 = canonicalCornerPoints[triCorners[triangle * 3 + 1]];
+                int point2 = canonicalCornerPoints[triCorners[triangle * 3 + 2]];
+                double edge1X = controlPoints[point1 * 3] - controlPoints[point0 * 3];
+                double edge1Y = controlPoints[point1 * 3 + 1] - controlPoints[point0 * 3 + 1];
+                double edge1Z = controlPoints[point1 * 3 + 2] - controlPoints[point0 * 3 + 2];
+                double edge2X = controlPoints[point2 * 3] - controlPoints[point0 * 3];
+                double edge2Y = controlPoints[point2 * 3 + 1] - controlPoints[point0 * 3 + 1];
+                double edge2Z = controlPoints[point2 * 3 + 2] - controlPoints[point0 * 3 + 2];
+                double faceNormalX = edge1Y * edge2Z - edge1Z * edge2Y;
+                double faceNormalY = edge1Z * edge2X - edge1X * edge2Z;
+                double faceNormalZ = edge1X * edge2Y - edge1Y * edge2X;
+                foreach (int point in new[] { point0, point1, point2 })
                 {
-                    acc[p * 3] += fx;
-                    acc[p * 3 + 1] += fy;
-                    acc[p * 3 + 2] += fz;
+                    accumulatedNormals[point * 3] += faceNormalX;
+                    accumulatedNormals[point * 3 + 1] += faceNormalY;
+                    accumulatedNormals[point * 3 + 2] += faceNormalZ;
                 }
             }
-            for (int v = 0; v < nv; v++)
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                mesh.Nrm[v * 3] = acc[vcp[v] * 3];
-                mesh.Nrm[v * 3 + 1] = acc[vcp[v] * 3 + 1];
-                mesh.Nrm[v * 3 + 2] = acc[vcp[v] * 3 + 2];
+                mesh.Normals[vertex * 3] = accumulatedNormals[vertexPoint[vertex] * 3];
+                mesh.Normals[vertex * 3 + 1] = accumulatedNormals[vertexPoint[vertex] * 3 + 1];
+                mesh.Normals[vertex * 3 + 2] = accumulatedNormals[vertexPoint[vertex] * 3 + 2];
             }
         }
-        for (int v = 0; v < nv; v++)
+        for (int vertex = 0; vertex < vertexCount; vertex++)
         {
-            double x = mesh.Nrm[v * 3];
-            double y = mesh.Nrm[v * 3 + 1];
-            double z = mesh.Nrm[v * 3 + 2];
-            double len = Math.Sqrt(x * x + y * y + z * z);
-            if (len > 1e-12)
+            double x = mesh.Normals[vertex * 3];
+            double y = mesh.Normals[vertex * 3 + 1];
+            double z = mesh.Normals[vertex * 3 + 2];
+            double length = Math.Sqrt(x * x + y * y + z * z);
+            if (length > 1e-12)
             {
-                mesh.Nrm[v * 3] = x / len;
-                mesh.Nrm[v * 3 + 1] = y / len;
-                mesh.Nrm[v * 3 + 2] = z / len;
+                mesh.Normals[vertex * 3] = x / length;
+                mesh.Normals[vertex * 3 + 1] = y / length;
+                mesh.Normals[vertex * 3 + 2] = z / length;
             }
             else
             {
-                mesh.Nrm[v * 3] = 0;
-                mesh.Nrm[v * 3 + 1] = 1;
-                mesh.Nrm[v * 3 + 2] = 0;
+                mesh.Normals[vertex * 3] = 0;
+                mesh.Normals[vertex * 3 + 1] = 1;
+                mesh.Normals[vertex * 3 + 2] = 0;
             }
         }
 
-        if (cpInfl != null)
+        if (controlPointInfluences != null)
         {
             mesh.Skinned = true;
-            mesh.Jnt = new int[nv * 8];
-            mesh.Wgt = new double[nv * 8];
-            Array.Fill(mesh.Jnt, -1);
-            for (int v = 0; v < nv; v++)
+            mesh.Joints = new int[vertexCount * 8];
+            mesh.Weights = new double[vertexCount * 8];
+            Array.Fill(mesh.Joints, -1);
+            for (int vertex = 0; vertex < vertexCount; vertex++)
             {
-                List<Influence> infl = cpInfl[vcp[v]];
-                if (infl.Count == 0)
+                List<Influence> influences = controlPointInfluences[vertexPoint[vertex]];
+                if (influences.Count == 0)
                 {
                     continue;
                 }
-                List<Influence> ranked = new List<Influence>(infl);
+                List<Influence> ranked = new List<Influence>(influences);
                 // stable, heaviest first (List.Sort is not stable: order by weight, then position)
-                List<int> idx = new List<int>();
+                List<int> rankOrder = new List<int>();
                 for (int k = 0; k < ranked.Count; k++)
                 {
-                    idx.Add(k);
+                    rankOrder.Add(k);
                 }
-                idx.Sort((a, b) =>
+                rankOrder.Sort((left, right) =>
                 {
-                    int c = ranked[b].Weight.CompareTo(ranked[a].Weight);
-                    if (c != 0)
+                    int comparison = ranked[right].Weight.CompareTo(ranked[left].Weight);
+                    if (comparison != 0)
                     {
-                        return c;
+                        return comparison;
                     }
-                    return a.CompareTo(b);
+                    return left.CompareTo(right);
                 });
-                int count = Math.Min(8, idx.Count);
-                double tot = 0;
+                int count = Math.Min(8, rankOrder.Count);
+                double totalWeight = 0;
                 for (int k = 0; k < count; k++)
                 {
-                    tot += ranked[idx[k]].Weight;
+                    totalWeight += ranked[rankOrder[k]].Weight;
                 }
                 for (int k = 0; k < count; k++)
                 {
-                    mesh.Jnt[v * 8 + k] = ranked[idx[k]].Joint;
-                    mesh.Wgt[v * 8 + k] = ranked[idx[k]].Weight / tot;
+                    mesh.Joints[vertex * 8 + k] = ranked[rankOrder[k]].Joint;
+                    mesh.Weights[vertex * 8 + k] = ranked[rankOrder[k]].Weight / totalWeight;
                 }
             }
         }

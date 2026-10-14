@@ -15,15 +15,15 @@ class Program
 
         Raylib.InitWindow(1920, 1080, "DOTR Asset Extractor");
 
-        glRD.UpdateWindowToMonitor();
+        GuiContext.UpdateWindowToMonitor();
         Raylib.MaximizeWindow();
         Raylib.SetExitKey(KeyboardKey.Null);
         rlImGui.Setup();
-        glRD.Init();
+        GuiContext.Init();
         MainWindow main_window = new MainWindow();
         while (!Raylib.WindowShouldClose())
         {
-            glRD.UpdateWinDims();
+            GuiContext.UpdateWindowSize();
             Raylib.BeginDrawing();
             Raylib.ClearBackground(Color.Gray);
             rlImGui.Begin();
@@ -88,7 +88,7 @@ class Program
                 File.WriteAllText(PortablePath, json);
                 return;
             }
-            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException)
             {
             }
 
@@ -97,9 +97,9 @@ class Program
                 Directory.CreateDirectory(Path.GetDirectoryName(UserPath)!);
                 File.WriteAllText(UserPath, json);
             }
-            catch (Exception ex)
+            catch (Exception exception)
             {
-                Console.Error.WriteLine("Failed to save config: " + ex.Message);
+                Console.Error.WriteLine("Failed to save config: " + exception.Message);
             }
         }
     }
