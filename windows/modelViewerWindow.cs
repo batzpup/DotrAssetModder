@@ -199,8 +199,11 @@ public class ModelViewerWindow
         float top = bottom + modelScale * viewHeight;
         float left = shift.X + modelScale * viewLeft;
         float right = shift.X + modelScale * viewRight;
+        float back = shift.Z + modelScale * viewBack;
+        float front = shift.Z + modelScale * viewFront;
         bottom = MathF.Min(bottom, 0f);                // keep the grid in view
-        orbit.Frame(left, right, bottom, top, 0.3f);
+        orbit.Frame(new Vector3(left, bottom, back), new Vector3(right, top, front), 0.3f,
+            (float)viewportWidth / Math.Max(viewportHeight, 1));
     }
 
     // Opens the loaded ISO's MODEL.MRG for the board and map the first time View needs them,

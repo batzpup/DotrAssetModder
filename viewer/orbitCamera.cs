@@ -82,12 +82,17 @@ public sealed class OrbitCamera
         }
     }
 
-    // Looks square-on at the box from left to right and bottom to top (at z 0), from far
-    // enough back to see all of it, tipped down by `pitch`.
-    public void Frame(float left, float right, float bottom, float top, float pitch)
+    // Looks square-on at the box from `boxMin` to `boxMax`, tipped down by `pitch`, from far enough
+    // back that the sphere round the box fits the view whichever way it is turned. `aspect` is the
+    // viewport's width over its height; the narrower of the two fields of view sets the distance.
+    public void Frame(Vector3 boxMin, Vector3 boxMax, float pitch, float aspect)
     {
-        Target = new Vector3((left + right) * 0.5f, (top + bottom) * 0.5f, 0f);
-        Distance = MathF.Max(MathF.Max(top - bottom, right - left) * 1.3f, 0.5f);
+        Target = (boxMin + boxMax) * 0.5f;
+        float sphereRadius = (boxMax - boxMin).Length() * 0.5f;
+        float verticalHalfFov = Camera.FovY * 0.5f * MathF.PI / 180f;
+        float horizontalHalfFov = MathF.Atan(MathF.Tan(verticalHalfFov) * MathF.Max(aspect, 0.01f));
+        float narrowestHalfFov = MathF.Min(verticalHalfFov, horizontalHalfFov);
+        Distance = MathF.Max(sphereRadius / MathF.Sin(narrowestHalfFov), 0.5f);
         Yaw = 0f;
         Pitch = pitch;
     }
