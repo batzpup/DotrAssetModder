@@ -2,7 +2,6 @@
  Used for modding and preservation purposes
  Should work on cross platform and for all versions of the game.
 
-## NOTES
 
 ### AI Notice and disclosure:
 This has moderate to extensive use of AI primarily for the importing and exporting of the 3D Models, I do apologise, but many things around this project are out of my skillset, very time consuming and some of the formats are Konami specific formats with no documentation or uses elsewhere. I do not currently have the time, energy and passion to learn all the required skills that would normally be needed for this project without AI. But I know many people would like to have this functionality to unlock one of the last few hurdles in modding this game. If you do not wish to use this project because of the AI usage I completely understand.
@@ -33,27 +32,35 @@ The tool has four tabs:
 - Extract the game's 3D models as `.glb` (with all their animations) and textures as `.png`.
 - Extract the game's BGMs.
 - Movies: not supported yet, the tab links to tools you can use instead (see below).
+<img width="1875" height="1353" alt="image" src="https://github.com/user-attachments/assets/298b05d8-ccb0-4c92-9699-d77d88fe1be4" />
 
 ### Texture Viewer
-- Browse every texture in the game's texture archives.
-- Edit textures with the built-in tools (pencil, eraser, fill, eyedropper, undo/redo), or import a PNG, then save the slot back into the ISO.
+- Browse every game texture.
+- Edit textures with the built-in tools, or import a PNG, then save the slot back into the ISO.
 - Export any texture as PNG.
+<img width="2556" height="1348" alt="image" src="https://github.com/user-attachments/assets/0e7ae152-a9e1-4a96-b67d-8388c729a5a0" />
 
 ### Model Viewer
-- View any `.glb` / `.gltf` / `.fbx` / `.dae` model (Load Model, Load Folder, or drag a file onto the window).
+- View any `.glb` / `.gltf` / `.fbx` / `.dae` model (Load Model, or drag a file onto the window).
+- Load an entire folder of models
 - Play and scrub through its animations.
-- See it as the game places it: **Grid** (battle, real size), **Duel board**, or **Map leader**, using
+- See the model as the game places it: **Grid** (battle and real size), **Duel board**, or **Map leader**, using
   scenery from your loaded ISO.
+- WASD (ctrl+space for up down) to fly around (shift to sprint), left click to orbit around the middle of screen, right click to rotate, and middle click to pan
+<img width="2539" height="1339" alt="image" src="https://github.com/user-attachments/assets/cc10162d-2139-4994-895f-7d5a77164f3d" />
+
 
 ### Model Importer
 - **View** any model as it is on the ISO, or **Extract .glb** of it.
 - **Import a new model** into any slot from `.glb`, `.gltf`, `.fbx` or `.dae`.
-- **Edit an existing card's model** (scale, rotate, move, pivot) without leaving the game's own data.
-- **Remove model**: for when you dont have a 3d model for a new card
-- Preview imports before saving, with you are able compare your new mode with the model it replaces (or Dark Magician as its an average sized model) beside it.
-- Stage as many imports as you want, then **Save to ISO** once. **Check plan** shows what would be
-  written without writing anything.
+- **Edit an existing card's model** (scale, rotate, move, pivot)
+- **Remove model**: for when you don't have a 3d model for a new card
+- Preview imports before saving, you are able compare your new mode with the model it replaces (or Dark Magician as its an average sized model) beside it.
+- Stage and unstage as many imports as you want, then **Save to ISO** once. **Check plan** shows what would be written without writing anything.
 - Edit a card's height on the world map (Map leader); written on Save to ISO.
+
+<img width="2418" height="1246" alt="image" src="https://github.com/user-attachments/assets/e4c774af-b99b-46db-9783-58bcc65e9081" />
+<img width="1319" height="1204" alt="image" src="https://github.com/user-attachments/assets/37a8fbe7-9ba7-40cf-80e6-6b167fe38db0" />
 
 
 ## How To Use
@@ -85,7 +92,7 @@ The card keeps its own model, textures and animations. 163 Supporter in the Shad
 
 ### Animation notes
 The game has five motion slots: **Idle, Attack, Death, Win, Hurt**.
-A model missing one of these gets a copy of another motion in its place (the import status says which), so it still plays in battle, but a copied idle never shows a fall: give the model its own death and hurt animations if possible, if you care about the 3d battles.
+A model missing one of these gets a copy of another motion in its place (defaults to idle), so it still plays in battle. Some battle animations get stuck, the cause is currently unknown, but you are able to skip the animation to return to the battle.
 The 3d battle attack animations cannot be edited at the present time, so whatever you put into slot 0 and view the battle animation with, will use blue-eyes white dragons attack beam.
 
 ### Texture notes
