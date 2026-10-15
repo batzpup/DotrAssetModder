@@ -250,6 +250,10 @@ public class ExtractorWindow
 
 
         }
+        GuiContext.HoveredTooltip(@"A .txt file with one model name per line, in the file's order:
+line 1 names the first model, line 2 the second, and so on.
+For MONSTER.MRG it must have 683 lines, one per card, in card id order.
+An empty or missing line keeps the default name.");
         ImGui.SameLine();
         ImGui.Text(dataWordlistPath);
 
