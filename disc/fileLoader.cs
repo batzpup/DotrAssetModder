@@ -50,6 +50,11 @@ public class FileLoader : IDisposable
 
     public Action OnIsoloaded;
 
+    /* Raised before the open image's stream is closed (another ISO opened, or Dispose), outside the
+       stream lock, so a reader on another thread (BGM playback, a sound extraction) can stop
+       first instead of reading through a closed or replaced stream. */
+    public Action? OnIsoClosing;
+
     public string[] MovieNames;
 
     readonly List<FileEntry> _files = new();
@@ -76,6 +81,10 @@ public class FileLoader : IDisposable
 
     public void OpenIso(string filePath)
     {
+        if (fileStream is not null)
+        {
+            OnIsoClosing?.Invoke();
+        }
         CurrentIsoPath = filePath;
 
         lock (FileStreamLock)
@@ -246,6 +255,10 @@ public class FileLoader : IDisposable
 
     public void Dispose()
     {
+        if (fileStream is not null)
+        {
+            OnIsoClosing?.Invoke();
+        }
         lock (FileStreamLock)
         {
             fileStream?.Dispose();

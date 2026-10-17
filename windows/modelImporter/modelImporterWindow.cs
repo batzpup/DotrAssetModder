@@ -63,6 +63,8 @@ public partial class ModelImporterWindow
 
     bool convertOpen; // the Convert panel's own window
     bool convertShow; // newly opened: expand it and bring it to the front
+    bool convertSelectTransform; // newly opened: its tab bar goes back to Transform
+    bool convertClosedByUser; // closed with its own close button: the preview's Show options opens it again
     string convertPath = string.Empty;
     int convertIndex = -1;
     List<string> convertName = new List<string>();
@@ -86,6 +88,7 @@ public partial class ModelImporterWindow
         public Vector3 PivotAt;
         public float Radius;
         public Vector3 PivotRest; // a card's: its node 1 rest offset from node 0
+        public List<SoundCue>? SoundCues; // null: the card's own (LoadCardSoundCues)
     }
 
     bool convertIsCard; // the Convert window edits convertIndex's card
@@ -121,6 +124,8 @@ public partial class ModelImporterWindow
     bool viewKeepCamera; // a redo keeps the camera and animation
     string viewLabel = string.Empty; // the model's name beside its height
     float viewRadius = -1f; // the block's node 0 radius; -1: the importer's measure (View import)
+    List<SoundCue>? viewSoundCues; // View of a block: its sound cues (a View import plays the Convert window's)
+    List<SoundCue>? previewSoundCues;
     Vector3 viewMove; // View import: the Move it was converted with
     Vector3 viewRotate; // and the Rotate
     float viewScale = 1f; // and the Scale
@@ -185,8 +190,9 @@ public partial class ModelImporterWindow
     float animTime = 0f;
     bool animPlaying = false;
 
-    public ModelImporterWindow()
+    public ModelImporterWindow(MusicExtractorWindow soundPlayer)
     {
+        this.soundPlayer = soundPlayer;
         groupNames = new string[ModelMrg.Groups.Length + 1];
         groupNames[0] = "All";
         for (int i = 0; i < ModelMrg.Groups.Length; i++)
@@ -293,13 +299,16 @@ public partial class ModelImporterWindow
                 ImGui.SetNextWindowCollapsed(false);
                 ImGui.SetNextWindowFocus();
                 convertShow = false;
+                convertSelectTransform = true;
             }
-            string title = Path.GetFileName(convertPath);
+            string title = "Convert - " + Path.GetFileName(convertPath);
             if (convertIsCard)
             {
-                title = cardNames[convertIndex];
+                title = "View - " + cardNames[convertIndex];
             }
-            if (ImGui.Begin("Convert - " + title + "###importer_convert", ref convertOpen))
+            bool convertWindowShown = ImGui.Begin(title + "###importer_convert", ref convertOpen);
+            convertClosedByUser = !convertOpen;
+            if (convertWindowShown)
             {
                 DrawConvertPanel();
             }
@@ -352,6 +361,7 @@ public partial class ModelImporterWindow
         planReport = null;
         status = string.Empty;
         convertOpen = false;
+        convertClosedByUser = false;
         ClearReport();
         rowsDirty = true;
         return true;
@@ -360,6 +370,7 @@ public partial class ModelImporterWindow
     void SourceChanged()
     {
         convertOpen = false; // its slot index belongs to the other archive
+        convertClosedByUser = false;
         ClearReport();
         plan = null;
         planReport = null;
@@ -630,9 +641,11 @@ Off: a successful save clears the staging, since those models are now on the dis
         {
             if (ImGui.Button("Remove model"))
             {
-                RemoveModel(index);
+                removeModelSilence = false;
+                ImGui.OpenPopup("Remove model");
             }
             HoveredTooltip("Stages this card as a model the game loads and animates but that draws nothing (one zero-area triangle, a transparent texture). Its nodes, motions and radius stay as they are on the ISO.");
+            DrawRemoveModelPopup(index);
         }
         if (ImGui.Button("Load Model"))
         {
@@ -746,6 +759,11 @@ Off: a successful save clears the staging, since those models are now on the dis
             viewRotate = cardEdit.RotateOn ? cardEdit.Rotate : Vector3.Zero;
             viewScale = cardEdit.Scale;
         }
+        viewSoundCues = null;
+        if (source == SourceMonster)
+        {
+            viewSoundCues = Rh0Assembler.ReadSoundCues(bytes);
+        }
         byte[] donor = null;
         if (card)
         {
@@ -769,6 +787,7 @@ Off: a successful save clears the staging, since those models are now on the dis
         viewOpensCard = false;
         viewKeepCamera = redo;
         viewRadius = -1f;
+        viewSoundCues = null; // the preview plays the Convert window's cues
         viewMove = MoveApplied();
         viewRotate = RotateApplied();
         viewScale = optScale;
@@ -814,6 +833,7 @@ Off: a successful save clears the staging, since those models are now on the dis
             cardEdit.PivotAt = cardEdit.PivotRest;
             cardEdit.Radius = BlockRadius(BlockBytes(index));
         }
+        LoadCardSoundCues(index); // a staged edit's own cues replace them in SetImportOptions
         SetImportOptions(cardEdit);
         cardPivotRest = cardEdit.PivotRest;
         cardRadiusOwn = BlockRadius(BlockBytes(index));
@@ -864,6 +884,7 @@ Off: a successful save clears the staging, since those models are now on the dis
         windowOptions.PivotAt = optPivotAt;
         windowOptions.Radius = optRadius;
         windowOptions.PivotRest = cardPivotRest;
+        windowOptions.SoundCues = CloneSoundCues(optSoundCues);
         return windowOptions;
     }
 
@@ -877,6 +898,10 @@ Off: a successful save clears the staging, since those models are now on the dis
         optPivotOn = windowOptions.PivotOn;
         optPivotAt = windowOptions.PivotAt;
         optRadius = windowOptions.Radius;
+        if (windowOptions.SoundCues != null)
+        {
+            optSoundCues = CloneSoundCues(windowOptions.SoundCues);
+        }
     }
 
     /* The Convert window's View import: the source converted with the options as they stand,
@@ -908,6 +933,7 @@ Off: a successful save clears the staging, since those models are now on the dis
         viewOpensCard = false;
         viewKeepCamera = redo;
         viewRadius = -1f;
+        viewSoundCues = null; // the preview plays the Convert window's cues
         viewMove = new Vector3((float)convertOptions.TranslateX, (float)convertOptions.TranslateY, (float)convertOptions.TranslateZ);
         viewRotate = new Vector3((float)convertOptions.RotateX, (float)convertOptions.RotateY, (float)convertOptions.RotateZ);
         viewScale = (float)convertOptions.Scale;
@@ -1232,6 +1258,7 @@ Off: a successful save clears the staging, since those models are now on the dis
             previewIsMonster = viewIsMonster;
             previewCanCompare = viewCanCompare;
             previewIsImport = viewIsImport;
+            previewSoundCues = viewSoundCues;
             previewMove = viewMove;
             previewRotate = viewRotate;
             previewScale = viewScale;

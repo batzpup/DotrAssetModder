@@ -38,9 +38,11 @@ public partial class ModelImporterWindow
         }
         Program.config.lastModelImportPath = path;
         convertOpen = false;
+        convertClosedByUser = false;
         PutImportOptionsBack();
         convertPath = path;
         convertIndex = index;
+        LoadCardSoundCues(index);
         convertName = new List<string>();
         convertFrames = new List<int>();
         convertAnimLabels = new string[0];
@@ -213,32 +215,7 @@ public partial class ModelImporterWindow
     void DrawConvertPanel()
     {
         ImGui.Text("Into " + SlotName(convertIndex));
-
-        // With none or one animation there is nothing to choose: the one motion goes to idle and
-        // the importer copies it into the slots the model lacks. A card keeps its own motions.
-        if (convertIsCard)
-        {
-            ImGui.BeginDisabled();
-            DrawSlotTable();
-            ImGui.EndDisabled();
-        }
-        else if (convertName.Count == 0)
-        {
-            ImGui.TextDisabled("No animations: the model is imported standing still.");
-        }
-        else if (convertName.Count == 1)
-        {
-            ImGui.TextDisabled("One animation, " + convertAnimLabels[0] + ": it plays in every battle slot.");
-        }
-        else
-        {
-            DrawSlotTable();
-        }
-
-        if (ImGui.CollapsingHeader("Advanced"))
-        {
-            DrawAdvanced();
-        }
+        DrawOptionTabs();
 
         if (ImGui.Button("Import"))
         {
@@ -299,10 +276,11 @@ Nothing is staged; press it again after changing an option.");
         }
     }
 
-    /* The converter's options, the same ones tools/toglb.py takes. They hold between imports.
+    /* The options as tabs: Transform, Animation, Source fixes, then Game and Sounds (MONSTER.MRG).
+       The converter's options are the same ones tools/toglb.py takes and hold between imports.
        Fields are dragged (or double-clicked to type); the View import preview follows a drag at
        once and is converted again when it is let go. */
-    void DrawAdvanced()
+    void DrawOptionTabs()
     {
         bool changed = false;
         // Rows of toggle, name, then the fields, the names and fields lined up.
@@ -310,7 +288,103 @@ Nothing is staged; press it again after changing an option.");
         float nameAt = ImGui.GetCursorPosX() + ImGui.GetFrameHeight() + style.ItemSpacing.X;
         float valuesAt = nameAt + ImGui.CalcTextSize("Position").X + style.ItemSpacing.X * 2f;
 
-        ImGui.SeparatorText("Transform");
+        if (!ImGui.BeginTabBar("convert_tabs"))
+        {
+            return;
+        }
+        // a newly opened window always starts on Transform
+        ImGuiTabItemFlags transformTabFlags = ImGuiTabItemFlags.None;
+        if (convertSelectTransform)
+        {
+            transformTabFlags = ImGuiTabItemFlags.SetSelected;
+            convertSelectTransform = false;
+        }
+        if (BeginTabItemWithFlags(TransformTabLabel, transformTabFlags))
+        {
+            changed |= DrawTransformTab(nameAt, valuesAt);
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("Animation"))
+        {
+            DrawAnimationTab();
+            ImGui.EndTabItem();
+        }
+        if (ImGui.BeginTabItem("Source fixes"))
+        {
+            ImGui.BeginDisabled(convertIsCard); // a card has no source to fix
+            changed |= ImGui.Checkbox("Bind at first frame", ref optRestFromAnim);
+            HoveredTooltip(@"Bind the skin at the first animation's first frame instead of the file's bind pose.
+Only for rips whose bind pose lies flat or is never shown;
+vertices pulled by several bones then move slightly differently.");
+
+            changed |= ImGui.Checkbox("Flip UV", ref optFlipUv);
+            HoveredTooltip(@"Turn this on if the textures land upside down: the source's UVs are already top-left.
+Done by itself for FBX files exported by Unity Studio.");
+            ImGui.EndDisabled();
+            ImGui.EndTabItem();
+        }
+        if (changed)
+        {
+            importDirty = true;
+        }
+        if (source == SourceMonster)
+        {
+            if (ImGui.BeginTabItem("Game"))
+            {
+                DrawRadius(nameAt, valuesAt);
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Sounds"))
+            {
+                soundsTabShownFrame = ImGui.GetFrameCount();
+                DrawSoundCues();
+                ImGui.EndTabItem();
+            }
+        }
+        ImGui.EndTabBar();
+    }
+
+    // Which animation plays in each battle slot. With none or one animation there is nothing to
+    // choose: the one motion goes to idle and the importer copies it into the slots the model
+    // lacks. A card keeps its own motions.
+    void DrawAnimationTab()
+    {
+        if (convertIsCard)
+        {
+            ImGui.BeginDisabled();
+            DrawSlotTable();
+            ImGui.EndDisabled();
+        }
+        else if (convertName.Count == 0)
+        {
+            ImGui.TextDisabled("No animations: the model is imported standing still.");
+        }
+        else if (convertName.Count == 1)
+        {
+            ImGui.TextDisabled("One animation, " + convertAnimLabels[0] + ": it plays in every battle slot.");
+        }
+        else
+        {
+            DrawSlotTable();
+        }
+    }
+
+    // The Transform tab: Scale, Rotate, Position, Pivot. True when a change is done.
+    static readonly byte[] TransformTabLabel = System.Text.Encoding.UTF8.GetBytes("Transform\0");
+
+    // ImGui.BeginTabItem with flags but no close button (ImGui.NET takes flags only with `ref open`);
+    // `nullTerminatedLabel` is UTF-8 ending in a 0 byte.
+    static unsafe bool BeginTabItemWithFlags(byte[] nullTerminatedLabel, ImGuiTabItemFlags flags)
+    {
+        fixed (byte* labelPointer = nullTerminatedLabel)
+        {
+            return ImGuiNative.igBeginTabItem(labelPointer, null, flags) != 0;
+        }
+    }
+
+    bool DrawTransformTab(float nameAt, float valuesAt)
+    {
+        bool changed = false;
         bool locked = convertIsCard && !cardEditable;
         if (locked)
         {
@@ -371,30 +445,10 @@ until the radius passes 133 (x0.3). Set Radius to keep the shrink fixed.");
             new string[] { }, pivotStart);
         ImGui.EndDisabled();
         ImGui.EndDisabled();
-
-        ImGui.SeparatorText("Source fixes");
-        ImGui.BeginDisabled(convertIsCard); // a card has no source to fix
-        changed |= ImGui.Checkbox("Bind at first frame", ref optRestFromAnim);
-        HoveredTooltip(@"Bind the skin at the first animation's first frame instead of the file's bind pose.
-Only for rips whose bind pose lies flat or is never shown;
-vertices pulled by several bones then move slightly differently.");
-
-        changed |= ImGui.Checkbox("Flip UV", ref optFlipUv);
-        HoveredTooltip(@"Turn this on if the textures land upside down: the source's UVs are already top-left.
-Done by itself for FBX files exported by Unity Studio.");
-        ImGui.EndDisabled();
-        if (changed)
-        {
-            importDirty = true;
-        }
-        if (source == SourceMonster)
-        {
-            ImGui.SeparatorText("Game");
-            DrawRadius(nameAt, valuesAt);
-        }
+        return changed;
     }
 
-    /* One Advanced row: the toggle, `name`, then X/Y/Z fields dragged by `speed` (greyed while
+    /* One Transform row: the toggle, `name`, then X/Y/Z fields dragged by `speed` (greyed while
        off), and a `resetLabel` button that puts them back at `resetTo` (where the row started).
        True when a change is done (a drag let go, a value typed, the toggle or the button). */
     bool AxisRow(string name, string imguiId, ref bool enabled, ref Vector3 value, float speed, string resetLabel,

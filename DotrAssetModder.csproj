@@ -16,6 +16,8 @@
       <PackageReference Include="NativeFileDialogSharp" Version="0.5.0" />
       <PackageReference Include="NAudio" Version="2.3.0" />
       <PackageReference Include="Raylib-cs" Version="8.0.0" />
+      <PackageReference Include="Sdcb.FFmpeg" Version="7.0.0" />
+      <PackageReference Include="Sdcb.FFmpeg.runtime.windows-x64" Version="7.1.0" />
       <PackageReference Include="rlImgui-cs" Version="3.2.0" />
       <PackageReference Include="SharpGLTF.Core" Version="1.0.6" />
       <PackageReference Include="SharpGLTF.Runtime" Version="1.0.6" />

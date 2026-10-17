@@ -8,7 +8,8 @@ public partial class ModelImporterWindow
 {
     // The card as on the ISO with its geometry removed (GlbImporter.RemoveModel), staged in place of
     // anything staged for it. The ISO's radius is kept so the board and map treat it as before.
-    void RemoveModel(int index)
+    // silenceSounds: its sound cue table is emptied, else its sounds stay as they are.
+    void RemoveModel(int index, bool silenceSounds)
     {
         reportIndex = index;
         reportWarnings = new List<string>();
@@ -17,7 +18,12 @@ public partial class ModelImporterWindow
             byte[] block = BlockBytes(index);
             ImportedModel model = GlbImporter.LoadFromBytes(ModelExtractor.ExtractGlb(block));
             GlbImporter.RemoveModel(model);
-            StageMonster(index, model, cardNames[index] + " (removed)", BlockRadius(block));
+            List<SoundCue>? soundCues = null;
+            if (silenceSounds)
+            {
+                soundCues = new List<SoundCue>();
+            }
+            StageMonster(index, model, cardNames[index] + " (removed)", BlockRadius(block), soundCues);
         }
         catch (Exception exception)
         {
@@ -79,7 +85,7 @@ public partial class ModelImporterWindow
         {
             if (source == SourceMonster)
             {
-                StageMonster(index, GlbImporter.LoadFromBytes(glb), label, optRadius);
+                StageMonster(index, GlbImporter.LoadFromBytes(glb), label, optRadius, SoundCuesToWrite());
             }
             else
             {
@@ -107,7 +113,8 @@ public partial class ModelImporterWindow
         }
     }
 
-    void StageMonster(int index, ImportedModel model, string label, float boundsRadius)
+    // soundCues: null keeps the card's sound cues as they are, a list replaces them.
+    void StageMonster(int index, ImportedModel model, string label, float boundsRadius, List<SoundCue>? soundCues)
     {
         byte[] donor = LoadTemplate(index);
         List<Rh0Assembler.TextureInput> textures = GlbImporter.DecodeGlbTextures(model);
@@ -132,7 +139,7 @@ public partial class ModelImporterWindow
                     askedBudget = budget;
                     return allowReduction;
                 },
-                textures, boundsRadius);
+                textures, boundsRadius, soundCues);
         }
         catch (Exception) when (asked)
         {
@@ -350,6 +357,7 @@ public partial class ModelImporterWindow
                     if (convertIsCard)
                     {
                         convertOpen = false;
+                        convertClosedByUser = false;
                     }
                 }
             }

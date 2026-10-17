@@ -29,7 +29,7 @@ public class MainWindow
         extractWindow = new();
         textureWindow = new();
         modelWindow = new();
-        importWindow = new();
+        importWindow = new(extractWindow.MusicExtractor);
     }
 
 
@@ -46,6 +46,10 @@ public class MainWindow
                 if (extension == ".iso" && currentWindow == Windows.Extractor)
                 {
                     FileLoader.Instance.OpenIso(files[0]);
+                }
+                else if (MusicExtractorWindow.IsReplacementFile(files[0]) && currentWindow == Windows.Extractor)
+                {
+                    extractWindow.DropSoundFile(files[0]);
                 }
                 else if (extension is ".glb" or ".gltf")
                 {
@@ -123,8 +127,12 @@ public class MainWindow
                 importWindow.Render();
                 ImGui.EndTabItem();
             }
-         
+
             ImGui.EndTabBar();
+        }
+        if (currentWindow != Windows.Extractor)
+        {
+            extractWindow.PauseMoviePreview();
         }
         
 

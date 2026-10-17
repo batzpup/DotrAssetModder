@@ -120,9 +120,10 @@ public static class Rh0Assembler
         public List<(int Slot, int From)> MotionClones = new();
     }
 
+    // soundCues: null keeps the template's sound cue table as it is; a list replaces it.
     public static Result Assemble(byte[] originalMrg, RebuildPipeline.Result rebuilt,
         IReadOnlyList<TextureInput>? textures, int blockSize, bool trimToContent,
-        ConfirmReduction confirmReduction, bool ownSizeTextures)
+        ConfirmReduction confirmReduction, bool ownSizeTextures, IReadOnlyList<SoundCue>? soundCues = null)
     {
         if (ReadU32(originalMrg, 0) != Rh0Magic) throw new InvalidOperationException("template is not an RH0");
         var result = new Result();
@@ -361,6 +362,10 @@ public static class Rh0Assembler
         for (int i = 0; i < 0x80 && i < aux2.Length; i++) aux2[i] = 0;
 
         byte[] earlyPostMotionChain = CapturePostMotChain(originalMrg);
+        if (soundCues != null)
+        {
+            earlyPostMotionChain = WithSoundCues(originalMrg, earlyPostMotionChain, soundCues);
+        }
 
         int EstimateTotalSize(int textureCount)
         {
@@ -691,7 +696,15 @@ public static class Rh0Assembler
     /// false-positive magic match, not a real block).
     internal static long ComputeBlockEnd(ReadOnlySpan<byte> bytes, long blockBase, out long postMotStart)
     {
+        return WalkRegionChain(bytes, blockBase, out postMotStart, out _);
+    }
+
+    /* ComputeBlockEnd's walk; soundCueTableStart receives where the bit-21 region (the sound cue
+       table) starts, or -1 when the block has none. */
+    private static long WalkRegionChain(ReadOnlySpan<byte> bytes, long blockBase, out long postMotStart, out long soundCueTableStart)
+    {
         postMotStart = -1;
+        soundCueTableStart = -1;
         if (blockBase < 0 || blockBase + 0x10 > bytes.Length) return -1;
         if (ReadU32(bytes, (int)blockBase) != Rh0Magic) return -1;
 
@@ -724,6 +737,7 @@ public static class Rh0Assembler
                orig.Length; pack scanning does not, and this bit hasn't been observed in
                MODEL.MRG). Signal "open-ended" with a sentinel the pack scanner treats as
                "cannot determine, stop scanning". */
+            soundCueTableStart = chainCursor;
             return long.MaxValue;
         }
         return Math.Min(chainCursor, bytes.Length);
@@ -786,6 +800,114 @@ public static class Rh0Assembler
             throw new InvalidOperationException(
                 $"RH0 region chain computed end (0x{blockEnd:X}) exceeds the block size " +
                 $"(0x{block.Length:X}).");
+    }
+
+    /* The sound cue table (bit-21 region, SzModel_ReqSE): a fixed 0x100 bytes = 64 records
+       `u16 (frame << 4) | motionSlot, u16 soundId` (bit 15 of soundId = don't restart); a slot
+       nibble of 0xF ends the list, and retail fills the rest of the 0x100 with 0xFF. Any bytes
+       after the 0x100 are not part of it and are kept as they are. */
+    public const int SoundCueTableSize = 0x100;
+    public const int SoundCueRecordSize = 4;
+    public const int MaxSoundCues = SoundCueTableSize / SoundCueRecordSize;
+    public const int MaxSoundCueFrame = 0xFFF;
+    public const int MaxSoundCueSlot = 7;
+    public const int MaxSoundCueIndex = 0x7FFF;
+    const int SoundCueEndSlot = 0xF;
+    const int SoundCueNoRestartBit = 0x8000;
+
+    // The block's sound cues, or null when it has no cue table (no bit 21).
+    public static List<SoundCue>? ReadSoundCues(byte[] block)
+    {
+        long tableStart = SoundCueTableStart(block);
+        if (tableStart < 0)
+        {
+            return null;
+        }
+        var cues = new List<SoundCue>();
+        for (int recordIndex = 0; recordIndex < MaxSoundCues; recordIndex++)
+        {
+            int recordOffset = (int)tableStart + recordIndex * SoundCueRecordSize;
+            ushort key = ReadU16(block, recordOffset);
+            if ((key & 0xF) == SoundCueEndSlot)
+            {
+                break;
+            }
+            ushort soundId = ReadU16(block, recordOffset + 2);
+            var cue = new SoundCue();
+            cue.MotionSlot = key & 0xF;
+            cue.Frame = key >> 4;
+            cue.SoundIndex = soundId & MaxSoundCueIndex;
+            cue.NoRestart = (soundId & SoundCueNoRestartBit) != 0;
+            cues.Add(cue);
+        }
+        return cues;
+    }
+
+    // Where the block's cue table starts, -1 when it has none or it would run past the block.
+    static long SoundCueTableStart(byte[] block)
+    {
+        if (WalkRegionChain(block, 0, out _, out long tableStart) == -1 || tableStart < 0)
+        {
+            return -1;
+        }
+        if (tableStart + SoundCueTableSize > block.Length)
+        {
+            return -1;
+        }
+        return tableStart;
+    }
+
+    // Writes `cues` as a cue table at `tableOffset`: the records, the end record, 0xFF to 0x100.
+    static void WriteSoundCues(byte[] bytes, int tableOffset, IReadOnlyList<SoundCue> cues)
+    {
+        if (cues.Count > MaxSoundCues)
+        {
+            throw new ArgumentException($"{cues.Count} sound cues, the table holds {MaxSoundCues}", nameof(cues));
+        }
+        bytes.AsSpan(tableOffset, SoundCueTableSize).Fill(0xFF);
+        for (int cueIndex = 0; cueIndex < cues.Count; cueIndex++)
+        {
+            SoundCue cue = cues[cueIndex];
+            if (cue.MotionSlot < 0 || cue.MotionSlot > MaxSoundCueSlot || cue.Frame < 0 || cue.Frame > MaxSoundCueFrame
+                || cue.SoundIndex < 0 || cue.SoundIndex > MaxSoundCueIndex)
+            {
+                throw new ArgumentException($"sound cue {cueIndex}: slot {cue.MotionSlot}, frame {cue.Frame}, sound {cue.SoundIndex} out of range", nameof(cues));
+            }
+            int soundId = cue.SoundIndex;
+            if (cue.NoRestart)
+            {
+                soundId |= SoundCueNoRestartBit;
+            }
+            int recordOffset = tableOffset + cueIndex * SoundCueRecordSize;
+            WriteU16(bytes, recordOffset, (ushort)((cue.Frame << 4) | cue.MotionSlot));
+            WriteU16(bytes, recordOffset + 2, (ushort)soundId);
+        }
+    }
+
+    /* The captured post-MOT chain with its cue table replaced by `cues`; everything else in it
+       stays as it is. Throws when the template has no cue table. */
+    static byte[] WithSoundCues(byte[] originalMrg, byte[] postMotionChain, IReadOnlyList<SoundCue> cues)
+    {
+        long tableStart = SoundCueTableStart(originalMrg);
+        WalkRegionChain(originalMrg, 0, out long postMotStart, out _);
+        if (tableStart < 0 || postMotStart < 0 || tableStart < postMotStart)
+        {
+            throw new InvalidOperationException("the card has no sound cue table (RH0 sectionFlags bit 21)");
+        }
+        int tableOffset = (int)(tableStart - postMotStart);
+        byte[] chainBytes = postMotionChain;
+        int neededLength = Align16(tableOffset + SoundCueTableSize);
+        if (chainBytes.Length < neededLength)
+        {
+            chainBytes = new byte[neededLength];
+            Array.Copy(postMotionChain, chainBytes, postMotionChain.Length);
+        }
+        else
+        {
+            chainBytes = (byte[])postMotionChain.Clone();
+        }
+        WriteSoundCues(chainBytes, tableOffset, cues);
+        return chainBytes;
     }
 
     private static byte[] CapturePostMotChain(byte[] originalMrg)

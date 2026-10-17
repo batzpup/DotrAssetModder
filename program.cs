@@ -15,7 +15,7 @@ class Program
 
         Raylib.SetConfigFlags(ConfigFlags.ResizableWindow | ConfigFlags.VSyncHint);
 
-        Raylib.InitWindow(1920, 1080, "DOTR Asset Extractor");
+        Raylib.InitWindow(1920, 1080, "DOTR Asset Modder");
 
         GuiContext.UpdateWindowToMonitor();
         Raylib.MaximizeWindow();
@@ -72,6 +72,9 @@ class Program
         public string lastDataExtractPath { get; set; }
         public string lastModelFolderPath { get; set; }
         public string lastMovieExtractPath { get; set; }
+        public string lastMusicExtractPath { get; set; }
+        public string lastSoundReplacePath { get; set; }
+        public int movieVolumePercent { get; set; } = 100;
 
         
         

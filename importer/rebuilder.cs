@@ -24,10 +24,12 @@ public static class Rebuilder
        textures or animation to fit. Each texture keeps its own power-of-two size rather than
        the donor slot's; a texture that fits its donor still takes the template path, so retail
        round trips are unchanged. If the block overflows, ReduceTextures asks through
-       confirmReduction before shrinking anything. */
+       confirmReduction before shrinking anything. soundCues: null keeps the donor's sound cues,
+       a list replaces them (Rh0Assembler.Assemble). */
     public static ImportResult Import(ImportedModel model, byte[] donor, int budget, bool trimToContent,
         Rh0Assembler.ConfirmReduction confirmReduction,
-        IReadOnlyList<Rh0Assembler.TextureInput>? textures = null, float boundsRadius = 0f)
+        IReadOnlyList<Rh0Assembler.TextureInput>? textures = null, float boundsRadius = 0f,
+        IReadOnlyList<SoundCue>? soundCues = null)
     {
         if (textures == null)
         {
@@ -35,7 +37,7 @@ public static class Rebuilder
         }
         RebuildPipeline.Result rebuilt = BuildOver(model, donor, boundsRadius, false);
         Rh0Assembler.Result assembled = Rh0Assembler.Assemble(donor, rebuilt, textures, budget, trimToContent,
-            confirmReduction, !model.IsDotrExtractedGlb);
+            confirmReduction, !model.IsDotrExtractedGlb, soundCues);
         // a slot past the template's count that the 1 MiB block could not grow to hold
         foreach (var (slot, onto) in assembled.ShedTextureSlots)
         {

@@ -1247,6 +1247,20 @@ public static class FbxReader
             return Images.Load(names, data);
         }
 
+        // Some exporters (Cross Duel rips) write the Texture objects but never connect them to a
+        // material or model; the first such texture in file order, or null.
+        object? UnconnectedTexture()
+        {
+            foreach (object objectId in Document.Ids)
+            {
+                if (Document.Kind[objectId] == "Texture" && Document.ParentsOf(objectId).Count == 0)
+                {
+                    return objectId;
+                }
+            }
+            return null;
+        }
+
         int Material(object materialId, List<object> texturesFallback)
         {
             int existingIndex;
@@ -1285,6 +1299,10 @@ public static class FbxReader
             if (textureId == null && texturesFallback.Count > 0)
             {
                 textureId = texturesFallback[0];
+            }
+            if (textureId == null)
+            {
+                textureId = UnconnectedTexture();
             }
             SKBitmap? image = null;
             if (textureId != null)

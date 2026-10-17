@@ -10,6 +10,8 @@ public partial class ModelImporterWindow
 {
     // The Move, Rotate and Pivot gizmos on a View import, each shown while its toggle is on. A
     // handle is 0-2 the X/Y/Z arrow or ring, 3 the centre (Move, Pivot).
+    // Seconds before an animation's end where its held last frame is sampled.
+    const float LastFrameSampleOffset = 0.001f;
     const int GizmoMove = 0;
     const int GizmoRotate = 1;
     const int GizmoPivot = 2;
@@ -42,6 +44,7 @@ public partial class ModelImporterWindow
             currentAnim = 0;
             animTime = 0f;
             animPlaying = previewModel.AnimationCount > 0;
+            soundPlayer.StopMixedSounds(); // a new animation starts
         }
 
         previewModel.MeasureStanding(IdleAnimIndex(previewModel), out previewLowest, out previewHeight,
@@ -91,7 +94,17 @@ public partial class ModelImporterWindow
             {
                 animTime = 0f;
                 animPlaying = true;
+                soundPlayer.StopMixedSounds();
             }
+        }
+        if (ConvertReopenable())
+        {
+            if (ImGui.Button("Show options"))
+            {
+                convertOpen = true;
+                convertShow = true;
+            }
+            HoveredTooltip("Open the window with this model's options again.");
         }
         DrawCompareControls();
 
@@ -171,7 +184,7 @@ It is this card's model as it is on the ISO: the model the import replaces.");
         {
             extraTooltip = @"
 Pivot and Position show here; an import keeps the replaced card's map height.
-The radius of an import can be set in the Convert window's Advanced options.";
+The radius of an import can be set in the Convert window's Game tab.";
         }
         int heightBefore = modelMrg.Tables.MapLeaderY(card);
         if (viewScene.DrawControls(previewIsMonster, ref card, false, extraTooltip))
@@ -210,17 +223,44 @@ The radius of an import can be set in the Convert window's Advanced options.";
 
         previewModel.AdvanceTextureAnim(Raylib.GetFrameTime());
 
-        if (animPlaying)
+        float duration = previewModel.Duration(currentAnim);
+        if (animPlaying && duration > 0f)
         {
-            float duration = previewModel.Duration(currentAnim);
-            if (duration > 0f)
+            float previousTime = animTime;
+            animTime += Raylib.GetFrameTime();
+            if (animTime >= duration && PreviewSoundCuesHeard())
             {
-                animTime += Raylib.GetFrameTime();
+                // The cues up to the end play, then the last frame holds while any cue sound
+                // plays (animTime stays at duration); the loop starts again once they ended.
+                if (previousTime < duration)
+                {
+                    PlayPreviewSoundCues(previousTime, duration, false);
+                }
+                if (soundPlayer.MixedSoundsPlaying)
+                {
+                    animTime = duration;
+                }
+                else
+                {
+                    animTime = 0f;
+                    PlayPreviewSoundCues(previousTime, animTime, true);
+                }
+            }
+            else
+            {
+                bool wrapped = animTime >= duration;
                 animTime %= duration;
+                PlayPreviewSoundCues(previousTime, animTime, wrapped);
             }
         }
 
-        previewModel.SetAnimationFrame(currentAnim, animTime);
+        // the armature loops its sampling, so the held end is sampled just before it
+        float sampleTime = animTime;
+        if (duration > 0f && sampleTime >= duration)
+        {
+            sampleTime = duration - LastFrameSampleOffset;
+        }
+        previewModel.SetAnimationFrame(currentAnim, sampleTime);
     }
 
     // The compare model plays its idle on its own clock; Pause stops it too.
@@ -301,6 +341,12 @@ The radius of an import can be set in the Convert window's Advanced options.";
     bool ImportPreviewShown()
     {
         return convertOpen && previewLoaded && previewIsImport && previewIndex == convertIndex;
+    }
+
+    // The preview shows the View import of the options window the user closed.
+    bool ConvertReopenable()
+    {
+        return convertClosedByUser && !convertOpen && previewLoaded && previewIsImport && previewIndex == convertIndex;
     }
 
     // The gizmos show on the View import, each while its toggle is on (Pivot's only where it is

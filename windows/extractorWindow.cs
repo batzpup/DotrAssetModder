@@ -22,7 +22,15 @@ public class ExtractorWindow
     bool openUnsupportedNext;
 
     MusicExtractorWindow musicExtractor = new MusicExtractorWindow();
+    // The sound player and staged sounds, shared with the model importer's sound cues.
+    public MusicExtractorWindow MusicExtractor => musicExtractor;
     MovieExtractorWindow movieExtractor = new MovieExtractorWindow();
+
+    // Leaving the Extractor tab pauses the movie preview.
+    public void PauseMoviePreview()
+    {
+        movieExtractor.PausePreview();
+    }
 
     public void Render()
     {
@@ -71,6 +79,10 @@ public class ExtractorWindow
             if (CurrentExtractor != CurrentExtractor.Sound)
             {
                 musicExtractor.StopMusic();
+            }
+            if (CurrentExtractor != CurrentExtractor.Movie)
+            {
+                movieExtractor.PausePreview();
             }
             if (ImGui.BeginPopupModal("No Destination", ImGuiWindowFlags.AlwaysAutoResize))
             {
@@ -126,6 +138,15 @@ public class ExtractorWindow
             }
         }
         ImGui.PopFont();
+    }
+
+    // An audio file dropped on the window: replaces the selected sound when the Sound extractor is shown.
+    public void DropSoundFile(string filePath)
+    {
+        if (FileLoader.Instance.IsIsoLoaded && CurrentExtractor == CurrentExtractor.Sound)
+        {
+            musicExtractor.ReplaceSelectedSoundWith(filePath);
+        }
     }
 
     void StartDataExtraction(string[] fileList, int index)

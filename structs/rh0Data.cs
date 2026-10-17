@@ -55,6 +55,26 @@ sealed class GameNode
     public List<int> Children = new();
 }
 
+// One record of a monster's sound cue table (RH0 sectionFlags bit 21, read by SzModel_ReqSE):
+// sound SoundIndex of the card's monster bank plays when MotionSlot's motion passes Frame.
+public sealed class SoundCue
+{
+    public int MotionSlot;
+    public int Frame;       // MOT frames, 30 per second; slot 2 counts on the attack effect's frames
+    public int SoundIndex;  // entry in the card's SEGRP.MRG bank
+    public bool NoRestart;  // not restarted while it still plays (bit 15 of the stored sound id)
+
+    public SoundCue Clone()
+    {
+        var copy = new SoundCue();
+        copy.MotionSlot = MotionSlot;
+        copy.Frame = Frame;
+        copy.SoundIndex = SoundIndex;
+        copy.NoRestart = NoRestart;
+        return copy;
+    }
+}
+
 readonly record struct DotrBlendState(
     string Mode,
     float AlphaCutoff,
