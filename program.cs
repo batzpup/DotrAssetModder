@@ -72,9 +72,12 @@ class Program
         public string lastDataExtractPath { get; set; }
         public string lastModelFolderPath { get; set; }
         public string lastMovieExtractPath { get; set; }
+        public string lastMovieReplacePath { get; set; }
         public string lastMusicExtractPath { get; set; }
         public string lastSoundReplacePath { get; set; }
         public int movieVolumePercent { get; set; } = 100;
+        // Which MSG file an EU disc's text is read from, by MessageLanguage.Name.
+        public string messageLanguage { get; set; }
 
         
         

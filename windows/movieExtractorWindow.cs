@@ -79,7 +79,6 @@ public class MovieExtractorWindow
             RenderPreview(moviePath);
         }
         ImGui.EndChild();
-        RenderSaveConfirmPopup();
     }
 
     void RenderControls(string moviePath, Vector2 buttonSize, bool conversionRunning)
@@ -129,11 +128,14 @@ public class MovieExtractorWindow
         {
             ImGui.EndDisabled();
         }
+        // Inside ##MovieControls, as OpenPopup is: the popup ID includes the child's ID stack.
+        RenderSaveConfirmPopup();
 
-        if (selectedIsReplaced)
+        // Looked up again: Revert above may have just removed it.
+        if (stagedMovies.TryGetValue(moviePath, out StagedMovie? stagedMovie))
         {
             ImGui.PushTextWrapPos();
-            ImGui.TextUnformatted($"Replaced with {stagedMovies[moviePath].SourceName}: {stagedMovies[moviePath].Summary}");
+            ImGui.TextUnformatted($"Replaced with {stagedMovie.SourceName}: {stagedMovie.Summary}");
             ImGui.PopTextWrapPos();
         }
         RenderConversionStatus(buttonSize.X);
@@ -400,11 +402,12 @@ public class MovieExtractorWindow
 
     void StartReplacement(string moviePath)
     {
-        DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of(ReplacementFileExtensions), Program.config.lastMovieExtractPath);
+        DialogResult dialogResult = Dialog.FileOpen(FileDialogFilter.Of(ReplacementFileExtensions), Path.GetDirectoryName(Program.config.lastMovieReplacePath));
         if (!dialogResult.IsOk)
         {
             return;
         }
+        Program.config.lastMovieReplacePath = dialogResult.Path;
         FileLoader.FileEntry? movieFile = fileloader.Find(moviePath);
         if (movieFile == null)
         {

@@ -21,10 +21,43 @@ public class ExtractorWindow
     bool openResultsNext;
     bool openUnsupportedNext;
 
+    // The loaded disc's text languages (null when its text is in its ELF), read once per ISO.
+    string messageLanguagesIso;
+    MessageLanguage[]? messageLanguages;
+    string[] messageLanguageNames = [];
+
     MusicExtractorWindow musicExtractor = new MusicExtractorWindow();
     // The sound player and staged sounds, shared with the model importer's sound cues.
     public MusicExtractorWindow MusicExtractor => musicExtractor;
     MovieExtractorWindow movieExtractor = new MovieExtractorWindow();
+
+    // A disc whose text comes in several languages (EU): which one card names are read in.
+    void RenderMessageLanguage()
+    {
+        if (messageLanguagesIso != FileLoader.Instance.CurrentIsoPath)
+        {
+            messageLanguagesIso = FileLoader.Instance.CurrentIsoPath;
+            messageLanguages = GameTables.MessageLanguagesOf(FileLoader.Instance);
+            messageLanguageNames = [];
+            if (messageLanguages != null)
+            {
+                messageLanguageNames = messageLanguages.Select(language => language.Name).ToArray();
+            }
+        }
+        if (messageLanguages == null)
+        {
+            return;
+        }
+        int languageIndex = Array.IndexOf(messageLanguages, GameTables.ChosenLanguage(messageLanguages));
+        ImGui.Text("Text language");
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(GuiContext.FieldWidth(0.15f, 10f));
+        if (ImGui.Combo("##messageLanguage", ref languageIndex, messageLanguageNames, messageLanguageNames.Length))
+        {
+            GameTables.ChooseMessageLanguage(messageLanguages[languageIndex].Name);
+        }
+        GuiContext.HoveredTooltip("Which of the disc's MSG files card names are read from.");
+    }
 
     // Leaving the Extractor tab pauses the movie preview.
     public void PauseMoviePreview()
@@ -51,6 +84,10 @@ public class ExtractorWindow
             {
                 ImGui.OpenPopup("Error");
             }
+        }
+        if (FileLoader.Instance.IsIsoLoaded)
+        {
+            RenderMessageLanguage();
         }
         if (FileLoader.Instance.IsIsoLoaded)
         {
@@ -156,7 +193,40 @@ public class ExtractorWindow
         byte[] fileBytes = FileLoader.Instance.GetFileBytesFromDisk(currentFile);
         string fileNameStem = IsoPaths.FileNameWithoutExtension(currentFile);
         IList<string>? wordlistNames = LoadWordlist();
+        if (wordlistNames == null && IsoPaths.FileName(currentFile).Equals("MONSTER.MRG", StringComparison.OrdinalIgnoreCase))
+        {
+            wordlistNames = MonsterCardFileNames(fileBytes.Length / GameTables.MonsterSlotSize);
+        }
         activeJob = ExtractionJob.Start(fileBytes, dataDestinationPath, fileNameStem, wordlistNames);
+    }
+
+    /* Without a wordlist, MONSTER.MRG's models are named after their cards, in the text language
+       the disc is read in; characters a file name cannot hold become '_'. Null (default names)
+       when the names cannot be read. */
+    static IList<string>? MonsterCardFileNames(int slotCount)
+    {
+        GameTables tables;
+        try
+        {
+            tables = GameTables.Load(FileLoader.Instance);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine("Card names unavailable for file names: " + exception.Message);
+            return null;
+        }
+        char[] invalidFileNameCharacters = Path.GetInvalidFileNameChars();
+        var fileNames = new List<string>(slotCount);
+        for (int card = 0; card < slotCount; card++)
+        {
+            string cardName = tables.CardName(card).Trim();
+            foreach (char invalidCharacter in invalidFileNameCharacters)
+            {
+                cardName = cardName.Replace(invalidCharacter, '_');
+            }
+            fileNames.Add(cardName);
+        }
+        return fileNames;
     }
 
     IList<string>? LoadWordlist()
@@ -274,7 +344,8 @@ public class ExtractorWindow
         GuiContext.HoveredTooltip(@"A .txt file with one model name per line, in the file's order:
 line 1 names the first model, line 2 the second, and so on.
 For MONSTER.MRG it must have 683 lines, one per card, in card id order.
-An empty or missing line keeps the default name.");
+An empty or missing line keeps the default name.
+Without a wordlist, MONSTER.MRG's models are named after their cards, in the text language.");
         ImGui.SameLine();
         ImGui.Text(dataWordlistPath);
 

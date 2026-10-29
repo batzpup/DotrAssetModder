@@ -26,6 +26,8 @@ public partial class ModelImporterWindow
     string monsterPath;
     byte[] monsterMrg;
     string[] cardNames = new string[ModelCount];
+    // GameTables.MessageLanguageChangeCount when cardNames were read.
+    int cardNamesLanguageChangeCount;
     Dictionary<int, byte[]> monsterStaged = new Dictionary<int, byte[]>();
     Dictionary<int, string> monsterStagedFrom = new Dictionary<int, string>();
     HashSet<int> mapHeightEdits = new HashSet<int>(); // cards whose Map height was edited, written on Save to ISO
@@ -217,6 +219,11 @@ public partial class ModelImporterWindow
                 return;
             }
         }
+        if (cardNamesLanguageChangeCount != GameTables.MessageLanguageChangeCount && modelMrg != null)
+        {
+            modelMrg.Tables.ReadMessages(modelMrg.Disc);
+            ReadCardNames();
+        }
 
         ImGui.Text("Source:");
         ImGui.SameLine();
@@ -316,6 +323,16 @@ public partial class ModelImporterWindow
         }
     }
 
+    void ReadCardNames()
+    {
+        cardNamesLanguageChangeCount = GameTables.MessageLanguageChangeCount;
+        for (int i = 0; i < ModelCount; i++)
+        {
+            cardNames[i] = modelMrg.Tables.CardName(i).Trim();
+        }
+        rowsDirty = true;
+    }
+
     // Reads both archives and the card names from a newly opened ISO.
     bool Open(FileLoader fileLoader)
     {
@@ -342,11 +359,7 @@ public partial class ModelImporterWindow
             }
             modelMrg = ModelMrg.Open(fileLoader.CurrentIsoPath);
             viewScene.SetSource(modelMrg);
-
-            for (int i = 0; i < ModelCount; i++)
-            {
-                cardNames[i] = modelMrg.Tables.CardName(i).Trim();
-            }
+            ReadCardNames();
         }
         catch (Exception exception)
         {

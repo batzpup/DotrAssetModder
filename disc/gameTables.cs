@@ -1,15 +1,15 @@
 using static DotrAssetModder.Bin;
 namespace DotrAssetModder;
 
-/* Which disc this is. The tables below live at different addresses in every build, so nothing
-   here is read without a version. US is the only one measured; guessed EU/JP addresses would
-   corrupt a disc. */
+/* Which disc this is, from the boot ELF named in SYSTEM.CNF. The tables below live at different
+   addresses in every build, so nothing here is read without a version. Only builds whose
+   addresses were measured are listed; a guessed address would corrupt a disc. */
 public enum GameVersion
 {
     Unknown,
     UsSlus20515,   // "Yu-Gi-Oh! The Duelists of the Roses" (USA), boot ELF SLUS_205.15
-    EuUnsupported, // SLES_*: addresses not mapped
-    JpUnsupported, // SLPS/SLPM_*: the JP build names the tables but at other addresses
+    JpSlpm65050,   // "Yu-Gi-Oh! Shin Duel Monsters II" (Japan), boot ELF SLPM_650.50
+    EuSles52480,   // "Yu-Gi-Oh! The Duelists of the Roses" (Europe), boot ELF SLES_524.80
 }
 
 /* Where each table is in one version's boot ELF: EE virtual addresses (DotR-PC
@@ -38,11 +38,17 @@ public class GameTableAddresses
     public uint WindowBufferBase;
     public uint WindowBufferSize;
     /* The message table (SzMsg_LoadFont_Pipe @ 0x1FD680): u32 offset[count], message i starts at
-       blob + 2 * offset[i]. Card names are messages 320 + card id. */
+       blob + MessageOffsetUnit * offset[i] (US counts u16 words, JP counts bytes). Card names
+       are messages CardNameMessage + card id (SzDuel_GetMsgName). */
     public uint MessageOffsets;
     public uint MessageBlob;
     public int MessageCount;
+    public int MessageOffsetUnit;
     public int CardNameMessage;
+    // Null when the text is in the boot ELF; else one disc file per language, which the game
+    // loads whole at MessageFileLoadAddress (the addresses above are inside it).
+    public MessageLanguage[] MessageLanguages;
+    public uint MessageFileLoadAddress;
     /* Target_Model_Y: one signed byte per card, how high the map (Home_Camp_3D_LeaderModel @
        0x22B060) stands the deck leader's node 0 above the arena point (every ArenaYPos is 0),
        with the model at scale 0.5. */
@@ -68,10 +74,59 @@ public class GameTableAddresses
         PackCount = 39,
         ShareData = 0x292BA0, ShareDataCount = 7,
         WindowBufferBase = 0x10AA800, WindowBufferSize = 0xA000,
-        MessageOffsets = 0x2D19D0, MessageBlob = 0x2D49D4, MessageCount = 3073,
+        MessageOffsets = 0x2D19D0, MessageBlob = 0x2D49D4, MessageCount = 3073, MessageOffsetUnit = 2,
         CardNameMessage = 320,
         MapLeaderY = 0x299A30, MapLeaderYCount = 0x356,
         Arenas = 0x298BA0, ArenaCount = 22, ArenaStride = 0x34,
+    };
+
+    /* The JP ELF keeps its symbols (anOfs_*, aShareData, gSzMsg_Data/Root). FIRST, COUNT and OFS
+       have no JP names; they sit at the same distances from aShareData as in the US build and hold
+       the same values, and every pack's sub-offsets end at its MODEL.MRG size. Window buffer from
+       SzModel_Load @ 0x1E6410 (lui 0x10B / ori 0xB000, side * 0xA000); card names from
+       SzDuel_GetMsgName @ 0x1DBEA0 (317 + id for id < 0x356). */
+    public static readonly GameTableAddresses JpSlpm65050 = new GameTableAddresses
+    {
+        BootElf = "SLPM_650.50",
+        ModelMrgOffsets = 0x28E470, ModelEntryCount = 81,
+        StageCamMrgOffsets = 0x28DB90, StageCamEntryCount = 10,
+        IconMrgOffsets = 0x296A90, IconEntryCount = 4,
+        TexEtcMrgOffsets = 0x28F700, TexEtcRegionCount = 3,
+        FirstPack = 0x28E6C0,
+        PackSubCount = 0x28E800,
+        PackOfsPointers = 0x28E8A0,
+        PackCount = 39,
+        ShareData = 0x28E5C0, ShareDataCount = 7,
+        WindowBufferBase = 0x10BB000, WindowBufferSize = 0xA000,
+        MessageOffsets = 0x2CD4E0, MessageBlob = 0x2D70D4, MessageCount = 9981, MessageOffsetUnit = 1,
+        CardNameMessage = 317,
+        MapLeaderY = 0x295470, MapLeaderYCount = 0x356,
+        Arenas = 0x2945E0, ArenaCount = 22, ArenaStride = 0x34,
+    };
+
+    /* The EU tables hold the same values as the US ones (same MODEL.MRG), found by those values;
+       SzModel_Load builds the window buffer with the same code as US. The EU text is not in the
+       ELF: SzMsg_Init (0x246CA0) loads one of MSG/MSG_E/F/G/I/S.DAT (an "MWo3" overlay, loaded
+       whole at 0x3B2000) and points the message table, blob and font into it; the table and blob
+       are at the same addresses in all five, and card names are 323 + id in each. */
+    public static readonly GameTableAddresses EuSles52480 = new GameTableAddresses
+    {
+        BootElf = "SLES_524.80",
+        ModelMrgOffsets = 0x293790, ModelEntryCount = 81,
+        StageCamMrgOffsets = 0x292EB0, StageCamEntryCount = 10,
+        IconMrgOffsets = 0x29BF40, IconEntryCount = 4,
+        TexEtcMrgOffsets = 0x294B10, TexEtcRegionCount = 3,
+        FirstPack = 0x2939E0,
+        PackSubCount = 0x293B20,
+        PackOfsPointers = 0x293BC0,
+        PackCount = 39,
+        ShareData = 0x2938E0, ShareDataCount = 7,
+        WindowBufferBase = 0x10AA800, WindowBufferSize = 0xA000,
+        MessageOffsets = 0x3B2100, MessageBlob = 0x3B613C, MessageCount = 4111, MessageOffsetUnit = 2,
+        CardNameMessage = 323,
+        MessageLanguages = GameTables.EuMessageLanguages, MessageFileLoadAddress = 0x3B2000,
+        MapLeaderY = 0x29A960, MapLeaderYCount = 0x356,
+        Arenas = 0x299AD0, ArenaCount = 22, ArenaStride = 0x34,
     };
 
     public static GameTableAddresses For(GameVersion version)
@@ -80,16 +135,24 @@ public class GameTableAddresses
         {
             return UsSlus20515;
         }
-        if (version == GameVersion.EuUnsupported)
+        if (version == GameVersion.JpSlpm65050)
         {
-            throw new NotImplementedException("EU disc: table addresses are not mapped yet");
+            return JpSlpm65050;
         }
-        if (version == GameVersion.JpUnsupported)
+        if (version == GameVersion.EuSles52480)
         {
-            throw new NotImplementedException("JP disc: table addresses are not mapped yet");
+            return EuSles52480;
         }
         throw new NotSupportedException("unknown game version: no table addresses");
     }
+}
+
+// One of a disc's text files (EU: MSG/MSG_E.DAT ...) and the font glyphs it holds.
+public class MessageLanguage
+{
+    public string Name;
+    public string File;
+    public string GlyphText;    // glyph k is character k
 }
 
 /* aShareData @ 0x292BA0 (US): 7 x { u32 EE load address, u16 first pack index, u16
@@ -125,6 +188,60 @@ public class GameTables
     public ShareDataEntry[] ShareData;
 
     byte[] bootElfBytes;
+    // The bytes the message table is read from: the boot ELF, or MessageLanguage's file (null
+    // until read from a disc, so a loose EU ELF has no card names).
+    byte[] messageBytes;
+    // The language read, for a build with MessageLanguages; else null.
+    public MessageLanguage MessageLanguage;
+    string[] glyphTable;
+
+    /* Which language a disc with MessageLanguages is read in (Program.config.messageLanguage, by
+       name; the first one when unset). Windows that show card names compare the count with the
+       one they read with and read again when it changed. */
+    public static int MessageLanguageChangeCount;
+
+    public static void ChooseMessageLanguage(string languageName)
+    {
+        Program.config.messageLanguage = languageName;
+        MessageLanguageChangeCount++;
+    }
+
+    // The languages a disc's text comes in; null when it has one, in its ELF (US, JP, unknown).
+    public static MessageLanguage[] MessageLanguagesOf(FileLoader disc)
+    {
+        GameVersion version = DetectVersion(disc);
+        if (version == GameVersion.Unknown)
+        {
+            return null;
+        }
+        return GameTableAddresses.For(version).MessageLanguages;
+    }
+
+    public static MessageLanguage ChosenLanguage(MessageLanguage[] languages)
+    {
+        string? chosenName = Program.config?.messageLanguage;
+        foreach (MessageLanguage language in languages)
+        {
+            if (language.Name == chosenName)
+            {
+                return language;
+            }
+        }
+        return languages[0];
+    }
+
+    // Reads the chosen language's text file from `disc` (nothing for a build whose text is in its ELF).
+    public void ReadMessages(FileLoader disc)
+    {
+        if (Addresses.MessageLanguages == null)
+        {
+            return;
+        }
+        MessageLanguage language = ChosenLanguage(Addresses.MessageLanguages);
+        messageBytes = disc.ReadFile(language.File);
+        MessageLanguage = language;
+        glyphTable = null;
+    }
     /* Loadable pieces of the boot ELF, used to turn an EE virtual address into a file offset. The
        retail SLUS_205.15 has 835 program headers (one per overlay landing zone); exactly one has a
        non-zero file size, and it holds every table here. The mapping goes through the headers,
@@ -167,17 +284,17 @@ public class GameTables
             return GameVersion.Unknown;
         }
         string bootElfName = BootElfNameFrom(System.Text.Encoding.ASCII.GetString(disc.ReadFile(systemCnfFile))).ToUpperInvariant();
-        if (bootElfName == "SLUS_205.15")
+        if (bootElfName == GameTableAddresses.UsSlus20515.BootElf)
         {
             return GameVersion.UsSlus20515;
         }
-        if (bootElfName.StartsWith("SLES"))
+        if (bootElfName == GameTableAddresses.JpSlpm65050.BootElf)
         {
-            return GameVersion.EuUnsupported;
+            return GameVersion.JpSlpm65050;
         }
-        if (bootElfName.StartsWith("SLPS") || bootElfName.StartsWith("SLPM"))
+        if (bootElfName == GameTableAddresses.EuSles52480.BootElf)
         {
-            return GameVersion.JpUnsupported;
+            return GameVersion.EuSles52480;
         }
         return GameVersion.Unknown;
     }
@@ -186,7 +303,9 @@ public class GameTables
     {
         GameVersion version = DetectVersion(disc);
         var elfFile = disc.Get(GameTableAddresses.For(version).BootElf);
-        return new GameTables(version, disc.ReadFile(elfFile), elfFile.IsoPath);
+        var tables = new GameTables(version, disc.ReadFile(elfFile), elfFile.IsoPath);
+        tables.ReadMessages(disc);
+        return tables;
     }
 
     // For working on a loose ELF (OriginalGameData) with no disc.
@@ -201,6 +320,10 @@ public class GameTables
         Addresses = GameTableAddresses.For(version);
         BootElfIsoPath = bootElfIsoPath;
         bootElfBytes = elfBytes;
+        if (Addresses.MessageLanguages == null)
+        {
+            messageBytes = bootElfBytes;
+        }
 
         if (bootElfBytes.Length < 0x34 || bootElfBytes[0] != 0x7F || bootElfBytes[1] != 'E' || bootElfBytes[2] != 'L' || bootElfBytes[3] != 'F')
         {
@@ -296,13 +419,114 @@ public class GameTables
     const int MessageReferenceFlag = 0x4000;
     const int NameBuffer = 2;   // message the game writes the player's name into at runtime
 
-    static string[] cachedGlyphs;
+    static string[] cachedUsGlyphs;
 
-    static string[] Glyphs()
+    /* The JP font (gSzMsg_Image, 1947 glyphs of 22x22 at 4 bpp): glyph k is character k of this
+       text, read off the font's bitmaps for glyphs 0-929, the range card names use. Checked by
+       decoding all 854 JP card names against their US names. Full-width Latin and digits are
+       written as ASCII, as in the US table; 30 is the full-width space, 270 the half-width one. */
+    const string JpGlyphText =
+        "\n○、●ABCDEFGHIJKLMNOPQRSTUVWXYZ　[]abcdefg" + // 0
+        "hijklmnopqrstuvwxyz()1234567890・…?“”☆∞♂♀" + // 40
+        "※%=~!♪↑↓←→世あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへ" + // 80
+        "ほまみむめもやゆよらりるれろわゐゑをんっーぁぃぅぇぉがぎぐげござじずぜぞだぢづで" + // 120
+        "どばびぶべぼぱぴぷぺぽゃゅょアイウエオカキクケコサシスセソタチツテトナニヌネノハ" + // 160
+        "ヒフヘホマミムメモヤユヨラリルレロワヰヴヱヲンッーァィゥェォガギグゲゴザジズゼゾ" + // 200
+        "ダヂヅデドバビブベボパピプペポャュョ英数0123456789 -ABCDEFGH" + // 240
+        "IJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuv" + // 280
+        "wxyz記号#$&魔法強化罠範囲全体儀式使戦士獣鳥悪天昆虫恐竜爬類魚海機械雷水炎" + // 320
+        "岩石植物旧神光闇地風森荒野山草原迷宮闘員少尉中大佐准将上級元帥昇進降格埋財宝伏札" + // 360
+        "予想自己移動力増回復直撃半減形変更同族召喚軽支援拡味方抗敵特定種弱呪縛抹殺真表示" + // 400
+        "省略編成行設値破棄画面戻本当実良以下条件該枚限越一持既送先選択補充能転生完了入功" + // 440
+        "獲得失敗個発見別属性攻守備現在階基情報殊決終墓場詳細手裏取消書位置複合順序蘇参照" + // 480
+        "確島峡約束日時急練習初期家側薔薇効果態寄準感染界解除去験版試月売製品待頂赤白／名" + // 520
+        "称青眼龍究極暗黒王紅火這密林砦翼騎千年絵巻盾頭邪空術師泥棒妖精贈聖音楽帝明乙女厳" + // 560
+        "老剣薄幸美封印者右足左腕道幻眠子人魅惑怪盗仮古代導配誘紳操陰陽霊注射番亡鎧武招目" + // 600
+        "葬死銀髑髏寺院屍脚骨金色象食太無讐狩斬鬼東雄協魂像謎傀儡紫影首住冥異次座護伝説豪" + // 640
+        "獄国忍裁装侵響氷小牛漆豹獅深長虎有三姉妹鷹巨狗冠戴蒼晦城覇職鏡命判司知恵淵玉銃運" + // 680
+        "未熟壊芸調理屋根偵察喰箱男爵壁逆心鎖砂計北勇気誕沈黙間吸血蜘蛛蠍幼兵二貪口蜥蜴陸" + // 720
+        "恍惚潜舌要塞鮫室前車振刃拷問隊造砲球爆弾軍曹型鉄鋼仙双電娘々怒轟蛇踊沼万亀狸満潮" + // 760
+        "泉両用弓引巫壺朱雀溶窟壷棲木悟樹緑笑花咲瓶葉磁従星刻燃嵐羽帚秘薬治療祝福粉刑昼夜" + // 800
+        "事業訪仏酸剤息吹永遠渇割払塵寒波洗脳結雨暴唱『』収呼声律殻制斧甲器付猛歯羅菌矢角" + // 840
+        "鞭晶覚醒改工温突扇灼熱槍爪殖芳香華麗分身繭反孵六芒催涙蟻超重網粘着線硫落穴零砕副" + // 880
+        "作偽避針触幕活祈誓契"; // 920
+
+    /* The EU English font (MSG_E.DAT, 318 glyphs at 0x3E4340): a narrow set 0-162, then a wide
+       copy 163-317, read off its bitmaps and checked by decoding all 854 card names (853 equal the
+       US names; card 414 is "Kuwagata Alpha"). Glyph 0 (drawn as a TM) is the line break, as in
+       US: message 0 is that one glyph. 1 and 228 are spaces. MSG_F/I/S have the same font
+       (identical bitmaps); MSG_G's lacks glyph 160, so its glyphs from 160 on are one lower.
+       All five languages' card names were decoded with these. */
+    const string EuGlyphText =
+        "\n ©,®ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi" + // 0
+        "jklmnopqrstuvwxyz1234567890-•°\"#$%&'()=ƒ" + // 40
+        "ßÀÁÂÃÄÅÆŒÇÈÉÊËÌÍÎÏÐÒÓÔÕÖØÑÙÚÛÜ“”«».[]!?à" + // 80
+        "áâãäåæœçèéêëìíîïðòóôõöøñùúûü‘’<>{}¡¿:/□○" + // 120
+        ";∞△ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk" + // 160
+        "lmnopqrstuvwxyz1234567890-•° \"#$%&'()=ƒß" + // 200
+        "ÀÁÂÃÄÅÆŒÇÈÉÊËÌÍÎÏÐÒÓÔÕÖØÑÙÚÛÜ“”«».[]!?àá" + // 240
+        "âãäåæœçèéêëìíîïðòóôõöøñùúûü‘’<>,{}¡¿∞_"; // 280
+
+    public static readonly MessageLanguage[] EuMessageLanguages =
     {
-        if (cachedGlyphs != null)
+        new MessageLanguage { Name = "English", File = "MSG/MSG_E.DAT", GlyphText = EuGlyphText },
+        new MessageLanguage { Name = "French", File = "MSG/MSG_F.DAT", GlyphText = EuGlyphText },
+        new MessageLanguage { Name = "German", File = "MSG/MSG_G.DAT", GlyphText = EuGlyphText.Remove(160, 1) },
+        new MessageLanguage { Name = "Italian", File = "MSG/MSG_I.DAT", GlyphText = EuGlyphText },
+        new MessageLanguage { Name = "Spanish", File = "MSG/MSG_S.DAT", GlyphText = EuGlyphText },
+    };
+
+    // Glyph index -> text for this build's font (null = not mapped, shown as <index>).
+    string[] Glyphs()
+    {
+        if (glyphTable != null)
         {
-            return cachedGlyphs;
+            return glyphTable;
+        }
+        if (MessageLanguage != null)
+        {
+            glyphTable = GlyphTableFrom(MessageLanguage.GlyphText);
+        }
+        else if (Version == GameVersion.JpSlpm65050)
+        {
+            glyphTable = GlyphTableFrom(JpGlyphText);
+        }
+        else
+        {
+            glyphTable = UsGlyphs();
+        }
+        return glyphTable;
+    }
+
+    // Every character any build's glyph table can produce (for the UI font).
+    public static string GlyphCharacters()
+    {
+        var characters = new System.Text.StringBuilder(JpGlyphText + EuGlyphText);
+        foreach (string? glyphText in UsGlyphs())
+        {
+            if (glyphText != null)
+            {
+                characters.Append(glyphText);
+            }
+        }
+        return characters.ToString();
+    }
+
+    static string[] GlyphTableFrom(string glyphText)
+    {
+        string[] table = new string[0x2000];
+        for (int i = 0; i < glyphText.Length; i++)
+        {
+            table[i] = glyphText[i].ToString();
+        }
+        return table;
+    }
+
+    static string[] UsGlyphs()
+    {
+        if (cachedUsGlyphs != null)
+        {
+            return cachedUsGlyphs;
         }
         string[] glyphTable = new string[0x2000];
         glyphTable[0] = "\n";
@@ -337,19 +561,29 @@ public class GameTables
         {
             glyphTable[86 + i] = halfWidthGlyphs[i].ToString();
         }
-        cachedGlyphs = glyphTable;
+        cachedUsGlyphs = glyphTable;
         return glyphTable;
     }
 
     int MessageWord(int fileOffset)
     {
-        return ReadU16(bootElfBytes, fileOffset);
+        return ReadU16(messageBytes, fileOffset);
+    }
+
+    // Where EE address `address` (in the message table or blob) is in messageBytes.
+    int MessageFileOffset(uint address)
+    {
+        if (Addresses.MessageLanguages == null)
+        {
+            return VirtualAddressToFileOffset(address);
+        }
+        return (int)(address - Addresses.MessageFileLoadAddress);
     }
 
     int MessageStart(int messageIndex)
     {
-        uint messageWordOffset = ReadU32(bootElfBytes, VirtualAddressToFileOffset(Addresses.MessageOffsets) + 4 * messageIndex);
-        return VirtualAddressToFileOffset(Addresses.MessageBlob) + 2 * (int)messageWordOffset;
+        uint messageOffset = ReadU32(messageBytes, MessageFileOffset(Addresses.MessageOffsets) + 4 * messageIndex);
+        return MessageFileOffset(Addresses.MessageBlob) + Addresses.MessageOffsetUnit * (int)messageOffset;
     }
 
     // Appends one element at `elementFileOffset`; returns how many words it took.
@@ -440,8 +674,13 @@ public class GameTables
         marker = ReadI16(bootElfBytes, arenaFileOffset + 0x12);
     }
 
+    // Empty when the text was not read (an EU ELF opened without its disc).
     public string CardName(int cardId)
     {
+        if (messageBytes == null)
+        {
+            return string.Empty;
+        }
         return Message(Addresses.CardNameMessage + cardId);
     }
 }

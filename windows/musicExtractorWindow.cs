@@ -100,6 +100,8 @@ public class MusicExtractorWindow : IDisposable
 
     int selectedMonsterCard = 0;
     string[] monsterCardLabels = [];
+    // GameTables.MessageLanguageChangeCount when monsterCardLabels were read.
+    int monsterLabelsLanguageChangeCount;
     string? monsterNamesError;
 
     SoundExportFormat exportFormat = SoundExportFormat.Wav;
@@ -353,6 +355,10 @@ public class MusicExtractorWindow : IDisposable
 
     void RenderMonsterPicker()
     {
+        if (monsterLabelsLanguageChangeCount != GameTables.MessageLanguageChangeCount)
+        {
+            monsterCardLabels = [];
+        }
         if (monsterCardLabels.Length == 0)
         {
             LoadMonsterCardLabels();
@@ -604,6 +610,7 @@ public class MusicExtractorWindow : IDisposable
     void LoadMonsterCardLabels()
     {
         monsterNamesError = null;
+        monsterLabelsLanguageChangeCount = GameTables.MessageLanguageChangeCount;
         int slotCount;
         try
         {

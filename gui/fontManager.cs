@@ -18,6 +18,27 @@ public static class FontManager
         { FontFamily.NotoSansJP, "NotoSansJP-Regular.ttf" }
     };
 
+    /* Latin-1 (ImGui's default) plus every character a disc's text can decode to (the JP, EU and
+       US glyph tables in GameTables): without them card names draw as '?'. Built once; the
+       atlas reads it at Build. */
+    static ImVector glyphRanges;
+
+    static IntPtr GlyphRanges()
+    {
+        if (glyphRanges.Data == IntPtr.Zero)
+        {
+            ImFontGlyphRangesBuilderPtr rangesBuilder;
+            unsafe
+            {
+                rangesBuilder = new ImFontGlyphRangesBuilderPtr(ImGuiNative.ImFontGlyphRangesBuilder_ImFontGlyphRangesBuilder());
+            }
+            rangesBuilder.AddRanges(ImGui.GetIO().Fonts.GetGlyphRangesDefault());
+            rangesBuilder.AddText(GameTables.GlyphCharacters());
+            rangesBuilder.BuildRanges(out glyphRanges);
+        }
+        return glyphRanges.Data;
+    }
+
     public static void LoadFonts()
     {
         int[] sizes = { 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32 };
@@ -68,7 +89,12 @@ public static class FontManager
                 IntPtr unmanagedPtr = Marshal.AllocHGlobal(bytesRead);
                 Marshal.Copy(fontData, 0, unmanagedPtr, bytesRead);
 
-                font = ImGui.GetIO().Fonts.AddFontFromMemoryTTF(unmanagedPtr, bytesRead, pixelSize);
+                ImFontConfigPtr defaultConfig;
+                unsafe
+                {
+                    defaultConfig = new ImFontConfigPtr((ImFontConfig*)null);
+                }
+                font = ImGui.GetIO().Fonts.AddFontFromMemoryTTF(unmanagedPtr, bytesRead, pixelSize, defaultConfig, GlyphRanges());
             }
             else
             {
